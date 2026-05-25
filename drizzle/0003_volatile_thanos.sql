@@ -1,0 +1,1 @@
+ALTER TABLE "rounds" ADD COLUMN "gap_detected" boolean DEFAULT false NOT NULL;
