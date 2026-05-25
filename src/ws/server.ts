@@ -24,9 +24,11 @@ function broadcastJson(wss: WebSocketServer, payload: WsPayload) {
   }
 }
 
-const CORS_ORIGINS = process.env.CORS_ORIGINS
-  ? process.env.CORS_ORIGINS.split(",").map((s) => s.trim())
-  : ["http://localhost:3000", "http://localhost:5173"];
+const CORS_ORIGINS = [
+  "https://pakakumi-web-client.vercel.app",
+  "http://localhost:3000",
+  "http://localhost:5173",
+];
 
 export function attachWebSocketServer(httpServer: Server) {
   const wss = new WebSocketServer({
