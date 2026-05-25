@@ -6,6 +6,7 @@ import { users, sessions, accounts, verifications } from "../db/schema.js";
 // CORS origins — Better Auth needs these to set its own CORS headers
 const CORS_ORIGINS = [
   "https://pakakumi-web-client.vercel.app",
+  "https://pakakumi.softdocs.org",
   "http://localhost:3000",
   "http://localhost:5173",
 ];

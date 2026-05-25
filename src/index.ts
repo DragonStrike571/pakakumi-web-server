@@ -35,6 +35,7 @@ const HOST = process.env.HOST || "0.0.0.0";
 // CORS origins from env (comma-separated) or defaults
 const CORS_ORIGINS = [
   "https://pakakumi-web-client.vercel.app",
+  "https://pakakumi.softdocs.org",
   "http://localhost:3000",
   "http://localhost:5173",
 ];
@@ -44,15 +45,15 @@ const server = http.createServer(app);
 
 app.set("trust proxy", 1);
 
-// Security middleware
-app.use(
-  helmet({
-    crossOriginOpenerPolicy: { policy: "unsafe-none" },
-    crossOriginResourcePolicy: {
-      policy: "cross-origin",
-    },
-  }),
-);
+// // Security middleware
+// app.use(
+//   helmet({
+//     crossOriginOpenerPolicy: { policy: "unsafe-none" },
+//     crossOriginResourcePolicy: {
+//       policy: "cross-origin",
+//     },
+//   }),
+// );
 
 // Configure CORS
 app.use(
