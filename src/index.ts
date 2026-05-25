@@ -66,6 +66,9 @@ const authLimiter = rateLimit({
   max: 100, // Limit each IP to 100 requests per window
   standardHeaders: true,
   legacyHeaders: false,
+  validate: {
+    xForwardedForHeader: false,
+  },
 });
 
 // Better Auth Handler
