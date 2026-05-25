@@ -45,15 +45,15 @@ const server = http.createServer(app);
 
 app.set("trust proxy", 1);
 
-// // Security middleware
-// app.use(
-//   helmet({
-//     crossOriginOpenerPolicy: { policy: "unsafe-none" },
-//     crossOriginResourcePolicy: {
-//       policy: "cross-origin",
-//     },
-//   }),
-// );
+// Security middleware
+app.use(
+  helmet({
+    crossOriginOpenerPolicy: { policy: "unsafe-none" },
+    crossOriginResourcePolicy: {
+      policy: "cross-origin",
+    },
+  }),
+);
 
 // Configure CORS
 app.use(
