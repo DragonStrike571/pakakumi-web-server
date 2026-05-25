@@ -53,6 +53,11 @@ app.use(
   }),
 );
 
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
+
 // Rate limiter for Auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
@@ -62,7 +67,7 @@ const authLimiter = rateLimit({
 });
 
 // Better Auth Handler
-app.all("/api/auth/*splat", authLimiter, toNodeHandler(auth));
+app.use("/api/auth", authLimiter, toNodeHandler(auth));
 
 // Use JSON middleware
 app.use(express.json());
