@@ -35,5 +35,23 @@ export const auth = betterAuth({
       secure: true,
       partitioned: true,
     },
+    cookies: {
+      session_token: {
+        name: "better-auth.session_token",
+        attributes: {
+          sameSite: "none",
+          secure: true,
+          partitioned: true,
+        },
+      },
+      session_data: {
+        name: "better-auth.session_data",
+        attributes: {
+          sameSite: "none",
+          secure: true,
+          partitioned: true,
+        },
+      },
+    },
   },
 });
