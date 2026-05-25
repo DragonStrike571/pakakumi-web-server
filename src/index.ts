@@ -62,7 +62,7 @@ const authLimiter = rateLimit({
 });
 
 // Better Auth Handler
-app.all("/api/auth/*", authLimiter, toNodeHandler(auth));
+app.all("/api/auth/*splat", authLimiter, toNodeHandler(auth));
 
 // Use JSON middleware
 app.use(express.json());
