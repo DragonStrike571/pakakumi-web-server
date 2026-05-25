@@ -17,7 +17,11 @@ import cors from "cors";
 import { pool } from "./db/index.js";
 
 // Environment variable validation
-const requiredEnvVars = ["DATABASE_URL", "BETTER_AUTH_SECRET", "ENCRYPTION_KEY"];
+const requiredEnvVars = [
+  "DATABASE_URL",
+  "BETTER_AUTH_SECRET",
+  "ENCRYPTION_KEY",
+];
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
     console.error(`❌ Missing required environment variable: ${envVar}`);
@@ -58,7 +62,7 @@ const authLimiter = rateLimit({
 });
 
 // Better Auth Handler
-app.all("/api/auth/{*any}", authLimiter, toNodeHandler(auth));
+app.all("/api/auth/*", authLimiter, toNodeHandler(auth));
 
 // Use JSON middleware
 app.use(express.json());
