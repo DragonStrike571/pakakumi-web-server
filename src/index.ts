@@ -40,6 +40,8 @@ const CORS_ORIGINS = process.env.CORS_ORIGINS
 const app = express();
 const server = http.createServer(app);
 
+app.set("trust proxy", 1);
+
 // Security middleware
 app.use(helmet());
 
