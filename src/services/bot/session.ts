@@ -275,8 +275,8 @@ export class BotSession extends EventEmitter {
     try {
       // 1. Force Playwright to wait for the inputs to render on the DOM
       await this.page.waitForSelector(GAME_SELECTORS.GAME.INPUTS, {
-        state: "visible",
-        timeout: 5000,
+        state: "attached",
+        timeout: 2500,
       });
 
       // Now it is safe to grab them
