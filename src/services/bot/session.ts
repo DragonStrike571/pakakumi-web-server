@@ -270,29 +270,36 @@ export class BotSession extends EventEmitter {
     if (!this.page) return;
 
     try {
-      // Use page.$$ to get an array of all matching inputs
-      const inputs = await this.page.$$(GAME_SELECTORS.GAME.INPUTS);
+      // 1. Force Playwright to wait for the inputs to render on the DOM
+      await this.page.waitForSelector(GAME_SELECTORS.GAME.INPUTS, {
+        state: "visible",
+        timeout: 5000,
+      });
 
-      // Assign them based on their index (0 for first, 1 for second)
-      const amountInput = inputs[0];
-      const cashoutInput = inputs[1];
+      // Now it is safe to grab them
+      const inputs = await this.page.$$(GAME_SELECTORS.GAME.INPUTS);
       const betBtn = await this.page.$(GAME_SELECTORS.GAME.BET_BUTTON);
 
-      // Optional: Add a check to ensure both inputs were found before proceeding
-      if (!amountInput || !cashoutInput) {
-        throw new Error("Could not find both input fields on the page.");
+      if (inputs.length < 2 || !betBtn) {
+        throw new Error(
+          `Found ${inputs.length} inputs. Could not locate both fields or the bet button.`,
+        );
       }
 
-      if (amountInput && cashoutInput && betBtn) {
-        await amountInput.fill(amount.toString());
-        await cashoutInput.fill(cashout.toString());
-        await betBtn.click();
+      const amountInput = inputs[0];
+      const cashoutInput = inputs[1];
 
-        this.lastBet = { amount, cashout };
-        this.log(`🎲 Placed Bet: ${amount} @ ${cashout}x`);
-      } else {
-        this.log("❌ Failed to find betting controls.");
-      }
+      // 2. Click first to ensure UI focus, then fill
+      await amountInput.click();
+      await amountInput.fill(amount.toString());
+
+      await cashoutInput.click();
+      await cashoutInput.fill(cashout.toString());
+
+      await betBtn.click();
+
+      this.lastBet = { amount, cashout };
+      this.log(`🎲 Placed Bet: ${amount} @ ${cashout}x`);
     } catch (error: any) {
       this.log(`❌ Error placing bet: ${error.message}`);
       this.lastBet = null;
