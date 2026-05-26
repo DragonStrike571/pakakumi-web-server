@@ -19,8 +19,6 @@ interface SessionConfig {
   auth: { phone: string; pass: string };
 }
 
-
-
 const MAX_CONSECUTIVE_ERRORS = 10;
 
 export class BotSession extends EventEmitter {
@@ -77,7 +75,7 @@ export class BotSession extends EventEmitter {
 
         new MutationObserver(() => {
           const el = document.querySelector(
-            "table.css-1a87jyo tbody tr.css-15iar3s td span.css-hwpcld"
+            "table.css-1a87jyo tbody tr.css-15iar3s td span.css-hwpcld",
           );
           if (el && el.textContent) {
             const latestBustInfo = el.textContent;
@@ -90,7 +88,7 @@ export class BotSession extends EventEmitter {
 
         // Run once immediately
         const el = document.querySelector(
-          "table.css-1a87jyo tbody tr.css-15iar3s td span.css-hwpcld"
+          "table.css-1a87jyo tbody tr.css-15iar3s td span.css-hwpcld",
         );
         if (el && el.textContent) {
           const latestBustInfo = el.textContent;
@@ -134,8 +132,10 @@ export class BotSession extends EventEmitter {
         const passInput = await this.page.$(GAME_SELECTORS.LOGIN.PASS_INPUT);
 
         if (phoneInput && passInput) {
-          await phoneInput.fill(this.config.auth.phone);
-          await passInput.fill(this.config.auth.pass);
+          // await phoneInput.click();
+          // await this.page.waitForTimeout(500)
+          await phoneInput.fill(this.config.auth.phone, { force: true });
+          await passInput.fill(this.config.auth.pass, { force: true });
 
           const loginBtn = await this.page.$(GAME_SELECTORS.LOGIN.SUBMIT_BTN);
           await loginBtn?.click();
@@ -334,12 +334,12 @@ export class BotSession extends EventEmitter {
     const logEntry = `[${timestamp}] ${message}`;
     console.log(`[Bot ${this.sessionId}] ${message}`);
     this.logs.push(logEntry);
-    
+
     // Keep max 1000 logs in memory to avoid unbounded growth
     if (this.logs.length > 1000) {
       this.logs = this.logs.slice(-1000);
     }
-    
+
     this.emit("log", { sessionId: this.sessionId, message: logEntry });
   }
 }
