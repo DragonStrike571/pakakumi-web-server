@@ -157,28 +157,25 @@ export class BotSession extends EventEmitter {
         await this.page.waitForTimeout(500);
         await loginBtn.click({ force: true });
 
-        // TRUE VERIFICATION: Wait for the guest prompt to disappear
-        try {
-          await this.page.waitForFunction(
-            () => {
-              return !document.body.innerText.includes(
-                "Login or Register to start playing.",
-              );
-            },
-            { timeout: 10000 },
-          );
+        // 1. Force the bot to wait 4 full seconds to let the site finish loading/redirecting
+        await this.page.waitForTimeout(4000);
 
-          this.log("✅ Login Successful (Guest UI removed)");
-        } catch (verifyError) {
-          // If the text is still there, the login failed. Let's see what the screen says.
-          const pageText = await this.page.evaluate(
-            () => document.body.innerText,
-          );
+        // 2. Now check the screen after the dust has settled
+        const pageText = await this.page.evaluate(
+          () => document.body.innerText,
+        );
+
+        if (pageText.includes("Login or Register to start playing.")) {
+          // It's still on the guest page. Let's find out if there's an error message.
           this.log(
-            `❌ Login rejected. Screen text: \n ${pageText.substring(0, 300)}`,
+            `❌ Login rejected by server. Screen text: \n ${pageText.substring(0, 300)}`,
           );
-          throw new Error("Login click did not authenticate the session.");
+          throw new Error(
+            "Login click failed. Server IP is likely blocked or georestricted.",
+          );
         }
+
+        this.log("✅ Login Successful (Confirmed)");
       },
       { retries: 1, retryDelay: 2000 }, // Reduced retries so it fails faster if stuck
     );
