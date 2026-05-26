@@ -72,6 +72,11 @@ export class BotSession extends EventEmitter {
 
       await this.login();
 
+      // ---> ADD THIS LINE: Wait for the table to exist before observing it
+      await this.page.waitForSelector(GAME_SELECTORS.GAME.TABLE_BODY, {
+        timeout: 15000,
+      });
+
       // Inject MutationObserver to replace polling
       await this.page.evaluate((selector: string) => {
         const targetNode = document.querySelector(selector);
