@@ -130,34 +130,52 @@ export class BotSession extends EventEmitter {
         if (!this.page) throw new Error("Page not initialized");
         await this.page.goto("https://play.pakakumi.com/login");
 
+        // Wait for inputs
         await this.page.waitForSelector(GAME_SELECTORS.LOGIN.PHONE_INPUT, {
           timeout: 10000,
         });
 
         const phoneInput = await this.page.$(GAME_SELECTORS.LOGIN.PHONE_INPUT);
         const passInput = await this.page.$(GAME_SELECTORS.LOGIN.PASS_INPUT);
+        const loginBtn = await this.page.$(GAME_SELECTORS.LOGIN.SUBMIT_BTN);
 
-        if (phoneInput && passInput) {
-          // await phoneInput.click();
-          // await this.page.waitForTimeout(500)
-          await phoneInput.fill(this.config.auth.phone, { force: true });
-          await passInput.fill(this.config.auth.pass, { force: true });
+        if (!phoneInput || !passInput || !loginBtn) {
+          throw new Error("Login fields not found on page.");
+        }
 
-          const loginBtn = await this.page.$(GAME_SELECTORS.LOGIN.SUBMIT_BTN);
-          await loginBtn?.click();
+        // Fill and click
+        await phoneInput.fill(this.config.auth.phone, { force: true });
+        await passInput.fill(this.config.auth.pass, { force: true });
 
-          await this.page.waitForSelector(GAME_SELECTORS.GAME.TABLE_BODY, {
-            timeout: 15000,
-          });
-          this.log("✅ Login Successful");
+        // Sometimes frontend frameworks miss rapid headless clicks.
+        // Adding a tiny delay before clicking helps.
+        await this.page.waitForTimeout(500);
+        await loginBtn.click({ force: true });
 
-          await this.page.goto("https://play.pakakumi.com");
-          this.log("✅ Redirect Successful");
-        } else {
-          throw new Error("Login fields not found");
+        // TRUE VERIFICATION: Wait for the guest prompt to disappear
+        try {
+          await this.page.waitForFunction(
+            () => {
+              return !document.body.innerText.includes(
+                "Login or Register to start playing.",
+              );
+            },
+            { timeout: 10000 },
+          );
+
+          this.log("✅ Login Successful (Guest UI removed)");
+        } catch (verifyError) {
+          // If the text is still there, the login failed. Let's see what the screen says.
+          const pageText = await this.page.evaluate(
+            () => document.body.innerText,
+          );
+          this.log(
+            `❌ Login rejected. Screen text: \n ${pageText.substring(0, 300)}`,
+          );
+          throw new Error("Login click did not authenticate the session.");
         }
       },
-      { retries: 2, retryDelay: 2000 },
+      { retries: 1, retryDelay: 2000 }, // Reduced retries so it fails faster if stuck
     );
 
     if (error) {
