@@ -144,6 +144,9 @@ export class BotSession extends EventEmitter {
             timeout: 15000,
           });
           this.log("✅ Login Successful");
+
+          await this.page.goto("https://play.pakakumi.com");
+          this.log("✅ Redirect Successful");
         } else {
           throw new Error("Login fields not found");
         }
