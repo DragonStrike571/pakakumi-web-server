@@ -302,6 +302,10 @@ export class BotSession extends EventEmitter {
       this.log(`🎲 Placed Bet: ${amount} @ ${cashout}x`);
     } catch (error: any) {
       this.log(`❌ Error placing bet: ${error.message}`);
+      await this.page.screenshot({
+        path: `debug-fail-${Date.now()}.png`,
+        fullPage: true,
+      });
       this.lastBet = null;
     }
   }
