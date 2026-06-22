@@ -264,10 +264,13 @@ export async function runAnalysis(newRound?: {
           `<b>Status:</b> ${status}\n\n` +
           `_Use the bot to plan your bets before you start._`;
 
-        const premiumKb = new InlineKeyboard().url(
-          "⚙️ Plan My Bets",
-          `https://t.me/${botUsername}?start=strat_${cluster[0].target}`,
-        );
+        const premiumKb = new InlineKeyboard()
+          .url(
+            "⚙️ Plan My Bets",
+            `https://t.me/${botUsername}?start=strat_${cluster[0].target}`,
+          )
+          .row()
+          .url("❓ Read the Guide", `https://t.me/${botUsername}?start=guide`);
 
         bot.api
           .sendMessage(privateChannelId, premiumMsg, {
@@ -301,7 +304,9 @@ export async function runAnalysis(newRound?: {
         const publicKb = new InlineKeyboard()
           .url("Get Premium", `https://t.me/${botUsername}?start=premium`)
           .row()
-          .url("🤖 Use Bot to Plan Bets", `https://t.me/${botUsername}`); // <-- ADDED THIS FOR CONSISTENCY
+          .url("🤖 Use Bot to Plan Bets", `https://t.me/${botUsername}`)
+          .row()
+          .url("❓ Read the Guide", `https://t.me/${botUsername}?start=guide`); // <-- Add this; // <-- ADDED THIS FOR CONSISTENCY
 
         bot.api
           .sendMessage(publicChannelId, teaseMsg, {

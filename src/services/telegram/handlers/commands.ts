@@ -175,14 +175,20 @@ export function setupCommands(bot: Bot<MyContext>) {
   }
 
   async function triggerGuide(ctx: any) {
-    await ctx.reply(
-      "📖 **How to use Pakakumi Oracle**\n\n\n" +
-        "1️⃣ **Wait for Alerts:** The Premium channel tells you which targets are hot and when they are expected.\n\n" +
-        "2️⃣ **Plan Your Bets:** Click 'Plan My Bets' on the alert. Tell the bot your capital, and it will calculate your exact stakes so you survive the whole action window.\n\n" +
-        "3️⃣ **Play Smart:** Follow the bet plan exactly. Do not bet randomly.\n\n\n" +
-        "_Target one multiplier, get your profit, and stop._",
-      { parse_mode: "Markdown" },
-    );
+    const guideText =
+      `📖 **How to read the Oracle**\n\n` +
+      `We don't guess. The bot calculates **Mean Reversion**—the mathematical point where a multiplier *must* drop to maintain the game's 99% RTP.\n\n` +
+      `🎯 **ACTION WINDOWS EXPLAINED:**\n\n` +
+      `**1️⃣ "X to Y rounds" (e.g., 5 to 15)**\n` +
+      `The game is building up to the drop. The math shows the multiplier is most likely to hit within this specific pocket of rounds.\n\n` +
+      `**2️⃣ "Within X rounds" (e.g., Within 10)**\n` +
+      `The target is highly concentrated. The drop is expected to happen before this round count runs out.\n\n` +
+      `**3️⃣ "Overdue (Plan X)"**\n` +
+      `The mathematical drop point has already passed. The game is officially "late" to drop this multiplier. The bot tells you to "Plan X" rounds—meaning you should plan enough stakes to cover one full natural probability cycle to catch the correction.\n\n` +
+      `💡 **THE GOLDEN RULE:**\n` +
+      `Click **'⚙️ Plan My Bets'** on any alert. The bot will do the math and tell you exactly how much to bet each round to survive the entire Action Window and still profit.`;
+
+    await ctx.reply(guideText, { parse_mode: "Markdown" });
   }
 
   async function triggerSupport(ctx: any) {
