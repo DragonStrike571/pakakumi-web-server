@@ -24,6 +24,8 @@ export class GameScraper extends EventEmitter {
   private page: Page | null = null;
   private isRunning: boolean = false;
   private previousBustIDs = new Set<string>();
+  private restartCount: number = 0;
+  private readonly MAX_RESTARTS = 10;
 
   // Debounce: the observer can fire many times for one round change.
   // We collapse rapid signals into a single scrape after 100ms of quiet.
@@ -70,16 +72,27 @@ export class GameScraper extends EventEmitter {
         console.error("❌ Browser disconnected! Attempting restart in 5s...");
         this.isRunning = false;
         this.clearDebounce();
+        this.restartCount++;
+        if (this.restartCount > this.MAX_RESTARTS) {
+          console.error("🛑 Scraper exceeded max restarts. Halting permanently.");
+          return;
+        }
         setTimeout(() => this.start(), 5000);
       });
 
       this.isRunning = true;
+      this.restartCount = 0; // Reset on successful start
       console.log("✅ Scraper started and listening for rounds.");
     });
 
     if (error) {
       console.error("❌ Error starting scraper:", error);
       this.stop();
+      this.restartCount++;
+      if (this.restartCount > this.MAX_RESTARTS) {
+        console.error("🛑 Scraper exceeded max restarts. Halting permanently.");
+        return;
+      }
       setTimeout(() => this.start(), 10000);
     }
   }

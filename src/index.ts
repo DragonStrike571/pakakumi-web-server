@@ -15,12 +15,21 @@ import { toNodeHandler } from "better-auth/node";
 import { auth } from "./lib/auth.js";
 import cors from "cors";
 import { pool } from "./db/index.js";
+import paystackRouter from "./routes/paystack.js";
+
+// Core Daemons
+import { bot } from "./services/telegram/bot.js";
+import { runAnalysis } from "./services/telegram/analyzer.js";
+import { startPaystackPolling } from "./services/paystack/paystack.js";
+import { startExpiryKicker } from "./services/telegram/expiry.js";
 
 // Environment variable validation
 const requiredEnvVars = [
   "DATABASE_URL",
   "BETTER_AUTH_SECRET",
   "ENCRYPTION_KEY",
+  "PAYSTACK_SECRET_KEY",
+  "TELEGRAM_BOT_TOKEN",
 ];
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
@@ -31,14 +40,7 @@ for (const envVar of requiredEnvVars) {
 
 const PORT = Number(process.env.PORT || 8000);
 const HOST = process.env.HOST || "0.0.0.0";
-
-// CORS origins from env (comma-separated) or defaults
-const CORS_ORIGINS = [
-  "https://pakakumi-web-client.vercel.app",
-  "https://pakakumi.softdocs.org",
-  "http://localhost:3000",
-  "http://localhost:5173",
-];
+import { CORS_ORIGINS } from "./config/cors.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -49,9 +51,7 @@ app.set("trust proxy", 1);
 app.use(
   helmet({
     crossOriginOpenerPolicy: { policy: "unsafe-none" },
-    crossOriginResourcePolicy: {
-      policy: "cross-origin",
-    },
+    crossOriginResourcePolicy: { policy: "cross-origin" },
   }),
 );
 
@@ -72,27 +72,20 @@ app.use((req, res, next) => {
 
 // Rate limiter for Auth endpoints
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per window
+  windowMs: 15 * 60 * 1000,
+  max: 200,
   standardHeaders: true,
   legacyHeaders: false,
-  validate: {
-    xForwardedForHeader: false,
-  },
+  validate: { xForwardedForHeader: false },
 });
 
-// Better Auth Handler
 app.use("/api/auth", authLimiter, toNodeHandler(auth));
-
-// Use JSON middleware
 app.use(express.json());
 
-// Root route
 app.get("/", (req: Request, res: Response) => {
   res.send("Pakakumi Web Server is running!");
 });
 
-// Health check route
 app.get("/health", (req: Request, res: Response) => {
   res.json({
     status: "ok",
@@ -105,6 +98,9 @@ app.use("/rounds", roundsRouter);
 app.use("/strategies", strategiesRouter);
 app.use("/bot", botRouter);
 app.use("/account", accountRouter);
+app.use("/paystack", paystackRouter);
+
+// WEBHOOK REMOVED: Telegram now operates entirely via background polling
 
 const { broadcastRoundUpdate } = attachWebSocketServer(server);
 app.locals.broadcastRoundUpdate = broadcastRoundUpdate;
@@ -131,23 +127,43 @@ gameScraper.on("roundEnded", async (data) => {
       maxAmountPlayed: Number(savedRound.maxAmountPlayed),
       totalReserveFunds: Number(savedRound.totalReserveFunds),
     });
+
+    runAnalysis({
+      bust: Number(savedRound.bust),
+      createdAt: savedRound.createdAt,
+    }).catch((err) => console.error("❌ Analyzer error:", err));
   }
 });
 
-// Start the scraper
 gameScraper
   .start()
   .catch((err) => console.error("❌ Failed to start scraper:", err));
 
-// Initialize Services
+// Initialize Services & Background Daemons
 Promise.all([roundService.initialize(), botManager.initialize()])
-  .then(() => console.log("✅ Services initialized"))
+  .then(() => {
+    console.log("✅ Core services initialized");
+
+    // Start Background Pollers
+    startPaystackPolling();
+    console.log("✅ Paystack verification polling started");
+
+    startExpiryKicker();
+    console.log("✅ Expiry kicker daemon started");
+
+    // Start Telegram Long-Polling
+    if (bot) {
+      bot
+        .start({ drop_pending_updates: true })
+        .catch((err) => console.error("❌ Failed to start bot polling:", err));
+      console.log("✅ Telegram Daemon active (Long-Polling)");
+    }
+  })
   .catch((err) => console.error("❌ Failed to initialize services:", err));
 
 server.listen(PORT, HOST, () => {
   const baseUrl =
     HOST === "0.0.0.0" ? `http://localhost:${PORT}` : `http://${HOST}:${PORT}`;
-
   console.log(`Server is running on ${baseUrl}`);
   console.log(
     `WebSocket server is running on ${baseUrl.replace("http", "ws")}/ws`,
@@ -158,24 +174,26 @@ server.listen(PORT, HOST, () => {
 async function shutdown(signal: string) {
   console.log(`\n🛑 ${signal} received. Shutting down gracefully...`);
 
-  // Stop accepting new connections
-  server.close(() => {
-    console.log("✅ HTTP server closed");
-  });
+  server.close(() => console.log("✅ HTTP server closed"));
 
-  // Stop scraper browser
   await trycatch(async () => {
     await gameScraper.stop();
     console.log("✅ Scraper stopped");
   });
 
-  // Stop all bot sessions and close bot browser
   await trycatch(async () => {
     await botManager.shutdownAll();
     console.log("✅ Bot manager shut down");
   });
 
-  // Drain DB pool
+  // Safely terminate Telegram polling connections
+  if (bot) {
+    await trycatch(async () => {
+      await bot!.stop();
+      console.log("✅ Telegram polling stopped");
+    });
+  }
+
   await trycatch(async () => {
     await pool.end();
     console.log("✅ Database pool drained");

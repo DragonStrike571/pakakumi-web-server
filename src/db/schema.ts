@@ -14,8 +14,8 @@ export const users = pgTable(
   "users",
   {
     id: text("id").primaryKey(), // Changed to text for Better Auth compatibility
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-    updatedAt: timestamp("updated_at")
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
       .defaultNow()
       .notNull()
       .$onUpdateFn(() => new Date()),
@@ -25,6 +25,8 @@ export const users = pgTable(
     passwordHash: text("password_hash"), // Made optional as auth might use Account table
     emailVerified: boolean("email_verified").default(false).notNull(),
     image: text("image"),
+    role: text("role").default("user").notNull(),
+    accessStatus: text("access_status").default("pending").notNull(),
   },
   (table) => [
     index("email_idx").on(table.email),
@@ -35,11 +37,11 @@ export const users = pgTable(
 export const sessions = pgTable(
   "sessions",
   {
-    id: text("id").primaryKey(), // Better Auth uses text IDs for sessions usually alongside UUID users? Or should I use UUID? schema generated text. I'll stick to text for session ID to avoid issues, but USER ID is UUID.
-    expiresAt: timestamp("expires_at").notNull(),
+    id: text("id").primaryKey(),
+    expiresAt: timestamp("expires_at", { mode: "date" }).notNull(),
     token: text("token").notNull().unique(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-    updatedAt: timestamp("updated_at")
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
       .defaultNow()
       .notNull()
       .$onUpdateFn(() => new Date()),
@@ -64,12 +66,16 @@ export const accounts = pgTable(
     accessToken: text("access_token"),
     refreshToken: text("refresh_token"),
     idToken: text("id_token"),
-    accessTokenExpiresAt: timestamp("access_token_expires_at"),
-    refreshTokenExpiresAt: timestamp("refresh_token_expires_at"),
+    accessTokenExpiresAt: timestamp("access_token_expires_at", {
+      mode: "date",
+    }),
+    refreshTokenExpiresAt: timestamp("refresh_token_expires_at", {
+      mode: "date",
+    }),
     scope: text("scope"),
     password: text("password"),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-    updatedAt: timestamp("updated_at")
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
       .defaultNow()
       .notNull()
       .$onUpdateFn(() => new Date()),
@@ -83,9 +89,9 @@ export const verifications = pgTable(
     id: text("id").primaryKey(),
     identifier: text("identifier").notNull(),
     value: text("value").notNull(),
-    expiresAt: timestamp("expires_at").notNull(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-    updatedAt: timestamp("updated_at")
+    expiresAt: timestamp("expires_at", { mode: "date" }).notNull(),
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
       .defaultNow()
       .notNull()
       .$onUpdateFn(() => new Date()),
@@ -97,8 +103,8 @@ export const rounds = pgTable(
   "rounds",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-    updatedAt: timestamp("updated_at")
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
       .defaultNow()
       .notNull()
       .$onUpdateFn(() => new Date()),
@@ -133,8 +139,8 @@ export const strategies = pgTable(
     name: text("name").notNull(),
     type: text("type").notNull(), // 'sequence' | 'algorithm'
     config: jsonb("config").notNull(), // Flexible configuration
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-    updatedAt: timestamp("updated_at")
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
       .defaultNow()
       .notNull()
       .$onUpdateFn(() => new Date()),
@@ -153,7 +159,7 @@ export const strategyAccess = pgTable(
     userId: text("user_id") // Changed to text
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
   },
   (table) => [
     index("strategy_access_strategy_idx").on(table.strategyId),
@@ -177,8 +183,8 @@ export const botSessions = pgTable(
     totalProfit: numeric("total_profit", { mode: "number" }).notNull(),
     logs: jsonb("logs").$type<string[]>(), // Array of log strings
     currentStep: integer("current_step").default(0), // Track progress in sequence
-    startedAt: timestamp("started_at").defaultNow().notNull(),
-    endedAt: timestamp("ended_at"),
+    startedAt: timestamp("started_at", { mode: "date" }).defaultNow().notNull(),
+    endedAt: timestamp("ended_at", { mode: "date" }),
   },
   (table) => [
     index("bot_sessions_user_idx").on(table.userId),
@@ -196,11 +202,71 @@ export const pakakumiCredentials = pgTable(
     label: text("label").notNull(), // e.g. "My Main Account"
     phone: text("phone").notNull(), // encrypted
     password: text("password").notNull(), // encrypted
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-    updatedAt: timestamp("updated_at")
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
       .defaultNow()
       .notNull()
       .$onUpdateFn(() => new Date()),
   },
   (table) => [index("pakakumi_credentials_user_idx").on(table.userId)],
+);
+
+export const telegramUsers = pgTable(
+  "telegram_users",
+  {
+    chatId: text("chat_id").primaryKey(),
+    username: text("username"),
+    expiryTimestamp: timestamp("expiry_timestamp", { mode: "date" }),
+    sessionState: text("session_state").notNull().default("command"), // 'command' | 'support'
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
+      .defaultNow()
+      .notNull()
+      .$onUpdateFn(() => new Date()),
+  },
+  (table) => [index("telegram_users_session_idx").on(table.sessionState)],
+);
+
+export const payments = pgTable(
+  "payments",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    chatId: text("chat_id")
+      .notNull()
+      .references(() => telegramUsers.chatId),
+    amount: integer("amount").notNull(),
+    status: text("status").default("pending").notNull(), // 'pending', 'success', 'failed'
+    durationPaidFor: integer("duration_paid_for").notNull(), // in days
+    reference: text("reference").notNull().unique(), // Paystack reference
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
+      .defaultNow()
+      .notNull()
+      .$onUpdateFn(() => new Date()),
+  },
+  (table) => [
+    index("payments_chat_id_idx").on(table.chatId),
+    index("payments_reference_idx").on(table.reference),
+  ],
+);
+
+export const supportTickets = pgTable(
+  "support_tickets",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    chatId: text("chat_id")
+      .notNull()
+      .references(() => telegramUsers.chatId),
+    message: text("message").notNull(),
+    status: text("status").default("open").notNull(), // 'open', 'resolved'
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
+      .defaultNow()
+      .notNull()
+      .$onUpdateFn(() => new Date()),
+  },
+  (table) => [
+    index("support_tickets_chat_id_idx").on(table.chatId),
+    index("support_tickets_status_idx").on(table.status),
+  ],
 );

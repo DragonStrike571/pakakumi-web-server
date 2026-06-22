@@ -1,35 +1,92 @@
 import { Router, Request, Response } from "express";
 import { botManager } from "../services/bot/manager.js";
 import { db } from "../db/index.js";
-import { strategies, botSessions, strategyAccess } from "../db/schema.js";
+import {
+  strategies,
+  botSessions,
+  strategyAccess,
+  pakakumiCredentials,
+} from "../db/schema.js";
 import { eq, and, or, exists, desc } from "drizzle-orm";
 import { z } from "zod";
 import { trycatch } from "../utils/try-catch.js";
 import { requireAuth } from "../middleware/auth.js";
 import { AuthenticatedRequest } from "../types/express.js";
+import { requireActiveAccess } from "../middleware/access.js";
+import rateLimit from "express-rate-limit";
+import { decrypt } from "../utils/crypto.js";
 
 const router = Router();
 
 router.use(requireAuth);
+router.use(requireActiveAccess(true)); // Block telegram_premium users
 
-const startBotSchema = z.object({
-  strategyId: z.uuid(),
-  initialCapital: z.number().positive(),
-  auth: z.object({
-    phone: z.string().min(1),
-    pass: z.string().min(1),
-  }),
+const botLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
-router.post("/start", async (req: Request, res: Response) => {
+const startBotSchema = z
+  .object({
+    strategyId: z.uuid(),
+    initialCapital: z.number().positive(),
+    credentialId: z.string().uuid().optional(),
+    auth: z
+      .object({
+        phone: z.string().min(1),
+        pass: z.string().min(1),
+      })
+      .optional(),
+  })
+  .refine((data) => data.credentialId || data.auth, {
+    message: "Either credentialId or auth must be provided",
+    path: ["credentialId"],
+  });
+
+router.post("/start", botLimiter, async (req: Request, res: Response) => {
   const validation = startBotSchema.safeParse(req.body);
   if (!validation.success) {
     res.status(400).json({ error: validation.error.format() });
     return;
   }
 
-  const { strategyId, initialCapital, auth } = validation.data;
+  const {
+    strategyId,
+    initialCapital,
+    credentialId,
+    auth: rawAuth,
+  } = validation.data;
   const userId = (req as AuthenticatedRequest).user.id;
+
+  let auth = rawAuth;
+
+  if (credentialId) {
+    const { data: cred, error } = await trycatch(async () => {
+      return await db.query.pakakumiCredentials.findFirst({
+        where: and(
+          eq(pakakumiCredentials.id, credentialId),
+          eq(pakakumiCredentials.userId, userId),
+        ),
+      });
+    });
+
+    if (error || !cred) {
+      res.status(404).json({ error: "Credential not found" });
+      return;
+    }
+
+    auth = {
+      phone: decrypt(cred.phone),
+      pass: decrypt(cred.password),
+    };
+  }
+
+  if (!auth) {
+    res.status(400).json({ error: "Authentication details missing" });
+    return;
+  }
 
   // Check concurrency limit
   const activeSessions = botManager.getActiveSessionsForUser(userId);
@@ -86,6 +143,10 @@ router.post("/start", async (req: Request, res: Response) => {
       throw new Error("Strategy access denied");
     }
 
+    if (!auth) {
+      throw new Error("Auth info missing");
+    }
+
     const sessionId = await botManager.startSession(
       userId,
       strategyId,
@@ -103,7 +164,9 @@ router.post("/start", async (req: Request, res: Response) => {
     if (err.message === "Strategy not found") {
       res.status(404).json({ error: "Strategy not found" });
     } else if (err.message === "Strategy access denied") {
-      res.status(403).json({ error: "You do not have access to this strategy" });
+      res
+        .status(403)
+        .json({ error: "You do not have access to this strategy" });
     } else {
       res.status(500).json({ error: err.message || "Failed to start bot" });
     }

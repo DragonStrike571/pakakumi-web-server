@@ -32,6 +32,7 @@ export class BotSession extends EventEmitter {
   private currentCapital = 0;
   private profit = 0;
   private logs: string[] = [];
+  private consecutiveErrors = 0;
 
   constructor(
     private browser: Browser,
@@ -328,6 +329,7 @@ export class BotSession extends EventEmitter {
       await betBtn.click();
 
       this.lastBet = { amount, cashout };
+      this.consecutiveErrors = 0; // Reset errors on successful bet
       this.log(`🎲 Placed Bet: ${amount} @ ${cashout}x`);
     } catch (error: any) {
       this.log(`❌ Error placing bet: ${error.message}`);
@@ -336,6 +338,12 @@ export class BotSession extends EventEmitter {
       this.log(`🔍 WHAT THE BOT SEES: \n ${pageText.substring(0, 500)}`);
 
       this.lastBet = null;
+      this.consecutiveErrors++;
+      
+      if (this.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        this.log(`🛑 Exceeded max consecutive errors (${MAX_CONSECUTIVE_ERRORS}). Stopping session.`);
+        await this.stop("failed");
+      }
     }
   }
 

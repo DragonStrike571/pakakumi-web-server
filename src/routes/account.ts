@@ -9,10 +9,27 @@ import { requireAuth } from "../middleware/auth.js";
 import { AuthenticatedRequest } from "../types/express.js";
 import { balancePool } from "../services/balance-pool.js";
 import { GAME_SELECTORS } from "../utils/selectors.js";
+import { requireActiveAccess } from "../middleware/access.js";
+import rateLimit from "express-rate-limit";
 
 const router = Router();
 
 router.use(requireAuth);
+router.use(requireActiveAccess());
+
+const credentialsLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const balanceLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // ────────────────────── Credential CRUD ──────────────────────
 
@@ -25,7 +42,7 @@ const saveCredentialSchema = z.object({
 /**
  * POST /account/credentials — Save encrypted credentials
  */
-router.post("/credentials", async (req: Request, res: Response) => {
+router.post("/credentials", credentialsLimiter, async (req: Request, res: Response) => {
   const validation = saveCredentialSchema.safeParse(req.body);
   if (!validation.success) {
     res.status(400).json({ error: validation.error.format() });
@@ -122,7 +139,7 @@ router.delete("/credentials/:id", async (req: Request, res: Response) => {
 // ────────────────────── Balance Check ──────────────────────
 
 const balanceCheckSchema = z.object({
-  credentialId: z.string().uuid().optional(),
+  credentialId: z.uuid().optional(),
   phone: z.string().min(1).optional(),
   pass: z.string().min(1).optional(),
 });
@@ -131,7 +148,7 @@ const balanceCheckSchema = z.object({
  * POST /account/balance — Check Pakakumi balance via headless browser
  * Accepts either { credentialId } or { phone, pass }
  */
-router.post("/balance", async (req: Request, res: Response) => {
+router.post("/balance", balanceLimiter, async (req: Request, res: Response) => {
   const validation = balanceCheckSchema.safeParse(req.body);
   if (!validation.success) {
     res
@@ -188,7 +205,9 @@ router.post("/balance", async (req: Request, res: Response) => {
       console.log("[Balance] Login page loaded, filling form...");
 
       // Wait for login fields - support both previous and current selectors
-      await page.waitForSelector(GAME_SELECTORS.LOGIN.PHONE_INPUT, { timeout: 10000 });
+      await page.waitForSelector(GAME_SELECTORS.LOGIN.PHONE_INPUT, {
+        timeout: 10000,
+      });
 
       // Try multiple possible selectors since game UI updates frequently
       const phoneInput = await page.$(GAME_SELECTORS.LOGIN.PHONE_INPUT);

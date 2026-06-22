@@ -3,13 +3,7 @@ import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { db } from "../db/index.js";
 import { users, sessions, accounts, verifications } from "../db/schema.js";
 
-// CORS origins — Better Auth needs these to set its own CORS headers
-const CORS_ORIGINS = [
-  "https://pakakumi-web-client.vercel.app",
-  "https://pakakumi.softdocs.org",
-  "http://localhost:3000",
-  "http://localhost:5173",
-];
+import { CORS_ORIGINS } from "../config/cors.js";
 
 export const auth = betterAuth({
   database: drizzleAdapter(db, {
@@ -21,14 +15,22 @@ export const auth = betterAuth({
       verification: verifications,
     },
   }),
+  user: {
+    additionalFields: {
+      role: {
+        type: "string",
+        defaultValue: "user"
+      },
+      accessStatus: {
+        type: "string",
+        defaultValue: "pending"
+      }
+    }
+  },
   emailAndPassword: {
     enabled: true,
   },
-  trustedOrigins: [
-    "https://pakakumi-web-client.vercel.app",
-    "http://localhost:3000",
-    "http://localhost:5173",
-  ],
+  trustedOrigins: CORS_ORIGINS,
   advanced: {
     useSecureCookies: true,
     defaultCookieAttributes: {

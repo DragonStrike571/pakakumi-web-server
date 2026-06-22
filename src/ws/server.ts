@@ -1,6 +1,7 @@
 import { Server } from "http";
 import { WebSocket, WebSocketServer } from "ws";
 import { Round } from "../validation/rounds.js";
+import { CORS_ORIGINS } from "../config/cors.js";
 
 type WsPayload =
   | { type: "welcome"; message: string }
@@ -24,13 +25,6 @@ function broadcastJson(wss: WebSocketServer, payload: WsPayload) {
   }
 }
 
-const CORS_ORIGINS = [
-  "https://pakakumi-web-client.vercel.app",
-  "https://pakakumi.softdocs.org",
-  "http://localhost:3000",
-  "http://localhost:5173",
-];
-
 export function attachWebSocketServer(httpServer: Server) {
   const wss = new WebSocketServer({
     server: httpServer,
@@ -38,15 +32,18 @@ export function attachWebSocketServer(httpServer: Server) {
     maxPayload: 1024 * 1024,
     verifyClient: (info, cb) => {
       const origin = info.origin;
-      if (!origin) {
+      // Remove trailing slash from origin if present
+      const cleanOrigin = origin.endsWith("/") ? origin.slice(0, -1) : origin;
+
+      if (!cleanOrigin) {
         // Require origin header
         cb(false, 401, "Unauthorized");
         return;
       }
-      if (CORS_ORIGINS.includes(origin)) {
+      if (CORS_ORIGINS.includes(cleanOrigin)) {
         cb(true);
       } else {
-        cb(false, 403, "Forbidden");
+        cb(false, 403, `Forbidden: ${cleanOrigin}`);
       }
     },
   });
