@@ -57,6 +57,8 @@ export async function runAnalysis(newRound?: {
     if (hitSignals.length > 0) {
       systemStats.hits += hitSignals.length;
 
+      hitSignals.forEach((s) => cooldownMap.delete(s.target));
+
       const bestHit = hitSignals.reduce((prev, current) =>
         prev.target > current.target ? prev : current,
       );
@@ -266,8 +268,13 @@ export async function runAnalysis(newRound?: {
 
         const premiumKb = new InlineKeyboard()
           .url(
-            "⚙️ Plan My Bets",
+            "⚙️ Plan My Bets (Plan w/out Risk Management)",
             `https://t.me/${botUsername}?start=strat_${cluster[0].target}`,
+          )
+          .row()
+          .url(
+            "🛡️ Get Survival Plan (Plan w/ Risk Management)",
+            `https://t.me/${botUsername}?start=plan_${cluster[0].target}`,
           )
           .row()
           .url("❓ Read the Guide", `https://t.me/${botUsername}?start=guide`);

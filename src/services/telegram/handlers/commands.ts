@@ -5,6 +5,7 @@ import { db } from "../../../db/index.js";
 import { telegramUsers, rounds } from "../../../db/schema.js";
 import { eq, desc, gte } from "drizzle-orm";
 import { generateAlgorithmBets } from "../../../utils/strategies/core.js";
+import { formatRiskMessage } from "../risk.js";
 
 async function isUserPremium(chatId: string): Promise<boolean> {
   const user = await db
@@ -48,6 +49,18 @@ export function setupCommands(bot: Bot<MyContext>) {
     ctx.dbState = "command";
 
     const payload = ctx.match;
+    if (payload.startsWith("plan_")) {
+      const target = payload.replace("plan_", "");
+
+      const msg =
+        `🎯 **Target: ${target}x**\n\n` +
+        `Let's make sure you don't go broke hitting this.\n\n` +
+        `How much cash do you have right now? Type your balance and the target like this:\n\n` +
+        `\`/plan 1000 ${target}\``;
+
+      return ctx.reply(msg, { parse_mode: "Markdown" });
+    }
+
     if (payload.startsWith("strat_")) {
       const target = payload.split("_")[1];
       return ctx.reply(
@@ -320,6 +333,32 @@ export function setupCommands(bot: Bot<MyContext>) {
       response += `\n_...and ${sequence.length - 20} more rounds._\n`;
     response += `\n\n**Total losses you can survive:** ${sequence.length - 1}`;
     await ctx.reply(response, { parse_mode: "Markdown" });
+  });
+
+  bot.command("plan", async (ctx) => {
+    const args = ctx.match.split(" ");
+
+    if (args.length !== 2) {
+      return ctx.reply(
+        "❌ **Wrong format.**\n\nType it like this: `/plan [YourCash] [Target]`\nExample: `/plan 5000 2.5`",
+        { parse_mode: "Markdown" },
+      );
+    }
+
+    const bankroll = Number(args[0]);
+    const target = Number(args[1]);
+
+    if (isNaN(bankroll) || bankroll < 10) {
+      return ctx.reply("❌ Invalid cash amount. Minimum is 10 KES.");
+    }
+    if (isNaN(target) || target <= 1.01) {
+      return ctx.reply("❌ Invalid target multiplier.");
+    }
+
+    // Generate the simple text we created earlier
+    const riskMsg = formatRiskMessage(bankroll, target);
+
+    await ctx.reply(riskMsg, { parse_mode: "Markdown" });
   });
 
   bot.command("terms", async (ctx) => {
