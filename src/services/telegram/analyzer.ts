@@ -268,12 +268,12 @@ export async function runAnalysis(newRound?: {
 
         const premiumKb = new InlineKeyboard()
           .url(
-            "⚙️ Plan My Bets (Plan w/out Risk Management)",
+            "⚙️ Plan My Bets (No Risk Management)",
             `https://t.me/${botUsername}?start=strat_${cluster[0].target}`,
           )
           .row()
           .url(
-            "🛡️ Get Survival Plan (Plan w/ Risk Management)",
+            "🛡️ Get Survival Plan (Risk Management)",
             `https://t.me/${botUsername}?start=plan_${cluster[0].target}`,
           )
           .row()
