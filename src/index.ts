@@ -161,6 +161,18 @@ Promise.all([roundService.initialize(), botManager.initialize()])
   })
   .catch((err) => console.error("❌ Failed to initialize services:", err));
 
+// Catch unhandled promises that bypass the Express/Grammy error handlers
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("🚨 Unhandled Rejection at:", promise, "reason:", reason);
+  // Do not exit the process here; log it and let it recover
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("🚨 Uncaught Exception thrown:", error);
+  // If it's a critical core crash, log and allow PM2/Docker to restart it safely
+  process.exit(1);
+});
+
 server.listen(PORT, HOST, () => {
   const baseUrl =
     HOST === "0.0.0.0" ? `http://localhost:${PORT}` : `http://${HOST}:${PORT}`;
