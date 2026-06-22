@@ -66,6 +66,10 @@ export function setupCommands(bot: Bot<MyContext>) {
       );
     }
 
+    if (payload === "guide") {
+      return triggerGuide(ctx);
+    }
+
     if (payload === "premium") {
       return triggerPremiumMenu(ctx);
     }
