@@ -1,6 +1,6 @@
 import { db } from "../../db/index.js";
 import { payments, telegramUsers } from "../../db/schema.js";
-import { eq } from "drizzle-orm";
+import { eq, and, gte } from "drizzle-orm";
 import { bot } from "../telegram/bot.js";
 
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || "";
@@ -14,6 +14,7 @@ export async function initializePayment(
   amountKES: number,
   chatId: string,
   durationPaidFor: number,
+  callbackUrl: string,
 ) {
   if (!PAYSTACK_SECRET_KEY) throw new Error("PAYSTACK_SECRET_KEY is not set");
 
@@ -30,6 +31,7 @@ export async function initializePayment(
       email,
       amount: amountInCents,
       currency: "KES",
+      callback_url: callbackUrl,
       metadata: { chatId, durationPaidFor },
     }),
   });
@@ -70,39 +72,87 @@ export async function verifyPayment(reference: string) {
 /**
  * 3. The web-hook free background polling loop.
  */
+/**
+ * 3. The web-hook free background polling loop.
+ */
 export function startPaystackPolling() {
-  const POLLING_INTERVAL = 30 * 1000; // Run every 30 seconds for fast fulfillment
+  const POLLING_INTERVAL = 15 * 1000; // 15 seconds for aggressive fulfillment
 
-  setInterval(async () => {
+  const runPoller = async () => {
     try {
+      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+
       const pendingPayments = await db
         .select()
         .from(payments)
-        .where(eq(payments.status, "pending"));
-
+        .where(
+          and(
+            eq(payments.status, "pending"),
+            // Assuming you have a createdAt column. If not, add one immediately.
+            gte(payments.createdAt, oneHourAgo),
+          ),
+        );
       for (const payment of pendingPayments) {
         try {
-          const data = await verifyPayment(payment.reference);
-
-          if (data.status && data.data.status === "success") {
-            await handleSuccessfulPayment(payment.reference, data.data);
-          } else if (
-            data.status &&
-            (data.data.status === "failed" || data.data.status === "abandoned")
-          ) {
+          // Optional: If you have a createdAt column, kill the invoice if it's older than 15 minutes
+          // to stop the bot from polling it forever if the user abandoned it.
+          const ageMinutes =
+            (Date.now() - new Date(payment.createdAt).getTime()) / 60000;
+          if (ageMinutes > 15) {
             await db
               .update(payments)
               .set({ status: "failed" })
               .where(eq(payments.reference, payment.reference));
+            continue;
           }
+
+          const data = await verifyPayment(payment.reference);
+
+          if (data.status && data.data) {
+            const paystackStatus = data.data.status;
+
+            if (paystackStatus === "success") {
+              await handleSuccessfulPayment(payment.reference, data.data);
+            } else if (
+              paystackStatus === "failed" ||
+              paystackStatus === "abandoned"
+            ) {
+              // M-Pesa explicitly rejected it (wrong PIN, insufficient funds, or 60s timeout)
+              await db
+                .update(payments)
+                .set({ status: "failed" })
+                .where(eq(payments.reference, payment.reference));
+
+              // Notify the user so they aren't waiting in silence
+              if (bot) {
+                await bot.api
+                  .sendMessage(
+                    payment.chatId,
+                    "❌ **Payment Failed or Cancelled**\n\nThe M-Pesa request timed out, lacked funds, or was cancelled. If you still want Premium, please generate a new link.",
+                    { parse_mode: "Markdown" },
+                  )
+                  .catch(console.error); // Catch in case they blocked the bot
+              }
+            }
+            // If paystackStatus is 'pending', 'ongoing', or 'send_pin', DO NOTHING. Let it loop again.
+          }
+
+          // Throttle requests: wait 200ms between checking each payment to respect Paystack API limits
+          await new Promise((res) => setTimeout(res, 200));
         } catch (err) {
           console.error(`Error polling payment ${payment.reference}:`, err);
         }
       }
     } catch (err) {
       console.error("Error in paystack polling loop:", err);
+    } finally {
+      // Schedule the next poll ONLY after this entire batch finishes
+      setTimeout(runPoller, POLLING_INTERVAL);
     }
-  }, POLLING_INTERVAL);
+  };
+
+  // Kick off the first loop
+  setTimeout(runPoller, POLLING_INTERVAL);
 }
 
 /**

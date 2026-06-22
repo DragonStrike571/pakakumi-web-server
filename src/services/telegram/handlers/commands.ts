@@ -60,6 +60,12 @@ export function setupCommands(bot: Bot<MyContext>) {
       );
     }
 
+    if (payload === "paid") {
+      return ctx.reply(
+        "⏳ Welcome back! If you completed the payment, your Premium access link will arrive here within the next 15-30 seconds automatically.",
+      );
+    }
+
     if (payload === "premium") {
       return triggerPremiumMenu(ctx);
     }
@@ -103,19 +109,31 @@ export function setupCommands(bot: Bot<MyContext>) {
       const loadingMsg = await ctx.reply("⏳ Generating your M-Pesa link...");
 
       try {
+        const callbackUrl = `https://t.me/${bot.botInfo.username}?start=paid`;
+
         const payment = await initializePayment(
-          `user_${chatId}@pakakumi-oracle.softdocs.org`,
+          `user_${chatId}@oracle.internal`,
           amountKES,
           chatId,
           duration,
+          callbackUrl,
         );
 
         if (payment && payment.status) {
           await bot.api.editMessageText(
             chatId,
             loadingMsg.message_id,
-            `💳 **Pay via M-Pesa**\n\nPlan: ${duration} Days\n\nClick the link below to pay:\n${payment.data.authorization_url}\n\n_Your access link will be sent automatically after payment._`,
-            { parse_mode: "Markdown" },
+            `💳 **M-Pesa Payment Initiated**\n\n` +
+              `**Plan:** ${duration} Days\n\n` +
+              `1️⃣ Click the link below to open the secure payment portal.\n` +
+              `2️⃣ Enter your M-Pesa number and wait for the STK prompt on your phone.\n` +
+              `3️⃣ Enter your PIN.\n\n` +
+              `🔗 **[Open Payment Portal](${payment.data.authorization_url})**\n\n` +
+              `_⚠️ Note: M-Pesa can take up to 30 seconds to send the prompt. We verify payments every 30 seconds. Once paid, you will be automatically redirected here and granted access._`,
+            {
+              parse_mode: "Markdown",
+              link_preview_options: { is_disabled: true },
+            },
           );
         } else {
           // Log the exact payload to see why Paystack rejected it

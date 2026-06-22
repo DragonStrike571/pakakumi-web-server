@@ -171,24 +171,31 @@ export async function runAnalysis(newRound?: {
 
   if (rawAlerts.length === 0) return [];
 
-  // CLUSTERING: Group by target size proximity (e.g., 15x and 20x group together)
+  // =========================================================================
+  // STEP 2.5: ANCHOR-BASED CLUSTERING
+  // =========================================================================
   const clusters = [];
   rawAlerts.sort((a, b) => a.target - b.target);
 
-  let currentCluster = [rawAlerts[0]];
-  for (let i = 1; i < rawAlerts.length; i++) {
-    const current = rawAlerts[i];
-    const prev = currentCluster[currentCluster.length - 1];
+  if (rawAlerts.length > 0) {
+    let currentCluster = [rawAlerts[0]];
+    let clusterAnchor = rawAlerts[0].target; // Strict boundary anchor
 
-    // Group if the target multiplier is within 50% of the previous one in the loop
-    if (current.target <= prev.target * 1.5) {
-      currentCluster.push(current);
-    } else {
-      clusters.push([...currentCluster]);
-      currentCluster = [current];
+    for (let i = 1; i < rawAlerts.length; i++) {
+      const current = rawAlerts[i];
+
+      // Group ONLY if target is within 50% of the CLUSTER'S ANCHOR
+      // This immediately kills the infinite chaining effect
+      if (current.target <= clusterAnchor * 1.5) {
+        currentCluster.push(current);
+      } else {
+        clusters.push([...currentCluster]);
+        currentCluster = [current];
+        clusterAnchor = current.target; // Set new anchor
+      }
     }
+    if (currentCluster.length > 0) clusters.push(currentCluster);
   }
-  if (currentCluster.length > 0) clusters.push(currentCluster);
 
   // =========================================================================
   // STEP 3: DISPATCH ALERTS
@@ -206,10 +213,28 @@ export async function runAnalysis(newRound?: {
         cluster.reduce((sum, c) => sum + c.confidence, 0) / cluster.length,
       );
 
-      // Build a realistic Action Window based on the highest target in the cluster
-      const highestTarget = Math.max(...cluster.map((c) => c.target));
-      const planRounds = Math.max(10, Math.ceil(highestTarget * 0.3));
-      const roundsRange = `1 to ${planRounds}`;
+      // Extract the algorithm's actual expected gap math
+      const minExpected = Math.min(
+        ...cluster.map((c) => c.expectedRoundsRemaining),
+      );
+      const maxExpected = Math.max(
+        ...cluster.map((c) => c.expectedRoundsRemaining),
+      );
+
+      // Add a dynamic safety buffer based on the lowest target in the cluster
+      // Lower targets get smaller buffers, massive targets get larger survival buffers
+      const safetyBuffer = Math.max(5, Math.ceil(cluster[0].target * 0.2));
+      const lowerLimit = Math.max(1, minExpected);
+
+      // Force upperLimit to always be at least equal to lowerLimit
+      const upperLimit = Math.max(lowerLimit, maxExpected + safetyBuffer);
+
+      const planRounds = upperLimit;
+
+      const roundsRange =
+        lowerLimit === upperLimit
+          ? `Within ${upperLimit}`
+          : `${lowerLimit} to ${upperLimit}`;
 
       const status =
         cluster[0].overdueRatio >= 2.0 ? "Very Overdue" : "Hot & Ready";

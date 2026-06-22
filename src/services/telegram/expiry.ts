@@ -1,7 +1,7 @@
 // expiry.ts
 import { db } from "../../db/index.js";
 import { telegramUsers } from "../../db/schema.js";
-import { lt, and } from "drizzle-orm";
+import { lt, and, eq } from "drizzle-orm";
 import { bot } from "./bot.js";
 
 // Helper to prevent API throttling
@@ -21,14 +21,14 @@ export function startExpiryKicker() {
         .where(
           and(
             lt(telegramUsers.expiryTimestamp, now),
-            // eq(telegramUsers.status, "ACTIVE"), // Uncomment when you add status
+            // eq(telegramUsers.status, "ACTIVE"), // REQUIRED
           ),
         );
 
       for (const user of expiredUsers) {
         try {
           await bot!.api.banChatMember(PRIVATE_CHANNEL_ID, Number(user.chatId));
-          await sleep(200); // 200ms delay between actions to respect API limits
+          await sleep(200);
 
           await bot!.api.unbanChatMember(
             PRIVATE_CHANNEL_ID,
@@ -36,11 +36,17 @@ export function startExpiryKicker() {
           );
           await sleep(200);
 
+          // // Mark user as inactive so they are never queried again
+          // await db
+          //   .update(telegramUsers)
+          //   .set({ status: "INACTIVE" })
+          //   .where(eq(telegramUsers.chatId, user.chatId));
+
           const msg = `⏳ **Subscription Expired**\n\nYour premium access has concluded. You have been removed from the live channel.\n\nType /start to renew your access.`;
           await bot!.api.sendMessage(user.chatId, msg, {
             parse_mode: "Markdown",
           });
-          await sleep(500); // Wait half a second before processing the next user
+          await sleep(500);
         } catch (err) {
           console.error(`Failed to kick user ${user.chatId}:`, err);
         }
