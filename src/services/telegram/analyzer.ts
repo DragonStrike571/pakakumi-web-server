@@ -119,12 +119,12 @@ export async function runAnalysis(newRound?: {
   }
 
   // =========================================================================
-  // STEP 2: GENERATE SIGNALS
+  // STEP 2: MATHEMATICAL SIGNAL GENERATION
   // =========================================================================
   const rawAlerts = [];
 
   for (const target of TARGETS) {
-    const expectedGap = target / (1 - HOUSE_EDGE);
+    const expectedGap = target / (1 - HOUSE_EDGE); // True statistical frequency
     const K = 5;
     const occIndices: number[] = [];
 
@@ -144,27 +144,36 @@ export async function runAnalysis(newRound?: {
     if (gapsUsed > 0) {
       const sumOfPreviousGaps = occIndices[gapsUsed] - occIndices[0];
       const expectedTotalForNextGaps = (gapsUsed + 1) * expectedGap;
+
+      // Mean Reversion Target: What the next gap SHOULD be to balance the RTP
       expectedNextGap = expectedTotalForNextGaps - sumOfPreviousGaps;
-      if (expectedNextGap < 1) expectedNextGap = 1;
     }
 
-    const overdueRatio = currentGap / expectedNextGap;
-
-    const baseConfidence = overdueRatio * 50;
-    const riskPenalty = Math.log10(target) * 8;
-    let confidence = Math.min(99, Math.round(baseConfidence - riskPenalty));
-
+    // Pure mathematical deficit
     const expectedRoundsRemaining = Math.max(
       0,
       Math.round(expectedNextGap - currentGap),
     );
+    const pureOverdueRatio = currentGap / expectedGap;
+
+    // Confidence purely derived from Mean Reversion proximity
+    let confidence = 0;
+    if (expectedNextGap <= 0) {
+      // Past gaps were so massive that a hit is mathematically owed immediately
+      confidence = 99;
+    } else {
+      // Scales to 100% exactly as the current gap approaches the Mean Reversion point
+      const baseConfidence = (currentGap / expectedNextGap) * 100;
+      confidence = Math.min(99, Math.round(baseConfidence));
+    }
 
     if (confidence >= 75 && !cooldownMap.has(target)) {
       rawAlerts.push({
         target,
         confidence,
+        expectedGap, // Pass this for the Action Window calculation
         expectedRoundsRemaining,
-        overdueRatio,
+        pureOverdueRatio,
       });
     }
   }
@@ -179,19 +188,17 @@ export async function runAnalysis(newRound?: {
 
   if (rawAlerts.length > 0) {
     let currentCluster = [rawAlerts[0]];
-    let clusterAnchor = rawAlerts[0].target; // Strict boundary anchor
+    let clusterAnchor = rawAlerts[0].target;
 
     for (let i = 1; i < rawAlerts.length; i++) {
       const current = rawAlerts[i];
 
-      // Group ONLY if target is within 50% of the CLUSTER'S ANCHOR
-      // This immediately kills the infinite chaining effect
       if (current.target <= clusterAnchor * 1.5) {
         currentCluster.push(current);
       } else {
         clusters.push([...currentCluster]);
         currentCluster = [current];
-        clusterAnchor = current.target; // Set new anchor
+        clusterAnchor = current.target;
       }
     }
     if (currentCluster.length > 0) clusters.push(currentCluster);
@@ -213,31 +220,39 @@ export async function runAnalysis(newRound?: {
         cluster.reduce((sum, c) => sum + c.confidence, 0) / cluster.length,
       );
 
-      // Extract the algorithm's actual expected gap math
-      const minExpected = Math.min(
+      // Extract raw statistical data
+      const minRemaining = Math.min(
         ...cluster.map((c) => c.expectedRoundsRemaining),
       );
-      const maxExpected = Math.max(
+      const maxRemaining = Math.max(
         ...cluster.map((c) => c.expectedRoundsRemaining),
       );
 
-      // Add a dynamic safety buffer based on the lowest target in the cluster
-      // Lower targets get smaller buffers, massive targets get larger survival buffers
-      const safetyBuffer = Math.max(5, Math.ceil(cluster[0].target));
-      const lowerLimit = Math.max(1, minExpected);
+      // Use the highest expected gap in the cluster as the mathematical baseline
+      const baseExpectedGap = Math.round(
+        Math.max(...cluster.map((c) => c.expectedGap)),
+      );
 
-      // Force upperLimit to always be at least equal to lowerLimit
-      const upperLimit = Math.max(lowerLimit, maxExpected + safetyBuffer);
+      let roundsRange = "";
+      let planRounds = 0;
 
-      const planRounds = upperLimit;
-
-      const roundsRange =
-        lowerLimit === upperLimit
-          ? `Within ${upperLimit}`
-          : `${lowerLimit} to ${upperLimit}`;
+      if (maxRemaining > 0) {
+        // The hit is expected within this exact mathematical window
+        const lowerLimit = Math.max(1, minRemaining);
+        planRounds = maxRemaining;
+        roundsRange =
+          lowerLimit === planRounds
+            ? `Within ${planRounds}`
+            : `${lowerLimit} to ${planRounds}`;
+      } else {
+        // Mathematically overdue. The mean reversion point has passed.
+        // The safest statistical play is covering 1 full natural probability cycle.
+        planRounds = baseExpectedGap;
+        roundsRange = `Overdue (Plan ${planRounds})`;
+      }
 
       const status =
-        cluster[0].overdueRatio >= 2.0 ? "Very Overdue" : "Hot & Ready";
+        cluster[0].pureOverdueRatio >= 1.5 ? "Very Overdue" : "Hot & Ready";
 
       // 1. PREMIUM DISPATCH
       if (privateChannelId) {
