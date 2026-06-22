@@ -223,7 +223,7 @@ export async function runAnalysis(newRound?: {
 
       // Add a dynamic safety buffer based on the lowest target in the cluster
       // Lower targets get smaller buffers, massive targets get larger survival buffers
-      const safetyBuffer = Math.max(5, Math.ceil(cluster[0].target * 0.2));
+      const safetyBuffer = Math.max(5, Math.ceil(cluster[0].target));
       const lowerLimit = Math.max(1, minExpected);
 
       // Force upperLimit to always be at least equal to lowerLimit
