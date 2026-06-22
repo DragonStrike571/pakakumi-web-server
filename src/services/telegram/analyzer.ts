@@ -2,6 +2,7 @@ import { db } from "../../db/index.js";
 import { rounds } from "../../db/schema.js";
 import { desc } from "drizzle-orm";
 import { bot } from "./bot.js";
+import { InlineKeyboard } from "grammy";
 
 const HOUSE_EDGE = 0.01; // 1%
 const TARGETS = [
@@ -10,23 +11,24 @@ const TARGETS = [
   2000, 2500, 3000,
 ];
 
-// In-Memory Cache for fast sequential reads
 let cachedRounds: { bust: number; createdAt: Date }[] = [];
 
-// THE SIGNAL QUEUE: Tracks active signals waiting for a mathematical win
 interface ActiveSignal {
   target: number;
   confidence: number;
   roundsElapsed: number;
-  maxLifespan: number; // Dynamically calculated limit before the queue drops it
+  maxLifespan: number; // Now completely adaptive
 }
 let pendingProofs: ActiveSignal[] = [];
+
+const cooldownMap = new Map<number, number>();
+let systemStats = { hits: 0, signals: 0 };
+let currentRoundIndex = 0;
 
 export async function runAnalysis(newRound?: {
   bust: number;
   createdAt: Date;
 }) {
-  // 1. POPULATE OR UPDATE CACHE
   if (cachedRounds.length === 0) {
     cachedRounds = await db.query.rounds.findMany({
       orderBy: [desc(rounds.createdAt)],
@@ -36,6 +38,7 @@ export async function runAnalysis(newRound?: {
   } else if (newRound) {
     cachedRounds.unshift(newRound);
     if (cachedRounds.length > 10000) cachedRounds.pop();
+    currentRoundIndex++;
   }
 
   const recentRounds = cachedRounds;
@@ -43,39 +46,58 @@ export async function runAnalysis(newRound?: {
 
   const publicChannelId = process.env.PUBLIC_CHANNEL_ID;
   const privateChannelId = process.env.PRIVATE_CHANNEL_ID;
+  const botUsername = bot?.botInfo?.username || "PakakumiOracleBot";
 
   // =========================================================================
-  // STEP 1: EVALUATE PENDING SIGNALS FOR PUBLIC MARKETING (THE FOMO MACHINE)
+  // STEP 1: EVALUATE PENDING SIGNALS & UPDATE STATS
   // =========================================================================
   if (newRound && pendingProofs.length > 0) {
     const hitSignals = pendingProofs.filter((s) => newRound.bust >= s.target);
 
     if (hitSignals.length > 0) {
+      systemStats.hits += hitSignals.length;
+
       const bestHit = hitSignals.reduce((prev, current) =>
         prev.target > current.target ? prev : current,
       );
 
-      // 1. Send FOMO Proof to Public Channel
+      const winRate = (
+        (systemStats.hits / Math.max(1, systemStats.signals)) *
+        100
+      ).toFixed(1);
+
+      // 1. Send Proof to Free Channel
       if (publicChannelId) {
         const publicProofMsg =
-          `🔥 <b>SYSTEM WIN VERIFIED ON-CHAIN</b> 🔥\n\n` +
-          `🎯 <b>Target Hunted:</b> &gt;${bestHit.target.toFixed(2)}x\n` +
-          `✅ <b>Actual House Crash:</b> ${newRound.bust}x\n\n` +
-          `Premium members were notified before this flight took off.\n\n` +
-          `👇 <b>Upgrade via Bot to get live entries</b>`;
+          `🔥 <b>TARGET HIT</b> 🔥\n\n` +
+          `🎯 <b>Target:</b> &gt;${bestHit.target.toFixed(2)}x\n` +
+          `✅ <b>Actual Crash:</b> ${newRound.bust}x\n\n` +
+          `📊 <b>Accuracy:</b> ${winRate}%\n\n` +
+          `Premium members got this alert early.`;
+
+        const publicKb = new InlineKeyboard()
+          .url(
+            "Get Premium Alerts",
+            `https://t.me/${botUsername}?start=premium`,
+          )
+          .row()
+          .url("Join Free Chat", "https://t.me/your_free_chat_link");
 
         bot?.api
-          .sendMessage(publicChannelId, publicProofMsg, { parse_mode: "HTML" })
+          .sendMessage(publicChannelId, publicProofMsg, {
+            parse_mode: "HTML",
+            reply_markup: publicKb,
+          })
           .catch(console.error);
       }
 
-      // 2. NEW: Send Execution Proof to Premium Channel
+      // 2. Send Proof to Premium Channel
       if (privateChannelId) {
         const premiumProofMsg =
-          `✅ **TARGET RESOLVED**\n\n` +
-          `The algorithm successfully mapped the >${bestHit.target.toFixed(2)}x exit.\n` +
+          `✅ **TARGET SECURED**\n\n` +
+          `Target: >${bestHit.target.toFixed(2)}x\n` +
           `Actual Crash: **${newRound.bust}x**\n\n` +
-          `_System matrix updated. Awaiting next variance pocket._`;
+          `_Waiting for the next hot target._`;
 
         bot?.api
           .sendMessage(privateChannelId, premiumProofMsg, {
@@ -89,21 +111,23 @@ export async function runAnalysis(newRound?: {
     pendingProofs = pendingProofs
       .filter((s) => newRound.bust < s.target)
       .map((s) => ({ ...s, roundsElapsed: s.roundsElapsed + 1 }))
-      .filter((s) => s.roundsElapsed < s.maxLifespan);
+      .filter((s) => {
+        const alive = s.roundsElapsed < s.maxLifespan;
+        if (!alive) cooldownMap.delete(s.target);
+        return alive;
+      });
   }
 
   // =========================================================================
-  // STEP 2: GENERATE NEW ALGORITHMIC SIGNALS
+  // STEP 2: GENERATE SIGNALS
   // =========================================================================
-  const analysisResults = [];
-  const alertsToDispatch = [];
+  const rawAlerts = [];
 
   for (const target of TARGETS) {
     const expectedGap = target / (1 - HOUSE_EDGE);
-
-    // Find up to 6 occurrences to get 5 previous gaps
     const K = 5;
     const occIndices: number[] = [];
+
     for (let i = 0; i < recentRounds.length; i++) {
       if (recentRounds[i].bust >= target) {
         occIndices.push(i);
@@ -115,99 +139,163 @@ export async function runAnalysis(newRound?: {
 
     const currentGap = occIndices[0];
     const gapsUsed = occIndices.length - 1;
-
     let expectedNextGap = expectedGap;
 
     if (gapsUsed > 0) {
       const sumOfPreviousGaps = occIndices[gapsUsed] - occIndices[0];
       const expectedTotalForNextGaps = (gapsUsed + 1) * expectedGap;
-
       expectedNextGap = expectedTotalForNextGaps - sumOfPreviousGaps;
-      if (expectedNextGap < 1) expectedNextGap = 1; // Clamp to avoid negatives
+      if (expectedNextGap < 1) expectedNextGap = 1;
     }
 
     const overdueRatio = currentGap / expectedNextGap;
 
-    let overdueChance = 0;
-    if (overdueRatio >= 1.0) overdueChance = 50;
-    if (overdueRatio >= 1.2) overdueChance = 60;
-    if (overdueRatio >= 1.5) overdueChance = 75;
-    if (overdueRatio >= 1.8) overdueChance = 95;
-    if (overdueRatio >= 2.0) overdueChance = 99; // Imminent
+    const baseConfidence = overdueRatio * 50;
+    const riskPenalty = Math.log10(target) * 8;
+    let confidence = Math.min(99, Math.round(baseConfidence - riskPenalty));
 
-    analysisResults.push({
-      target,
-      expectedGap,
-      currentGap,
-      expectedNextGap,
-      overdueChance,
-    });
+    const expectedRoundsRemaining = Math.max(
+      0,
+      Math.round(expectedNextGap - currentGap),
+    );
 
-    // Only dispatch highly actionable setups
-    if (overdueChance >= 75) {
-      alertsToDispatch.push({
+    if (confidence >= 75 && !cooldownMap.has(target)) {
+      rawAlerts.push({
         target,
-        overdueChance,
-        expectedNextGap,
-        currentGap,
+        confidence,
+        expectedRoundsRemaining,
+        overdueRatio,
       });
     }
   }
 
-  // =========================================================================
-  // STEP 3: DISPATCH ALERTS (PREMIUM VS PUBLIC)
-  // =========================================================================
-  if (alertsToDispatch.length > 0 && bot) {
-    // 1. Send actionable entries to PREMIUM channel
-    if (privateChannelId) {
-      const premiumText = alertsToDispatch
-        .map(
-          (alert) =>
-            `⚠️ <b>LIVE ENTRY DETECTED</b>\n\n` +
-            `<b>Target:</b> &gt;${alert.target}x\n` +
-            `<b>Confidence:</b> ${alert.overdueChance}%\n` +
-            `<b>Current Gap:</b> ${alert.currentGap} rounds\n` +
-            `<b>Signal Strength:</b> ${alert.overdueChance >= 95 ? "🔴 EXTREME" : "🟡 HIGH"}`,
-        )
-        .join("\n\n---\n\n");
+  if (rawAlerts.length === 0) return [];
 
-      bot.api
-        .sendMessage(privateChannelId, premiumText, { parse_mode: "HTML" })
-        .catch(console.error);
+  // CLUSTERING
+  const clusters = [];
+  rawAlerts.sort(
+    (a, b) => a.expectedRoundsRemaining - b.expectedRoundsRemaining,
+  );
+
+  let currentCluster = [rawAlerts[0]];
+  for (let i = 1; i < rawAlerts.length; i++) {
+    const current = rawAlerts[i];
+    const prev = currentCluster[currentCluster.length - 1];
+
+    const roundsDiff = Math.abs(
+      current.expectedRoundsRemaining - prev.expectedRoundsRemaining,
+    );
+    if (roundsDiff <= Math.max(5, prev.expectedRoundsRemaining * 0.2)) {
+      currentCluster.push(current);
+    } else {
+      clusters.push([...currentCluster]);
+      currentCluster = [current];
     }
+  }
+  if (currentCluster.length > 0) clusters.push(currentCluster);
 
-    // 2. Identify extreme signals for the PUBLIC FOMO queue
-    const extremeAlerts = alertsToDispatch.filter((a) => a.overdueChance >= 95);
+  // =========================================================================
+  // STEP 3: DISPATCH ALERTS
+  // =========================================================================
 
-    if (publicChannelId && extremeAlerts.length > 0) {
-      // Send ONE blind teaser to the public channel (hiding the targets)
-      const teaseMsg =
-        `🚨 <b>ALGORITHM DETECTED ANOMALY</b> 🚨\n\n` +
-        `<b>Confidence:</b> 99%\n<b>Target Multiplier:</b> [HIDDEN]\n\n` +
-        `A high-multiplier variance pocket is opening in the next few rounds. Exact exit targets were just dispatched to the Premium Room.`;
+  if (clusters.length > 0 && bot) {
+    let freeTargetDropped = false;
 
-      bot.api
-        .sendMessage(publicChannelId, teaseMsg, { parse_mode: "HTML" })
-        .catch(console.error);
+    for (const cluster of clusters) {
+      cluster.forEach((c) => cooldownMap.set(c.target, currentRoundIndex));
+      systemStats.signals++;
 
-      // Push the targets into the queue to await public proof.
-      // Dynamic Lifespan: Give high targets more time to hit before dropping them.
-      // Minimum wait is 10 rounds, scales up heavily for huge targets.
-      extremeAlerts.forEach((alert) => {
-        // Prevent duplicate queue entries for the same target
-        if (!pendingProofs.find((p) => p.target === alert.target)) {
-          const dynamicLifespan = Math.max(10, Math.ceil(alert.target * 2));
+      cluster.sort((a, b) => a.target - b.target);
 
-          pendingProofs.push({
-            target: alert.target,
-            confidence: alert.overdueChance,
-            roundsElapsed: 0,
-            maxLifespan: dynamicLifespan,
-          });
+      const targetsStr = cluster.map((c) => `${c.target}x`).join(", ");
+      const avgConfidence = Math.round(
+        cluster.reduce((sum, c) => sum + c.confidence, 0) / cluster.length,
+      );
+      const minRounds = Math.min(
+        ...cluster.map((c) => c.expectedRoundsRemaining),
+      );
+      const maxRounds = Math.max(
+        ...cluster.map((c) => c.expectedRoundsRemaining),
+      );
+      const roundsRange =
+        minRounds === maxRounds ? `${minRounds}` : `${minRounds}-${maxRounds}`;
+
+      const status =
+        cluster[0].overdueRatio >= 2.0 ? "Very Overdue" : "Expected Soon";
+
+      // 1. PREMIUM DISPATCH
+      if (privateChannelId) {
+        const premiumMsg =
+          `⚠️ <b>HOT TARGETS FOUND</b>\n\n` +
+          `<b>Targets:</b> &gt;${targetsStr}\n` +
+          `<b>Expected In:</b> Next ${roundsRange} rounds\n` +
+          `<b>Confidence:</b> ${avgConfidence}%\n` +
+          `<b>Status:</b> ${status}\n\n` +
+          `_Use the bot to plan your bets before you start._`;
+
+        const premiumKb = new InlineKeyboard().url(
+          "⚙️ Plan My Bets",
+          `https://t.me/${botUsername}?start=strat_${cluster[0].target}`,
+        );
+
+        bot.api
+          .sendMessage(privateChannelId, premiumMsg, {
+            parse_mode: "HTML",
+            reply_markup: premiumKb,
+          })
+          .catch(console.error);
+      }
+
+      // 2. FREE DISPATCH
+      if (publicChannelId && avgConfidence >= 90) {
+        const isFreeDrop = !freeTargetDropped && Math.random() < 0.2;
+
+        let teaseMsg = "";
+        if (isFreeDrop) {
+          freeTargetDropped = true;
+          teaseMsg =
+            `🎁 <b>FREE TARGET DROP</b> 🎁\n\n` +
+            `<b>Target:</b> &gt;${cluster[0].target}x\n` +
+            `<b>Expected In:</b> ${roundsRange} rounds\n\n` +
+            `Here is a free premium target. Bet wisely and don't force it.`;
+        } else {
+          teaseMsg =
+            `🚨 <b>NEW TARGET ALERT</b> 🚨\n\n` +
+            `<b>Confidence:</b> ${avgConfidence}%\n` +
+            `<b>Target:</b> [HIDDEN]\n` +
+            `<b>Expected In:</b> ${roundsRange} rounds\n\n` +
+            `The exact multipliers were just sent to Pakakumi Oracle Premium.`;
         }
-      });
+
+        const publicKb = new InlineKeyboard().url(
+          "Get Premium",
+          `https://t.me/${botUsername}?start=premium`,
+        );
+
+        bot.api
+          .sendMessage(publicChannelId, teaseMsg, {
+            parse_mode: "HTML",
+            reply_markup: publicKb,
+          })
+          .catch(console.error);
+
+        // FULLY ADAPTIVE LIFESPAN: Scales exactly with the target size
+        cluster.forEach((c) => {
+          if (!pendingProofs.find((p) => p.target === c.target)) {
+            // e.g. target 1000x -> waits expected rounds + 850 rounds. Target 2x -> waits expected rounds + 2 rounds.
+            const adaptiveLifespan =
+              c.expectedRoundsRemaining + Math.ceil(c.target * 0.85);
+            pendingProofs.push({
+              target: c.target,
+              confidence: c.confidence,
+              roundsElapsed: 0,
+              maxLifespan: adaptiveLifespan,
+            });
+          }
+        });
+      }
     }
   }
 
-  return analysisResults;
+  return rawAlerts;
 }
