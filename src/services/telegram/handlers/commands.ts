@@ -26,12 +26,12 @@ async function sendMainMenu(ctx: any) {
     .text("💬 Support", "menu_support");
 
   await ctx.reply(
-    "📊 **Pakakumi Oracle**\n\n" +
+    "📊 **Pakakumi Oracle**\n\n\n" +
       "We track the game to find the best times to bet.\n\n" +
-      "🔧 **Bot Commands:**\n" +
-      "• `/last <multiplier> [count]` - See past hits\n" +
-      "• `/generate <capital> <minBet> <multiplier> <targetReturn>` - Plan your bets\n" +
-      "• `/terms` - Rules",
+      "🔧 **Bot Commands:**\n\n" +
+      "• `/last <multiplier> [count]`\n_See past hits (e.g., /last 50 3)_\n\n" +
+      "• `/generate <capital> <minBet> <multiplier> <targetReturn>`\n_Plan your bets (e.g., /generate 1000 10 2.0 1.5)_\n\n" +
+      "• `/terms`\n_Rules and Policies_",
     { parse_mode: "Markdown", reply_markup: menuKb },
   );
 }
@@ -49,7 +49,11 @@ export function setupCommands(bot: Bot<MyContext>) {
     if (payload.startsWith("strat_")) {
       const target = payload.split("_")[1];
       return ctx.reply(
-        `⚙️ **Plan Your Bets**\n\nYou are aiming for a ${target}x multiplier. To plan your stakes, reply with:\n\n\`/generate <capital> <minBet> ${target} <targetReturn>\`\n\n_Example: /generate 5000 20 ${target} 1.5_`,
+        `⚙️ **Plan Your Bets**\n\n` +
+          `You are aiming for a ${target}x multiplier.\n\n` +
+          `To plan your stakes, reply with:\n\n` +
+          `\`/generate <capital> <minBet> ${target} <targetReturn>\`\n\n` +
+          `_Example: /generate 5000 20 ${target} 1.5_`,
         { parse_mode: "Markdown" },
       );
     }
@@ -70,7 +74,8 @@ export function setupCommands(bot: Bot<MyContext>) {
       .text("30 Days - KES 3000", "pay_30_3000");
 
     await ctx.reply(
-      "⚡ **Choose your Premium Plan:**\n\nGet exact targets, live alerts, and full access to `/last` and `/generate` commands.",
+      "⚡ **Choose your Premium Plan:**\n\n\n" +
+        "Get exact targets, live alerts, and full access to the `/last` and `/generate` commands.",
       { parse_mode: "Markdown", reply_markup: tierKeyboard },
     );
   }
@@ -99,7 +104,10 @@ export function setupCommands(bot: Bot<MyContext>) {
         );
         if (payment && payment.status) {
           await ctx.reply(
-            `💳 **Pay via M-Pesa**\nPlan: ${duration} Days\n\nClick the link below to pay:\n${payment.data.authorization_url}\n\n_Your access link will be sent automatically after payment._`,
+            `💳 **Pay via M-Pesa**\n\n` +
+              `Plan: ${duration} Days\n\n` +
+              `Click the link below to pay:\n${payment.data.authorization_url}\n\n\n` +
+              `_Your access link will be sent automatically after payment._`,
             { parse_mode: "Markdown" },
           );
         }
@@ -122,7 +130,7 @@ export function setupCommands(bot: Bot<MyContext>) {
       await ctx.reply("❌ **Status:** Not Active", { parse_mode: "Markdown" });
     } else {
       await ctx.reply(
-        `✅ **Status:** Active\n\nExpires on: *${user.expiryTimestamp?.toDateString()}*`,
+        `✅ **Status:** Active\n\nExpires on:\n*${user.expiryTimestamp?.toDateString()}*`,
         { parse_mode: "Markdown" },
       );
     }
@@ -130,10 +138,10 @@ export function setupCommands(bot: Bot<MyContext>) {
 
   async function triggerGuide(ctx: any) {
     await ctx.reply(
-      "📖 **How to use Pakakumi Oracle**\n\n" +
-        "1️⃣ **Wait for Alerts:** The Premium channel tells you which targets are hot and when they are expected.\n" +
-        "2️⃣ **Plan Your Bets:** Click 'Plan My Bets' on the alert. Tell the bot your capital, and it will tell you exactly how much to bet each round so you don't run out of money.\n" +
-        "3️⃣ **Play Smart:** Follow the bet plan exactly. If a target is expected in 20 rounds, don't start betting heavy on round 1.\n\n" +
+      "📖 **How to use Pakakumi Oracle**\n\n\n" +
+        "1️⃣ **Wait for Alerts:** The Premium channel tells you which targets are hot and when they are expected.\n\n" +
+        "2️⃣ **Plan Your Bets:** Click 'Plan My Bets' on the alert. Tell the bot your capital, and it will calculate your exact stakes so you survive the whole action window.\n\n" +
+        "3️⃣ **Play Smart:** Follow the bet plan exactly. Do not bet randomly.\n\n\n" +
         "_Target one multiplier, get your profit, and stop._",
       { parse_mode: "Markdown" },
     );
@@ -148,7 +156,7 @@ export function setupCommands(bot: Bot<MyContext>) {
     ctx.dbState = "support";
 
     await ctx.reply(
-      "🔒 **Support Open**\n\nType your message below. The admin will reply to you here.",
+      "🔒 **Support Open**\n\n\nType your message below. The admin will reply to you here.",
       {
         parse_mode: "Markdown",
         reply_markup: {
@@ -159,26 +167,11 @@ export function setupCommands(bot: Bot<MyContext>) {
     );
   }
 
-  bot.hears("❌ Close Support", async (ctx) => {
-    const chatId = ctx.chat!.id.toString();
-    if (ctx.dbState === "support") {
-      await db
-        .update(telegramUsers)
-        .set({ sessionState: "command" })
-        .where(eq(telegramUsers.chatId, chatId));
-      ctx.dbState = "command";
-      await ctx.reply("✅ Support closed.", {
-        reply_markup: { remove_keyboard: true },
-      });
-      await sendMainMenu(ctx);
-    }
-  });
-
   bot.command("last", async (ctx) => {
     const chatId = ctx.chat!.id.toString();
     const args = ctx.match.trim().split(/\s+/);
     if (!args[0])
-      return ctx.reply("⚠️ **How to use:** `/last <multiplier> [count]`", {
+      return ctx.reply("⚠️ **How to use:**\n\n`/last <multiplier> [count]`", {
         parse_mode: "Markdown",
       });
 
@@ -207,12 +200,14 @@ export function setupCommands(bot: Bot<MyContext>) {
       if (timeAgo > 1440) timeString = `${Math.floor(timeAgo / 1440)} days ago`;
 
       return ctx.reply(
-        `🔒 **Data Locked**\n\nThe last **${target}x** hit **${timeString}**.\n\n_Upgrade to Premium to see the exact time and get up to 10 past results._`,
+        `🔒 **Data Locked**\n\n\n` +
+          `The last **${target}x** hit **${timeString}**.\n\n\n` +
+          `_Upgrade to Premium to see the exact time and get up to 10 past results._`,
         { parse_mode: "Markdown" },
       );
     }
 
-    let response = `📊 **Past results for >= ${target}x**\n\n`;
+    let response = `📊 **Past results for >= ${target}x**\n\n\n`;
     history.forEach((hit, index) => {
       const dateStr = hit.createdAt.toLocaleString("en-GB", {
         timeZone: "Africa/Nairobi",
@@ -221,7 +216,7 @@ export function setupCommands(bot: Bot<MyContext>) {
         hour: "2-digit",
         minute: "2-digit",
       });
-      response += `${index + 1}. **${hit.bust}x** ─ _${dateStr}_\n`;
+      response += `${index + 1}. **${hit.bust}x**\n_${dateStr}_\n\n`;
     });
     await ctx.reply(response, { parse_mode: "Markdown" });
   });
@@ -232,7 +227,7 @@ export function setupCommands(bot: Bot<MyContext>) {
 
     if (args.length < 4) {
       return ctx.reply(
-        "⚠️ **How to use:** `/generate <capital> <minBet> <multiplier> <targetReturn>`",
+        "⚠️ **How to use:**\n\n`/generate <capital> <minBet> <multiplier> <targetReturn>`",
         { parse_mode: "Markdown" },
       );
     }
@@ -260,7 +255,13 @@ export function setupCommands(bot: Bot<MyContext>) {
         "❌ This plan is impossible with your capital. Try changing the numbers.",
       );
 
-    let response = `⚙️ **Your Bet Plan**\n_Capital: ${capital} | Target: ${multiplier}x | Recovery: ${targetReturn}x_\n\n**What to bet:**\n`;
+    let response =
+      `⚙️ **Your Bet Plan**\n\n` +
+      `_Capital: ${capital}_\n` +
+      `_Target: ${multiplier}x_\n` +
+      `_Recovery: ${targetReturn}x_\n\n\n` +
+      `**What to bet:**\n\n`;
+
     const displayLimit = Math.min(sequence.length, 20);
 
     for (let i = 0; i < displayLimit; i++) {
@@ -269,12 +270,12 @@ export function setupCommands(bot: Bot<MyContext>) {
 
     if (sequence.length > 20)
       response += `\n_...and ${sequence.length - 20} more rounds._\n`;
-    response += `\n**Total losses you can survive:** ${sequence.length - 1}`;
+    response += `\n\n**Total losses you can survive:** ${sequence.length - 1}`;
     await ctx.reply(response, { parse_mode: "Markdown" });
   });
 
   bot.command("terms", async (ctx) => {
-    const legalText = `⚖️ **RULES**\n\n**1. NO REFUNDS**\nAll payments are final.\n\n**2. BANS**\nReversing an M-Pesa payment will get you permanently banned.\n\n**3. RISKS**\nThe bot gives you the best chances based on past data, but there are no guarantees. We are not responsible for money lost.\n\n**4. PRIVACY**\nWe do not share your info or track your personal bets.`;
+    const legalText = `⚖️ **RULES**\n\n\n**1. NO REFUNDS**\nAll payments are final.\n\n**2. BANS**\nReversing an M-Pesa payment will get you permanently banned.\n\n**3. RISKS**\nThe bot gives you the best chances based on past data, but there are no guarantees. We are not responsible for money lost.\n\n**4. PRIVACY**\nWe do not share your info or track your personal bets.`;
     await ctx.reply(legalText, { parse_mode: "Markdown" });
   });
 }

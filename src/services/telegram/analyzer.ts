@@ -81,7 +81,7 @@ export async function runAnalysis(newRound?: {
             `https://t.me/${botUsername}?start=premium`,
           )
           .row()
-          .url("Join Free Chat", "https://t.me/your_free_chat_link");
+          .url("Join Free Chat", "https://t.me/pakakumi_oracle_free");
 
         bot?.api
           .sendMessage(publicChannelId, publicProofMsg, {
@@ -171,21 +171,17 @@ export async function runAnalysis(newRound?: {
 
   if (rawAlerts.length === 0) return [];
 
-  // CLUSTERING
+  // CLUSTERING: Group by target size proximity (e.g., 15x and 20x group together)
   const clusters = [];
-  rawAlerts.sort(
-    (a, b) => a.expectedRoundsRemaining - b.expectedRoundsRemaining,
-  );
+  rawAlerts.sort((a, b) => a.target - b.target);
 
   let currentCluster = [rawAlerts[0]];
   for (let i = 1; i < rawAlerts.length; i++) {
     const current = rawAlerts[i];
     const prev = currentCluster[currentCluster.length - 1];
 
-    const roundsDiff = Math.abs(
-      current.expectedRoundsRemaining - prev.expectedRoundsRemaining,
-    );
-    if (roundsDiff <= Math.max(5, prev.expectedRoundsRemaining * 0.2)) {
+    // Group if the target multiplier is within 50% of the previous one in the loop
+    if (current.target <= prev.target * 1.5) {
       currentCluster.push(current);
     } else {
       clusters.push([...currentCluster]);
@@ -205,30 +201,25 @@ export async function runAnalysis(newRound?: {
       cluster.forEach((c) => cooldownMap.set(c.target, currentRoundIndex));
       systemStats.signals++;
 
-      cluster.sort((a, b) => a.target - b.target);
-
       const targetsStr = cluster.map((c) => `${c.target}x`).join(", ");
       const avgConfidence = Math.round(
         cluster.reduce((sum, c) => sum + c.confidence, 0) / cluster.length,
       );
-      const minRounds = Math.min(
-        ...cluster.map((c) => c.expectedRoundsRemaining),
-      );
-      const maxRounds = Math.max(
-        ...cluster.map((c) => c.expectedRoundsRemaining),
-      );
-      const roundsRange =
-        minRounds === maxRounds ? `${minRounds}` : `${minRounds}-${maxRounds}`;
+
+      // Build a realistic Action Window based on the highest target in the cluster
+      const highestTarget = Math.max(...cluster.map((c) => c.target));
+      const planRounds = Math.max(10, Math.ceil(highestTarget * 0.3));
+      const roundsRange = `1 to ${planRounds}`;
 
       const status =
-        cluster[0].overdueRatio >= 2.0 ? "Very Overdue" : "Expected Soon";
+        cluster[0].overdueRatio >= 2.0 ? "Very Overdue" : "Hot & Ready";
 
       // 1. PREMIUM DISPATCH
       if (privateChannelId) {
         const premiumMsg =
           `⚠️ <b>HOT TARGETS FOUND</b>\n\n` +
-          `<b>Targets:</b> &gt;${targetsStr}\n` +
-          `<b>Expected In:</b> Next ${roundsRange} rounds\n` +
+          `<b>Targets:</b> &gt;${targetsStr}\n\n` +
+          `<b>Action Window:</b> ${roundsRange} rounds\n` +
           `<b>Confidence:</b> ${avgConfidence}%\n` +
           `<b>Status:</b> ${status}\n\n` +
           `_Use the bot to plan your bets before you start._`;
@@ -255,15 +246,15 @@ export async function runAnalysis(newRound?: {
           freeTargetDropped = true;
           teaseMsg =
             `🎁 <b>FREE TARGET DROP</b> 🎁\n\n` +
-            `<b>Target:</b> &gt;${cluster[0].target}x\n` +
-            `<b>Expected In:</b> ${roundsRange} rounds\n\n` +
+            `<b>Target:</b> &gt;${cluster[0].target}x\n\n` +
+            `<b>Action Window:</b> ${roundsRange} rounds\n\n` +
             `Here is a free premium target. Bet wisely and don't force it.`;
         } else {
           teaseMsg =
             `🚨 <b>NEW TARGET ALERT</b> 🚨\n\n` +
             `<b>Confidence:</b> ${avgConfidence}%\n` +
-            `<b>Target:</b> [HIDDEN]\n` +
-            `<b>Expected In:</b> ${roundsRange} rounds\n\n` +
+            `<b>Target:</b> [HIDDEN]\n\n` +
+            `<b>Action Window:</b> ${roundsRange} rounds\n\n` +
             `The exact multipliers were just sent to Pakakumi Oracle Premium.`;
         }
 
@@ -279,12 +270,9 @@ export async function runAnalysis(newRound?: {
           })
           .catch(console.error);
 
-        // FULLY ADAPTIVE LIFESPAN: Scales exactly with the target size
         cluster.forEach((c) => {
           if (!pendingProofs.find((p) => p.target === c.target)) {
-            // e.g. target 1000x -> waits expected rounds + 850 rounds. Target 2x -> waits expected rounds + 2 rounds.
-            const adaptiveLifespan =
-              c.expectedRoundsRemaining + Math.ceil(c.target * 0.85);
+            const adaptiveLifespan = planRounds + Math.ceil(c.target * 0.85);
             pendingProofs.push({
               target: c.target,
               confidence: c.confidence,
