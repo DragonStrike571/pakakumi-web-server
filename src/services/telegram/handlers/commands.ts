@@ -104,7 +104,7 @@ export function setupCommands(bot: Bot<MyContext>) {
 
       try {
         const payment = await initializePayment(
-          `user_${chatId}@oracle.internal`,
+          `user_${chatId}@pakakumi-oracle.softdocs.org`,
           amountKES,
           chatId,
           duration,
