@@ -1,3 +1,4 @@
+// messages.ts
 import { Bot, InlineKeyboard } from "grammy";
 import { MyContext } from "../bot.js";
 import { db } from "../../../db/index.js";
@@ -7,23 +8,25 @@ import { eq } from "drizzle-orm";
 const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID;
 
 export function setupMessages(bot: Bot<MyContext>) {
-  bot.on("message:text", async (ctx) => {
-    if (!ctx.message || !ctx.message.text) return;
+  // Listen for both direct messages/groups AND channel posts
+  bot.on(["message:text", "channel_post:text"], async (ctx) => {
+    const text = ctx.message?.text || ctx.channelPost?.text;
+    const replyToText =
+      ctx.message?.reply_to_message?.text ||
+      ctx.channelPost?.reply_to_message?.text;
 
-    const text = ctx.message.text;
-    const chatId = ctx.chat.id.toString();
-    const userId = ctx.from.id.toString();
+    if (!text) return;
+
+    // In channel posts, ctx.from might be undefined. Fall back to chat ID.
+    const chatId = ctx.chat?.id.toString();
+    const userId = ctx.from?.id.toString() || chatId;
 
     if (text.startsWith("/")) return;
 
     // 1. ADMIN REPLY LOGIC
-    // Fallback included: allows routing if testing in a group OR private DM
     if (chatId === ADMIN_CHANNEL_ID || userId === ADMIN_CHANNEL_ID) {
-      if (ctx.message?.reply_to_message?.text) {
-        const originalText = ctx.message.reply_to_message.text;
-
-        // Simplified, fail-proof regex
-        const match = originalText.match(/User ID:\s*(-?\d+)/i);
+      if (replyToText) {
+        const match = replyToText.match(/User ID:\s*(-?\d+)/i);
 
         if (match && match[1]) {
           const targetUserId = match[1];
@@ -35,7 +38,7 @@ export function setupMessages(bot: Bot<MyContext>) {
             );
             await ctx.reply("✅ Reply successfully delivered to user.");
           } catch (err) {
-            console.error("Error sending reply to user:", err);
+            console.error(`Error sending reply to user ${targetUserId}:`, err);
             await ctx.reply(
               "❌ Failed to send reply. The user may have blocked the bot.",
             );
@@ -56,9 +59,6 @@ export function setupMessages(bot: Bot<MyContext>) {
         .set({ sessionState: "command" })
         .where(eq(telegramUsers.chatId, chatId));
       ctx.dbState = "command";
-      await ctx.reply("✅ Support closed. You are back in the main menu.", {
-        reply_markup: { remove_keyboard: true },
-      });
 
       const menuKb = new InlineKeyboard()
         .text("🚀 Get Premium", "menu_premium")
@@ -70,15 +70,20 @@ export function setupMessages(bot: Bot<MyContext>) {
         .text("📅 My Status", "menu_status")
         .text("💬 Support", "menu_support");
 
-      await ctx.reply("📊 **Pakakumi Oracle**\n\nChoose an option below:", {
-        reply_markup: menuKb,
-      });
+      await ctx.reply(
+        "✅ Support closed. You are back in the main menu.\n\n📊 **Pakakumi Oracle**\nChoose an option below:",
+        {
+          reply_markup: { remove_keyboard: true },
+        },
+      );
+      // Send the inline menu separately so it renders cleanly
+      await ctx.reply("Options:", { reply_markup: menuKb });
       return;
     }
 
     // 3. SUPPORT TICKET CREATION
     if (ctx.dbState === "support") {
-      const username = ctx.from.username || ctx.from.first_name || "Unknown";
+      const username = ctx.from?.username || ctx.from?.first_name || "Unknown";
 
       const [ticket] = await db
         .insert(supportTickets)

@@ -86,6 +86,9 @@ export function setupCommands(bot: Bot<MyContext>) {
     const data = ctx.callbackQuery.data;
     const chatId = ctx.chat!.id.toString();
 
+    // Always acknowledge the callback immediately to stop the UI from hanging
+    await ctx.answerCallbackQuery().catch(console.error);
+
     if (data === "menu_premium") return triggerPremiumMenu(ctx);
     if (data === "menu_guide") return triggerGuide(ctx);
     if (data === "menu_status") return checkStatus(ctx);
@@ -96,7 +99,9 @@ export function setupCommands(bot: Bot<MyContext>) {
       const duration = parseInt(daysStr);
       const amountKES = parseInt(amountStr);
 
-      await ctx.answerCallbackQuery("Generating M-Pesa link...");
+      // Notify the user something is happening
+      const loadingMsg = await ctx.reply("⏳ Generating your M-Pesa link...");
+
       try {
         const payment = await initializePayment(
           `user_${chatId}@oracle.internal`,
@@ -104,17 +109,30 @@ export function setupCommands(bot: Bot<MyContext>) {
           chatId,
           duration,
         );
+
         if (payment && payment.status) {
-          await ctx.reply(
-            `💳 **Pay via M-Pesa**\n\n` +
-              `Plan: ${duration} Days\n\n` +
-              `Click the link below to pay:\n${payment.data.authorization_url}\n\n\n` +
-              `_Your access link will be sent automatically after payment._`,
+          await bot.api.editMessageText(
+            chatId,
+            loadingMsg.message_id,
+            `💳 **Pay via M-Pesa**\n\nPlan: ${duration} Days\n\nClick the link below to pay:\n${payment.data.authorization_url}\n\n_Your access link will be sent automatically after payment._`,
             { parse_mode: "Markdown" },
+          );
+        } else {
+          // Log the exact payload to see why Paystack rejected it
+          console.error("❌ Paystack initialization rejected:", payment);
+          await bot.api.editMessageText(
+            chatId,
+            loadingMsg.message_id,
+            "❌ Payment could not be generated at this time. Please try again.",
           );
         }
       } catch (error) {
-        await ctx.reply("❌ Payment system is busy. Try again in a minute.");
+        console.error("❌ Payment Network Error:", error);
+        await bot.api.editMessageText(
+          chatId,
+          loadingMsg.message_id,
+          "❌ Payment system is currently busy. Try again in a minute.",
+        );
       }
     }
   });
