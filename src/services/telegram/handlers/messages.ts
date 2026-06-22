@@ -12,16 +12,18 @@ export function setupMessages(bot: Bot<MyContext>) {
 
     const text = ctx.message.text;
     const chatId = ctx.chat.id.toString();
+    const userId = ctx.from.id.toString();
 
     if (text.startsWith("/")) return;
 
     // 1. ADMIN REPLY LOGIC
-    if (chatId === ADMIN_CHANNEL_ID) {
+    // Fallback included: allows routing if testing in a group OR private DM
+    if (chatId === ADMIN_CHANNEL_ID || userId === ADMIN_CHANNEL_ID) {
       if (ctx.message?.reply_to_message?.text) {
         const originalText = ctx.message.reply_to_message.text;
 
-        // More lenient regex to extract User ID perfectly
-        const match = originalText.match(/Ticket from User ID:\s*(-?\d+)/i);
+        // Simplified, fail-proof regex
+        const match = originalText.match(/User ID:\s*(-?\d+)/i);
 
         if (match && match[1]) {
           const targetUserId = match[1];
@@ -38,13 +40,16 @@ export function setupMessages(bot: Bot<MyContext>) {
               "❌ Failed to send reply. The user may have blocked the bot.",
             );
           }
+        } else {
+          await ctx.reply(
+            "⚠️ Could not extract User ID from the message you replied to.",
+          );
         }
       }
       return;
     }
 
     // 2. CLOSE SUPPORT OVERRIDE
-    // Catch the exact button press BEFORE it registers as a ticket
     if (text === "❌ Close Support") {
       await db
         .update(telegramUsers)
@@ -55,9 +60,10 @@ export function setupMessages(bot: Bot<MyContext>) {
         reply_markup: { remove_keyboard: true },
       });
 
-      // Resend Main Menu
       const menuKb = new InlineKeyboard()
         .text("🚀 Get Premium", "menu_premium")
+        .row()
+        .url("💬 Join Free Chat", "https://t.me/pakakumi_oracle_free")
         .row()
         .text("📖 How to Use", "menu_guide")
         .row()

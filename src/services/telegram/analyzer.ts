@@ -81,7 +81,7 @@ export async function runAnalysis(newRound?: {
             `https://t.me/${botUsername}?start=premium`,
           )
           .row()
-          .url("Join Free Chat", "https://t.me/pakakumi_oracle_free");
+          .url("🤖 Use Bot to Plan Bets", `https://t.me/${botUsername}`); // <-- FIXED THIS
 
         bot?.api
           .sendMessage(publicChannelId, publicProofMsg, {
@@ -258,10 +258,10 @@ export async function runAnalysis(newRound?: {
             `The exact multipliers were just sent to Pakakumi Oracle Premium.`;
         }
 
-        const publicKb = new InlineKeyboard().url(
-          "Get Premium",
-          `https://t.me/${botUsername}?start=premium`,
-        );
+        const publicKb = new InlineKeyboard()
+          .url("Get Premium", `https://t.me/${botUsername}?start=premium`)
+          .row()
+          .url("🤖 Use Bot to Plan Bets", `https://t.me/${botUsername}`); // <-- ADDED THIS FOR CONSISTENCY
 
         bot.api
           .sendMessage(publicChannelId, teaseMsg, {

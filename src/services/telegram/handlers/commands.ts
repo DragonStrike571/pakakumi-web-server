@@ -20,6 +20,8 @@ async function sendMainMenu(ctx: any) {
   const menuKb = new InlineKeyboard()
     .text("🚀 Get Premium", "menu_premium")
     .row()
+    .url("💬 Join Free Chat", "https://t.me/pakakumi_oracle_free")
+    .row()
     .text("📖 How to Use", "menu_guide")
     .row()
     .text("📅 My Status", "menu_status")
