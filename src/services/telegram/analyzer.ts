@@ -1,8 +1,9 @@
 import { db } from "../../db/index.js";
-import { rounds } from "../../db/schema.js";
-import { desc } from "drizzle-orm";
+import { rounds, systemStats, pendingSignals } from "../../db/schema.js";
+import { desc, asc, eq, inArray, sql } from "drizzle-orm";
 import { bot } from "./bot.js";
 import { InlineKeyboard } from "grammy";
+import { SQL, Placeholder } from "drizzle-orm/sql";
 
 const HOUSE_EDGE = 0.01; // 1%
 const TARGETS = [
@@ -11,33 +12,42 @@ const TARGETS = [
   2000, 2500, 3000,
 ];
 
+// O(1) Push Array Buffer
 let cachedRounds: { bust: number; createdAt: Date }[] = [];
-
-interface ActiveSignal {
-  target: number;
-  confidence: number;
-  roundsElapsed: number;
-  maxLifespan: number;
-}
-let pendingProofs: ActiveSignal[] = [];
-
 const cooldownMap = new Map<number, number>();
-let systemStats = { hits: 0, signals: 0 };
 let currentRoundIndex = 0;
 
 export async function runAnalysis(newRound?: {
   bust: number;
   createdAt: Date;
 }) {
+  // Load State from Database (Persistence Fix)
+  let stats = await db
+    .select()
+    .from(systemStats)
+    .where(eq(systemStats.id, 1))
+    .then((res) => res[0]);
+
+  if (!stats) {
+    stats = { id: 1, hits: 0, signals: 0 };
+    await db.insert(systemStats).values(stats);
+  }
+
+  let pendingProofs = await db.select().from(pendingSignals);
+
+  // Array Bottleneck Fix (O(1) Push & Batch Slice)
   if (cachedRounds.length === 0) {
+    // Fetch ASCENDING so oldest is [0], newest is end
     cachedRounds = await db.query.rounds.findMany({
-      orderBy: [desc(rounds.createdAt)],
+      orderBy: [asc(rounds.createdAt)],
       limit: 10000,
       columns: { bust: true, createdAt: true },
     });
   } else if (newRound) {
-    cachedRounds.unshift(newRound);
-    if (cachedRounds.length > 10000) cachedRounds.pop();
+    cachedRounds.push(newRound); // O(1)
+    if (cachedRounds.length > 11000) {
+      cachedRounds = cachedRounds.slice(cachedRounds.length - 10000);
+    }
     currentRoundIndex++;
   }
 
@@ -46,7 +56,7 @@ export async function runAnalysis(newRound?: {
 
   const publicChannelId = process.env.PUBLIC_CHANNEL_ID;
   const privateChannelId = process.env.PRIVATE_CHANNEL_ID;
-  const botUsername = bot?.botInfo?.username || "PakakumiOracleBot";
+  const botUsername = bot?.botInfo?.username || "pk_oracle_bot";
 
   // =========================================================================
   // STEP 1: EVALUATE PENDING SIGNALS & UPDATE STATS
@@ -55,23 +65,35 @@ export async function runAnalysis(newRound?: {
     const hitSignals = pendingProofs.filter((s) => newRound.bust >= s.target);
 
     if (hitSignals.length > 0) {
-      systemStats.hits += hitSignals.length;
-      hitSignals.forEach((s) => cooldownMap.delete(s.target));
+      // 1. Update DB Stats
+      stats.hits += hitSignals.length;
+      await db
+        .update(systemStats)
+        .set({ hits: stats.hits })
+        .where(eq(systemStats.id, 1));
 
-      const bestHit = hitSignals.reduce((prev, current) =>
-        prev.target > current.target ? prev : current,
+      // 2. Clear Hits from Cooldown and DB
+      const hitTargets = hitSignals.map((s) => s.target);
+      hitTargets.forEach((t) => cooldownMap.delete(t));
+      await db
+        .delete(pendingSignals)
+        .where(inArray(pendingSignals.target, hitTargets));
+
+      // 3. String Fix: Map all hits instead of reducing
+      hitSignals.sort((a, b) => a.target - b.target);
+      const hitTargetsStr = hitSignals
+        .map((s) => `${s.target.toFixed(2)}x`)
+        .join(", ");
+
+      const winRate = ((stats.hits / Math.max(1, stats.signals)) * 100).toFixed(
+        1,
       );
 
-      const winRate = (
-        (systemStats.hits / Math.max(1, systemStats.signals)) *
-        100
-      ).toFixed(1);
-
-      // 1. Send Proof to Free Channel (Awaited to enforce order)
+      // Free Channel
       if (publicChannelId) {
         const publicProofMsg =
-          `🔥 <b>TARGET HIT</b> 🔥\n\n` +
-          `🎯 <b>Target:</b> &gt;${bestHit.target.toFixed(2)}x\n` +
+          `🔥 <b>TARGETS CLEARED</b> 🔥\n\n` +
+          `🎯 <b>Targets:</b> &gt;${hitTargetsStr}\n` +
           `✅ <b>Actual Crash:</b> ${newRound.bust}x\n\n` +
           `📊 <b>Accuracy:</b> ${winRate}%\n\n` +
           `Premium members got this alert early.`;
@@ -92,11 +114,11 @@ export async function runAnalysis(newRound?: {
           .catch(console.error);
       }
 
-      // 2. Send Proof to Premium Channel (Awaited)
+      // Premium Channel
       if (privateChannelId) {
         const premiumProofMsg =
-          `✅ **TARGET SECURED**\n\n` +
-          `Target: >${bestHit.target.toFixed(2)}x\n` +
+          `✅ **TARGETS SECURED**\n\n` +
+          `Targets: >${hitTargetsStr}\n` +
           `Actual Crash: **${newRound.bust}x**\n\n` +
           `_Waiting for the next hot target._`;
 
@@ -108,15 +130,24 @@ export async function runAnalysis(newRound?: {
       }
     }
 
-    // Queue Cleanup
-    pendingProofs = pendingProofs
-      .filter((s) => newRound.bust < s.target)
-      .map((s) => ({ ...s, roundsElapsed: s.roundsElapsed + 1 }))
-      .filter((s) => {
-        const alive = s.roundsElapsed < s.maxLifespan;
-        if (!alive) cooldownMap.delete(s.target);
-        return alive;
-      });
+    // Queue Cleanup for Dead/Expired Signals
+    const deadSignals = pendingProofs.filter(
+      (s) => newRound.bust < s.target && s.roundsElapsed + 1 >= s.maxLifespan,
+    );
+    if (deadSignals.length > 0) {
+      const deadTargets = deadSignals.map((s) => s.target);
+      deadTargets.forEach((t) => cooldownMap.delete(t));
+      await db
+        .delete(pendingSignals)
+        .where(inArray(pendingSignals.target, deadTargets));
+    }
+
+    // Update elapsed rounds for survivors
+    if (pendingProofs.length > 0 && deadSignals.length < pendingProofs.length) {
+      await db.execute(
+        sql`UPDATE pending_signals SET rounds_elapsed = rounds_elapsed + 1`,
+      );
+    }
   }
 
   // =========================================================================
@@ -129,9 +160,11 @@ export async function runAnalysis(newRound?: {
     const K = 5;
     const occIndices: number[] = [];
 
-    for (let i = 0; i < recentRounds.length; i++) {
+    // Array Bottleneck Fix: Traverse BACKWARDS since end of array is the newest
+    for (let i = recentRounds.length - 1; i >= 0; i--) {
       if (recentRounds[i].bust >= target) {
-        occIndices.push(i);
+        const distance = recentRounds.length - 1 - i;
+        occIndices.push(distance);
         if (occIndices.length >= K + 1) break;
       }
     }
@@ -139,9 +172,6 @@ export async function runAnalysis(newRound?: {
     if (occIndices.length === 0) continue;
 
     const currentGap = occIndices[0];
-
-    // CRITICAL FIX: If the target hit on this exact round, disqualify it immediately.
-    // This prevents math deficits from forcing a 99% confidence trigger on a target that just landed.
     if (currentGap === 0) continue;
 
     const gapsUsed = occIndices.length - 1;
@@ -213,7 +243,13 @@ export async function runAnalysis(newRound?: {
 
     for (const cluster of clusters) {
       cluster.forEach((c) => cooldownMap.set(c.target, currentRoundIndex));
-      systemStats.signals++;
+
+      // Fix: Increment signals by total targets in cluster, not just 1
+      stats.signals += cluster.length;
+      await db
+        .update(systemStats)
+        .set({ signals: stats.signals })
+        .where(eq(systemStats.id, 1));
 
       const targetsStr = cluster.map((c) => `${c.target}x`).join(", ");
       const avgConfidence = Math.round(
@@ -242,27 +278,45 @@ export async function runAnalysis(newRound?: {
             : `${lowerLimit} to ${planRounds}`;
       } else {
         planRounds = baseExpectedGap;
-        roundsRange = `Overdue (Plan ${planRounds})`;
+        // Fix: Actionable terminology instead of "Plan x"
+        roundsRange = `Late: Budget for ${planRounds} bets`;
       }
 
       const status =
         cluster[0].pureOverdueRatio >= 1.5 ? "Very Overdue" : "Hot & Ready";
 
-      // CRITICAL FIX: Push to pending proofs globally before dispatching.
-      // This ensures Premium alerts are tracked for hits and cleared from cooldown.
+      // DB Persistence: Push to pending signals table
+      const newSignalsToInsert: {
+        id: string | SQL<unknown> | Placeholder<string, any>;
+        target: number | SQL<unknown> | Placeholder<string, any>;
+        confidence: number | SQL<unknown> | Placeholder<string, any>;
+        maxLifespan: number | SQL<unknown> | Placeholder<string, any>;
+        roundsElapsed?:
+          | number
+          | SQL<unknown>
+          | Placeholder<string, any>
+          | undefined;
+      }[] = [];
       cluster.forEach((c) => {
         if (!pendingProofs.find((p) => p.target === c.target)) {
-          const adaptiveLifespan = planRounds + Math.ceil(c.target * 0.85);
-          pendingProofs.push({
+          newSignalsToInsert.push({
+            id: c.target.toString(),
             target: c.target,
             confidence: c.confidence,
             roundsElapsed: 0,
-            maxLifespan: adaptiveLifespan,
+            maxLifespan: planRounds + Math.ceil(c.target * 0.85),
           });
         }
       });
 
-      // 1. PREMIUM DISPATCH (Awaited)
+      if (newSignalsToInsert.length > 0) {
+        await db
+          .insert(pendingSignals)
+          .values(newSignalsToInsert)
+          .onConflictDoNothing();
+      }
+
+      // 1. PREMIUM DISPATCH
       if (privateChannelId) {
         const premiumMsg =
           `⚠️ <b>HOT TARGETS FOUND</b>\n\n` +
@@ -274,13 +328,8 @@ export async function runAnalysis(newRound?: {
 
         const premiumKb = new InlineKeyboard()
           .url(
-            "⚙️ Plan My Bets (No Risk Management)",
+            "⚙️ Plan My Bets",
             `https://t.me/${botUsername}?start=strat_${cluster[0].target}`,
-          )
-          .row()
-          .url(
-            "🛡️ Get Survival Plan (Risk Management)",
-            `https://t.me/${botUsername}?start=plan_${cluster[0].target}`,
           )
           .row()
           .url("❓ Read the Guide", `https://t.me/${botUsername}?start=guide`);
@@ -293,7 +342,7 @@ export async function runAnalysis(newRound?: {
           .catch(console.error);
       }
 
-      // 2. FREE DISPATCH (Awaited)
+      // 2. FREE DISPATCH
       if (publicChannelId && avgConfidence >= 90) {
         const isFreeDrop = !freeTargetDropped && Math.random() < 0.2;
         let teaseMsg = "";

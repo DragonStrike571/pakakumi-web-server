@@ -4,7 +4,7 @@ import { telegramUsers } from "../../db/schema.js";
 import { setupCommands } from "./handlers/commands.js";
 import { setupMessages } from "./handlers/messages.js";
 
-// Define custom context bypassing memory sessions entirely
+// Define custom context
 export interface MyContext extends Context {
   dbState: "command" | "support";
 }
@@ -18,17 +18,28 @@ if (!token) {
 
 export const bot = token ? new Bot<MyContext>(token) : null;
 
+// RAM Cache to protect the Database from being hammered by rapid updates
+const sessionCache = new Map<string, { state: string; lastUpdated: number }>();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
 if (bot) {
   // Database State Sync Middleware
-  // Fires on every single incoming update to ensure bulletproof session tracking
   bot.use(async (ctx, next) => {
     if (!ctx.from || !ctx.chat) return next();
 
     const chatId = ctx.chat.id.toString();
     const username = ctx.from.username || ctx.from.first_name || "Unknown";
+    const now = Date.now();
 
+    // 1. Check RAM Cache first
+    const cachedUser = sessionCache.get(chatId);
+    if (cachedUser && now - cachedUser.lastUpdated < CACHE_TTL) {
+      ctx.dbState = cachedUser.state as "command" | "support";
+      return next();
+    }
+
+    // 2. If not in cache or TTL expired, hit the Database
     try {
-      // Upsert the user and retrieve their current state from the database
       const [user] = await db
         .insert(telegramUsers)
         .values({
@@ -45,13 +56,17 @@ if (bot) {
         })
         .returning({ sessionState: telegramUsers.sessionState });
 
-      // Inject exact DB state into the context for downstream handlers
-      ctx.dbState = user.sessionState as "command" | "support";
+      // 3. Update the RAM Cache
+      sessionCache.set(chatId, {
+        state: user.sessionState,
+        lastUpdated: now,
+      });
 
+      ctx.dbState = user.sessionState as "command" | "support";
       await next();
     } catch (error) {
       console.error(`❌ DB Sync Error for user ${chatId}:`, error);
-      // Graceful degradation: default to command if DB fails, but don't crash
+      // Graceful degradation
       ctx.dbState = "command";
       await next();
     }
@@ -61,7 +76,7 @@ if (bot) {
   setupCommands(bot);
   setupMessages(bot);
 
-  // Global Error Boundary to prevent polling thread crashes
+  // Global Error Boundary
   bot.catch((err) => {
     console.error("❌ Telegram Bot Fatal Error:", err);
   });

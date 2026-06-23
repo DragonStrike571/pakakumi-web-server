@@ -7,6 +7,13 @@ import { eq, desc, gte } from "drizzle-orm";
 import { generateAlgorithmBets } from "../../../utils/strategies/core.js";
 import { formatRiskMessage } from "../risk.js";
 
+// Backend source of truth for pricing to prevent client-side spoofing
+const PRICING_PLANS: Record<string, { days: number; price: number }> = {
+  "1": { days: 1, price: 200 },
+  "7": { days: 7, price: 1000 },
+  "30": { days: 30, price: 3000 },
+};
+
 async function isUserPremium(chatId: string): Promise<boolean> {
   const user = await db
     .select()
@@ -51,13 +58,11 @@ export function setupCommands(bot: Bot<MyContext>) {
     const payload = ctx.match;
     if (payload.startsWith("plan_")) {
       const target = payload.replace("plan_", "");
-
       const msg =
         `🎯 **Target: ${target}x**\n\n` +
         `Let's make sure you don't go broke hitting this.\n\n` +
         `How much cash do you have right now? Type your balance and the target like this:\n\n` +
         `\`/plan 1000 ${target}\``;
-
       return ctx.reply(msg, { parse_mode: "Markdown" });
     }
 
@@ -79,24 +84,19 @@ export function setupCommands(bot: Bot<MyContext>) {
       );
     }
 
-    if (payload === "guide") {
-      return triggerGuide(ctx);
-    }
-
-    if (payload === "premium") {
-      return triggerPremiumMenu(ctx);
-    }
+    if (payload === "guide") return triggerGuide(ctx);
+    if (payload === "premium") return triggerPremiumMenu(ctx);
 
     await sendMainMenu(ctx);
   });
 
   async function triggerPremiumMenu(ctx: any) {
     const tierKeyboard = new InlineKeyboard()
-      .text("1 Day - KES 200", "pay_1_200")
+      .text("1 Day - KES 200", "pay_1")
       .row()
-      .text("7 Days - KES 1000", "pay_7_1000")
+      .text("7 Days - KES 1000", "pay_7")
       .row()
-      .text("30 Days - KES 3000", "pay_30_3000");
+      .text("30 Days - KES 3000", "pay_30");
 
     await ctx.reply(
       "⚡ **Choose your Premium Plan:**\n\n\n" +
@@ -109,7 +109,6 @@ export function setupCommands(bot: Bot<MyContext>) {
     const data = ctx.callbackQuery.data;
     const chatId = ctx.chat!.id.toString();
 
-    // Always acknowledge the callback immediately to stop the UI from hanging
     await ctx.answerCallbackQuery().catch(console.error);
 
     if (data === "menu_premium") return triggerPremiumMenu(ctx);
@@ -118,11 +117,18 @@ export function setupCommands(bot: Bot<MyContext>) {
     if (data === "menu_support") return triggerSupport(ctx);
 
     if (data.startsWith("pay_")) {
-      const [, daysStr, amountStr] = data.split("_");
-      const duration = parseInt(daysStr);
-      const amountKES = parseInt(amountStr);
+      const [, daysStr] = data.split("_");
 
-      // Notify the user something is happening
+      // SECURITY: Validate against backend pricing source of truth
+      const plan = PRICING_PLANS[daysStr];
+      if (!plan) {
+        console.error(`🚨 Invalid plan requested: ${daysStr} by ${chatId}`);
+        return;
+      }
+
+      const duration = plan.days;
+      const amountKES = plan.price;
+
       const loadingMsg = await ctx.reply("⏳ Generating your M-Pesa link...");
 
       try {
@@ -153,7 +159,6 @@ export function setupCommands(bot: Bot<MyContext>) {
             },
           );
         } else {
-          // Log the exact payload to see why Paystack rejected it
           console.error("❌ Paystack initialization rejected:", payment);
           await bot.api.editMessageText(
             chatId,
@@ -200,8 +205,8 @@ export function setupCommands(bot: Bot<MyContext>) {
       `The game is building up to the drop. The math shows the multiplier is most likely to hit within this specific pocket of rounds.\n\n` +
       `**2️⃣ "Within X rounds" (e.g., Within 10)**\n` +
       `The target is highly concentrated. The drop is expected to happen before this round count runs out.\n\n` +
-      `**3️⃣ "Overdue (Plan X)"**\n` +
-      `The mathematical drop point has already passed. The game is officially "late" to drop this multiplier. The bot tells you to "Plan X" rounds—meaning you should plan enough stakes to cover one full natural probability cycle to catch the correction.\n\n` +
+      `**3️⃣ "High Risk / Late"**\n` +
+      `The mathematical drop point has already passed. The bot will tell you to budget enough stakes to cover one full natural probability cycle to catch the correction.\n\n` +
       `💡 **THE GOLDEN RULE:**\n` +
       `Click **'⚙️ Plan My Bets'** on any alert. The bot will do the math and tell you exactly how much to bet each round to survive the entire Action Window and still profit.`;
 
@@ -336,7 +341,8 @@ export function setupCommands(bot: Bot<MyContext>) {
   });
 
   bot.command("plan", async (ctx) => {
-    const args = ctx.match.split(" ");
+    const chatId = ctx.chat!.id.toString();
+    const args = ctx.match.trim().split(/\s+/);
 
     if (args.length !== 2) {
       return ctx.reply(
@@ -355,9 +361,16 @@ export function setupCommands(bot: Bot<MyContext>) {
       return ctx.reply("❌ Invalid target multiplier.");
     }
 
-    // Generate the simple text we created earlier
-    const riskMsg = formatRiskMessage(bankroll, target);
+    // Premium Validation Check
+    const isPremium = await isUserPremium(chatId);
+    if (!isPremium) {
+      return ctx.reply(
+        "🔒 **Locked**\n\nOnly Premium users can use the bot to generate survival plans.",
+        { parse_mode: "Markdown" },
+      );
+    }
 
+    const riskMsg = formatRiskMessage(bankroll, target);
     await ctx.reply(riskMsg, { parse_mode: "Markdown" });
   });
 

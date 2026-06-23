@@ -8,6 +8,7 @@ import {
   index,
   jsonb,
   boolean,
+  real,
 } from "drizzle-orm/pg-core";
 
 export const users = pgTable(
@@ -270,3 +271,17 @@ export const supportTickets = pgTable(
     index("support_tickets_status_idx").on(table.status),
   ],
 );
+
+export const systemStats = pgTable("system_stats", {
+  id: integer("id").primaryKey().default(1), // Single row table
+  hits: integer("hits").notNull().default(0),
+  signals: integer("signals").notNull().default(0),
+});
+
+export const pendingSignals = pgTable("pending_signals", {
+  id: text("id").primaryKey(), // We'll use the target as the ID to avoid duplicates
+  target: real("target").notNull(),
+  confidence: integer("confidence").notNull(),
+  roundsElapsed: integer("rounds_elapsed").notNull().default(0),
+  maxLifespan: integer("max_lifespan").notNull(),
+});

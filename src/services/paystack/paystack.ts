@@ -72,11 +72,8 @@ export async function verifyPayment(reference: string) {
 /**
  * 3. The web-hook free background polling loop.
  */
-/**
- * 3. The web-hook free background polling loop.
- */
 export function startPaystackPolling() {
-  const POLLING_INTERVAL = 15 * 1000; // 15 seconds for aggressive fulfillment
+  const POLLING_INTERVAL = 15 * 1000; // 15 seconds
 
   const runPoller = async () => {
     try {
@@ -88,16 +85,18 @@ export function startPaystackPolling() {
         .where(
           and(
             eq(payments.status, "pending"),
-            // Assuming you have a createdAt column. If not, add one immediately.
             gte(payments.createdAt, oneHourAgo),
           ),
         );
+
       for (const payment of pendingPayments) {
         try {
-          // Optional: If you have a createdAt column, kill the invoice if it's older than 15 minutes
-          // to stop the bot from polling it forever if the user abandoned it.
-          const ageMinutes =
-            (Date.now() - new Date(payment.createdAt).getTime()) / 60000;
+          const paymentTime = new Date(payment.createdAt).getTime();
+          const ageMinutes = (Date.now() - paymentTime) / 60000;
+
+          // Timezone / STK Push Grace Period Fix
+          if (ageMinutes < 0.5) continue;
+
           if (ageMinutes > 15) {
             await db
               .update(payments)
@@ -117,13 +116,11 @@ export function startPaystackPolling() {
               paystackStatus === "failed" ||
               paystackStatus === "abandoned"
             ) {
-              // M-Pesa explicitly rejected it (wrong PIN, insufficient funds, or 60s timeout)
               await db
                 .update(payments)
                 .set({ status: "failed" })
                 .where(eq(payments.reference, payment.reference));
 
-              // Notify the user so they aren't waiting in silence
               if (bot) {
                 await bot.api
                   .sendMessage(
@@ -131,13 +128,10 @@ export function startPaystackPolling() {
                     "❌ **Payment Failed or Cancelled**\n\nThe M-Pesa request timed out, lacked funds, or was cancelled. If you still want Premium, please generate a new link.",
                     { parse_mode: "Markdown" },
                   )
-                  .catch(console.error); // Catch in case they blocked the bot
+                  .catch(console.error);
               }
             }
-            // If paystackStatus is 'pending', 'ongoing', or 'send_pin', DO NOTHING. Let it loop again.
           }
-
-          // Throttle requests: wait 200ms between checking each payment to respect Paystack API limits
           await new Promise((res) => setTimeout(res, 200));
         } catch (err) {
           console.error(`Error polling payment ${payment.reference}:`, err);
@@ -146,12 +140,10 @@ export function startPaystackPolling() {
     } catch (err) {
       console.error("Error in paystack polling loop:", err);
     } finally {
-      // Schedule the next poll ONLY after this entire batch finishes
       setTimeout(runPoller, POLLING_INTERVAL);
     }
   };
 
-  // Kick off the first loop
   setTimeout(runPoller, POLLING_INTERVAL);
 }
 
