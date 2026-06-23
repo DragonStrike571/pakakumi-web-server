@@ -129,7 +129,7 @@ export function setupCommands(bot: Bot<MyContext>) {
         const callbackUrl = `https://t.me/${bot.botInfo.username}?start=paid`;
 
         const payment = await initializePayment(
-          `user_${chatId}@oracle.internal`,
+          `user_${chatId}@pakakumi-oracle.ke.softdocs.org`,
           amountKES,
           chatId,
           duration,
