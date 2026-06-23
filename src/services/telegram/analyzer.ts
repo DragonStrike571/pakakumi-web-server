@@ -17,7 +17,7 @@ interface ActiveSignal {
   target: number;
   confidence: number;
   roundsElapsed: number;
-  maxLifespan: number; // Now completely adaptive
+  maxLifespan: number;
 }
 let pendingProofs: ActiveSignal[] = [];
 
@@ -56,7 +56,6 @@ export async function runAnalysis(newRound?: {
 
     if (hitSignals.length > 0) {
       systemStats.hits += hitSignals.length;
-
       hitSignals.forEach((s) => cooldownMap.delete(s.target));
 
       const bestHit = hitSignals.reduce((prev, current) =>
@@ -68,7 +67,7 @@ export async function runAnalysis(newRound?: {
         100
       ).toFixed(1);
 
-      // 1. Send Proof to Free Channel
+      // 1. Send Proof to Free Channel (Awaited to enforce order)
       if (publicChannelId) {
         const publicProofMsg =
           `🔥 <b>TARGET HIT</b> 🔥\n\n` +
@@ -83,9 +82,9 @@ export async function runAnalysis(newRound?: {
             `https://t.me/${botUsername}?start=premium`,
           )
           .row()
-          .url("🤖 Use Bot to Plan Bets", `https://t.me/${botUsername}`); // <-- FIXED THIS
+          .url("🤖 Use Bot to Plan Bets", `https://t.me/${botUsername}`);
 
-        bot?.api
+        await bot?.api
           .sendMessage(publicChannelId, publicProofMsg, {
             parse_mode: "HTML",
             reply_markup: publicKb,
@@ -93,7 +92,7 @@ export async function runAnalysis(newRound?: {
           .catch(console.error);
       }
 
-      // 2. Send Proof to Premium Channel
+      // 2. Send Proof to Premium Channel (Awaited)
       if (privateChannelId) {
         const premiumProofMsg =
           `✅ **TARGET SECURED**\n\n` +
@@ -101,7 +100,7 @@ export async function runAnalysis(newRound?: {
           `Actual Crash: **${newRound.bust}x**\n\n` +
           `_Waiting for the next hot target._`;
 
-        bot?.api
+        await bot?.api
           .sendMessage(privateChannelId, premiumProofMsg, {
             parse_mode: "Markdown",
           })
@@ -126,7 +125,7 @@ export async function runAnalysis(newRound?: {
   const rawAlerts = [];
 
   for (const target of TARGETS) {
-    const expectedGap = target / (1 - HOUSE_EDGE); // True statistical frequency
+    const expectedGap = target / (1 - HOUSE_EDGE);
     const K = 5;
     const occIndices: number[] = [];
 
@@ -140,31 +139,30 @@ export async function runAnalysis(newRound?: {
     if (occIndices.length === 0) continue;
 
     const currentGap = occIndices[0];
+
+    // CRITICAL FIX: If the target hit on this exact round, disqualify it immediately.
+    // This prevents math deficits from forcing a 99% confidence trigger on a target that just landed.
+    if (currentGap === 0) continue;
+
     const gapsUsed = occIndices.length - 1;
     let expectedNextGap = expectedGap;
 
     if (gapsUsed > 0) {
       const sumOfPreviousGaps = occIndices[gapsUsed] - occIndices[0];
       const expectedTotalForNextGaps = (gapsUsed + 1) * expectedGap;
-
-      // Mean Reversion Target: What the next gap SHOULD be to balance the RTP
       expectedNextGap = expectedTotalForNextGaps - sumOfPreviousGaps;
     }
 
-    // Pure mathematical deficit
     const expectedRoundsRemaining = Math.max(
       0,
       Math.round(expectedNextGap - currentGap),
     );
     const pureOverdueRatio = currentGap / expectedGap;
 
-    // Confidence purely derived from Mean Reversion proximity
     let confidence = 0;
     if (expectedNextGap <= 0) {
-      // Past gaps were so massive that a hit is mathematically owed immediately
       confidence = 99;
     } else {
-      // Scales to 100% exactly as the current gap approaches the Mean Reversion point
       const baseConfidence = (currentGap / expectedNextGap) * 100;
       confidence = Math.min(99, Math.round(baseConfidence));
     }
@@ -173,7 +171,7 @@ export async function runAnalysis(newRound?: {
       rawAlerts.push({
         target,
         confidence,
-        expectedGap, // Pass this for the Action Window calculation
+        expectedGap,
         expectedRoundsRemaining,
         pureOverdueRatio,
       });
@@ -222,15 +220,12 @@ export async function runAnalysis(newRound?: {
         cluster.reduce((sum, c) => sum + c.confidence, 0) / cluster.length,
       );
 
-      // Extract raw statistical data
       const minRemaining = Math.min(
         ...cluster.map((c) => c.expectedRoundsRemaining),
       );
       const maxRemaining = Math.max(
         ...cluster.map((c) => c.expectedRoundsRemaining),
       );
-
-      // Use the highest expected gap in the cluster as the mathematical baseline
       const baseExpectedGap = Math.round(
         Math.max(...cluster.map((c) => c.expectedGap)),
       );
@@ -239,7 +234,6 @@ export async function runAnalysis(newRound?: {
       let planRounds = 0;
 
       if (maxRemaining > 0) {
-        // The hit is expected within this exact mathematical window
         const lowerLimit = Math.max(1, minRemaining);
         planRounds = maxRemaining;
         roundsRange =
@@ -247,8 +241,6 @@ export async function runAnalysis(newRound?: {
             ? `Within ${planRounds}`
             : `${lowerLimit} to ${planRounds}`;
       } else {
-        // Mathematically overdue. The mean reversion point has passed.
-        // The safest statistical play is covering 1 full natural probability cycle.
         planRounds = baseExpectedGap;
         roundsRange = `Overdue (Plan ${planRounds})`;
       }
@@ -256,7 +248,21 @@ export async function runAnalysis(newRound?: {
       const status =
         cluster[0].pureOverdueRatio >= 1.5 ? "Very Overdue" : "Hot & Ready";
 
-      // 1. PREMIUM DISPATCH
+      // CRITICAL FIX: Push to pending proofs globally before dispatching.
+      // This ensures Premium alerts are tracked for hits and cleared from cooldown.
+      cluster.forEach((c) => {
+        if (!pendingProofs.find((p) => p.target === c.target)) {
+          const adaptiveLifespan = planRounds + Math.ceil(c.target * 0.85);
+          pendingProofs.push({
+            target: c.target,
+            confidence: c.confidence,
+            roundsElapsed: 0,
+            maxLifespan: adaptiveLifespan,
+          });
+        }
+      });
+
+      // 1. PREMIUM DISPATCH (Awaited)
       if (privateChannelId) {
         const premiumMsg =
           `⚠️ <b>HOT TARGETS FOUND</b>\n\n` +
@@ -279,7 +285,7 @@ export async function runAnalysis(newRound?: {
           .row()
           .url("❓ Read the Guide", `https://t.me/${botUsername}?start=guide`);
 
-        bot.api
+        await bot.api
           .sendMessage(privateChannelId, premiumMsg, {
             parse_mode: "HTML",
             reply_markup: premiumKb,
@@ -287,11 +293,11 @@ export async function runAnalysis(newRound?: {
           .catch(console.error);
       }
 
-      // 2. FREE DISPATCH
+      // 2. FREE DISPATCH (Awaited)
       if (publicChannelId && avgConfidence >= 90) {
         const isFreeDrop = !freeTargetDropped && Math.random() < 0.2;
-
         let teaseMsg = "";
+
         if (isFreeDrop) {
           freeTargetDropped = true;
           teaseMsg =
@@ -313,26 +319,14 @@ export async function runAnalysis(newRound?: {
           .row()
           .url("🤖 Use Bot to Plan Bets", `https://t.me/${botUsername}`)
           .row()
-          .url("❓ Read the Guide", `https://t.me/${botUsername}?start=guide`); // <-- Add this; // <-- ADDED THIS FOR CONSISTENCY
+          .url("❓ Read the Guide", `https://t.me/${botUsername}?start=guide`);
 
-        bot.api
+        await bot.api
           .sendMessage(publicChannelId, teaseMsg, {
             parse_mode: "HTML",
             reply_markup: publicKb,
           })
           .catch(console.error);
-
-        cluster.forEach((c) => {
-          if (!pendingProofs.find((p) => p.target === c.target)) {
-            const adaptiveLifespan = planRounds + Math.ceil(c.target * 0.85);
-            pendingProofs.push({
-              target: c.target,
-              confidence: c.confidence,
-              roundsElapsed: 0,
-              maxLifespan: adaptiveLifespan,
-            });
-          }
-        });
       }
     }
   }
