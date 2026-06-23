@@ -9,9 +9,10 @@ import { formatRiskMessage } from "../risk.js";
 
 // Backend source of truth for pricing to prevent client-side spoofing
 const PRICING_PLANS: Record<string, { days: number; price: number }> = {
-  "1": { days: 1, price: 200 },
-  "7": { days: 7, price: 1000 },
-  "30": { days: 30, price: 3000 },
+  "0.5": { days: 0.5, price: 700 },
+  "1": { days: 1, price: 1300 },
+  "7": { days: 7, price: 4000 },
+  "30": { days: 30, price: 13000 },
 };
 
 async function isUserPremium(chatId: string): Promise<boolean> {
@@ -92,11 +93,13 @@ export function setupCommands(bot: Bot<MyContext>) {
 
   async function triggerPremiumMenu(ctx: any) {
     const tierKeyboard = new InlineKeyboard()
-      .text("1 Day - KES 200", "pay_1")
+      .text(`12 Hours - KES ${PRICING_PLANS["0.5"].price}`, "pay_0.5")
       .row()
-      .text("7 Days - KES 1000", "pay_7")
+      .text(`1 Day - KES ${PRICING_PLANS["1"].price}`, "pay_1")
       .row()
-      .text("30 Days - KES 3000", "pay_30");
+      .text(`7 Days - KES ${PRICING_PLANS["7"].price}`, "pay_7")
+      .row()
+      .text(`30 Days - KES ${PRICING_PLANS["30"].price}`, "pay_30");
 
     await ctx.reply(
       "⚡ **Choose your Premium Plan:**\n\n\n" +
@@ -314,7 +317,7 @@ export function setupCommands(bot: Bot<MyContext>) {
       minBet,
       multiplier,
       targetReturn,
-      "none",
+      "five",
     );
     if (sequence.length === 0)
       return ctx.reply(
