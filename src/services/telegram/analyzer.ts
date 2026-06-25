@@ -62,7 +62,9 @@ export async function runAnalysis(newRound?: {
   // STEP 1: EVALUATE PENDING SIGNALS & UPDATE STATS
   // =========================================================================
   if (newRound && pendingProofs.length > 0) {
-    const hitSignals = pendingProofs.filter((s) => newRound.bust >= s.target);
+    const hitSignals = pendingProofs.filter(
+      (s) => newRound.bust >= Number(s.target),
+    );
 
     if (hitSignals.length > 0) {
       // 1. Update DB Stats
@@ -73,16 +75,16 @@ export async function runAnalysis(newRound?: {
         .where(eq(systemStats.id, 1));
 
       // 2. Clear Hits from Cooldown and DB
-      const hitTargets = hitSignals.map((s) => s.target);
+      const hitTargets = hitSignals.map((s) => Number(s.target));
       hitTargets.forEach((t) => cooldownMap.delete(t));
       await db
         .delete(pendingSignals)
         .where(inArray(pendingSignals.target, hitTargets));
 
       // 3. String Fix: Map all hits instead of reducing
-      hitSignals.sort((a, b) => a.target - b.target);
+      hitSignals.sort((a, b) => Number(a.target) - Number(b.target));
       const hitTargetsStr = hitSignals
-        .map((s) => `${s.target.toFixed(2)}x`)
+        .map((s) => `${Number(s.target).toFixed(2)}x`)
         .join(", ");
 
       const winRate = ((stats.hits / Math.max(1, stats.signals)) * 100).toFixed(
@@ -132,10 +134,12 @@ export async function runAnalysis(newRound?: {
 
     // Queue Cleanup for Dead/Expired Signals
     const deadSignals = pendingProofs.filter(
-      (s) => newRound.bust < s.target && s.roundsElapsed + 1 >= s.maxLifespan,
+      (s) =>
+        newRound.bust < Number(s.target) &&
+        s.roundsElapsed + 1 >= s.maxLifespan,
     );
     if (deadSignals.length > 0) {
-      const deadTargets = deadSignals.map((s) => s.target);
+      const deadTargets = deadSignals.map((s) => Number(s.target));
       deadTargets.forEach((t) => cooldownMap.delete(t));
       await db
         .delete(pendingSignals)
@@ -297,8 +301,9 @@ export async function runAnalysis(newRound?: {
           | Placeholder<string, any>
           | undefined;
       }[] = [];
+
       cluster.forEach((c) => {
-        if (!pendingProofs.find((p) => p.target === c.target)) {
+        if (!pendingProofs.find((p) => Number(p.target) === c.target)) {
           newSignalsToInsert.push({
             id: c.target.toString(),
             target: c.target,
