@@ -32,6 +32,11 @@ export class GameScraper extends EventEmitter {
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private scraping: boolean = false;
 
+  // Staleness detection: if no DOM changes arrive for this long, re-initialize the observer
+  private stalenessTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly STALENESS_TIMEOUT_MS = 300_000; // 5 minutes without a DOM change = stale
+  private lastActivity: number = Date.now();
+
   constructor() {
     super();
   }
@@ -72,9 +77,12 @@ export class GameScraper extends EventEmitter {
         console.error("❌ Browser disconnected! Attempting restart in 5s...");
         this.isRunning = false;
         this.clearDebounce();
+        this.clearStalenessTimer();
         this.restartCount++;
         if (this.restartCount > this.MAX_RESTARTS) {
-          console.error("🛑 Scraper exceeded max restarts. Halting permanently.");
+          console.error(
+            "🛑 Scraper exceeded max restarts. Halting permanently.",
+          );
           return;
         }
         setTimeout(() => this.start(), 5000);
@@ -82,6 +90,8 @@ export class GameScraper extends EventEmitter {
 
       this.isRunning = true;
       this.restartCount = 0; // Reset on successful start
+      this.lastActivity = Date.now();
+      this.resetStalenessTimer();
       console.log("✅ Scraper started and listening for rounds.");
     });
 
@@ -99,6 +109,7 @@ export class GameScraper extends EventEmitter {
 
   public async stop() {
     this.clearDebounce();
+    this.clearStalenessTimer();
     if (this.browser) {
       await this.browser.close();
       this.browser = null;
@@ -106,6 +117,46 @@ export class GameScraper extends EventEmitter {
     }
     this.isRunning = false;
     console.log("🛑 Scraper stopped.");
+  }
+
+  private clearStalenessTimer() {
+    if (this.stalenessTimer) {
+      clearTimeout(this.stalenessTimer);
+      this.stalenessTimer = null;
+    }
+  }
+
+  private resetStalenessTimer() {
+    this.clearStalenessTimer();
+    this.stalenessTimer = setTimeout(() => {
+      this.handleStaleness();
+    }, this.STALENESS_TIMEOUT_MS);
+  }
+
+  private async handleStaleness() {
+    const silentSeconds = Math.round((Date.now() - this.lastActivity) / 1000);
+    console.warn(
+      `⚠️ Scraper stale: no DOM changes for ${silentSeconds}s. Reloading page...`,
+    );
+
+    if (!this.page || !this.isRunning) return;
+
+    try {
+      await this.page.reload({ waitUntil: "load", timeout: 30000 });
+      await this.setupObserver();
+      this.lastActivity = Date.now();
+      this.resetStalenessTimer();
+      console.log("✅ Scraper re-initialized after staleness.");
+    } catch (err) {
+      console.error("❌ Failed to recover from staleness:", err);
+      // Full restart
+      this.isRunning = false;
+      this.clearStalenessTimer();
+      this.restartCount++;
+      if (this.restartCount <= this.MAX_RESTARTS) {
+        setTimeout(() => this.start(), 5000);
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -120,6 +171,10 @@ export class GameScraper extends EventEmitter {
     // If we're already mid-scrape, just mark that another change came in
     // (the current scrape will pick it up since it reads the latest DOM state)
     if (this.scraping) return;
+
+    // Reset staleness timer on any activity
+    this.lastActivity = Date.now();
+    this.resetStalenessTimer();
 
     this.clearDebounce();
     this.debounceTimer = setTimeout(() => {

@@ -4,6 +4,7 @@ import { MyContext } from "../bot.js";
 import { db } from "../../../db/index.js";
 import { telegramUsers, supportTickets } from "../../../db/schema.js";
 import { eq } from "drizzle-orm";
+import { buildMainMenuKeyboard } from "./commands.js";
 
 const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID;
 
@@ -18,8 +19,11 @@ export function setupMessages(bot: Bot<MyContext>) {
     if (!text) return;
 
     // In channel posts, ctx.from might be undefined. Fall back to chat ID.
-    const chatId = ctx.chat?.id.toString();
-    const userId = ctx.from?.id.toString() || chatId;
+    const chatId = ctx.chat?.id?.toString();
+    const userId = ctx.from?.id?.toString() || chatId;
+
+    // Null safety: if we can't determine a chat ID, bail out
+    if (!chatId) return;
 
     if (text.startsWith("/")) return;
 
@@ -33,19 +37,19 @@ export function setupMessages(bot: Bot<MyContext>) {
           try {
             await bot.api.sendMessage(
               targetUserId,
-              `📩 **Support Reply:**\n\n${text}`,
-              { parse_mode: "Markdown" },
+              `📩 <b>Support Reply:</b>\n\n${text}`,
+              { parse_mode: "HTML" },
             );
-            await ctx.reply("✅ Reply successfully delivered to user.");
+            await ctx.reply("✅ Reply delivered to user.");
           } catch (err) {
             console.error(`Error sending reply to user ${targetUserId}:`, err);
             await ctx.reply(
-              "❌ Failed to send reply. The user may have blocked the bot.",
+              "❌ Could not send reply. The user may have blocked the bot.",
             );
           }
         } else {
           await ctx.reply(
-            "⚠️ Could not extract User ID from the message you replied to.",
+            "⚠️ Could not find User ID in the message you replied to.",
           );
         }
       }
@@ -60,24 +64,17 @@ export function setupMessages(bot: Bot<MyContext>) {
         .where(eq(telegramUsers.chatId, chatId));
       ctx.dbState = "command";
 
-      const menuKb = new InlineKeyboard()
-        .text("🚀 Get Premium", "menu_premium")
-        .row()
-        .url("💬 Join Free Chat", "https://t.me/pakakumi_oracle_free")
-        .row()
-        .text("📖 How to Use", "menu_guide")
-        .row()
-        .text("📅 My Status", "menu_status")
-        .text("💬 Support", "menu_support");
+      const botUsername = ctx.me?.username || "pk_oracle_bot";
+      const menuKb = buildMainMenuKeyboard(botUsername);
 
-      await ctx.reply(
-        "✅ Support closed. You are back in the main menu.\n\n📊 **Pakakumi Oracle**\nChoose an option below:",
-        {
-          reply_markup: { remove_keyboard: true },
-        },
-      );
+      await ctx.reply("✅ Support closed. You are back in the main menu.", {
+        reply_markup: { remove_keyboard: true },
+      });
       // Send the inline menu separately so it renders cleanly
-      await ctx.reply("Options:", { reply_markup: menuKb });
+      await ctx.reply("📊 <b>Pakakumi Oracle</b>\n\nChoose an option:", {
+        parse_mode: "HTML",
+        reply_markup: menuKb,
+      });
       return;
     }
 
@@ -93,13 +90,13 @@ export function setupMessages(bot: Bot<MyContext>) {
       if (ADMIN_CHANNEL_ID) {
         await bot.api.sendMessage(
           ADMIN_CHANNEL_ID,
-          `🎫 **New Support Ticket (#${ticket.id})**\n[Ticket from User ID: ${chatId}]\nUsername: @${username}\n\nMessage:\n${text}\n\n_Reply directly to this message to answer the user._`,
-          { parse_mode: "Markdown" },
+          `🎫 <b>Support Ticket (#${ticket.id})</b>\n[User ID: ${chatId}]\nUsername: @${username}\n\nMessage:\n${text}\n\n<i>Reply to this message to answer the user.</i>`,
+          { parse_mode: "HTML" },
         );
       }
 
       await ctx.reply(
-        "✅ Message sent. An admin will reply here shortly.\n\n_Type another message or click '❌ Close Support'._",
+        "✅ Message sent. An admin will reply here shortly.\n\nType another message or click '❌ Close Support'.",
       );
       return;
     }

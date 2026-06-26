@@ -66,7 +66,14 @@ export async function verifyPayment(reference: string) {
     },
   );
 
-  return await response.json();
+  const data = await response.json();
+
+  // Guard against malformed responses
+  if (!data || typeof data !== 'object') {
+    throw new Error(`Paystack verify returned invalid data for ${reference}`);
+  }
+
+  return data;
 }
 
 /**
@@ -148,11 +155,24 @@ export function startPaystackPolling() {
 }
 
 /**
+ * Shape of Paystack transaction data after verification.
+ */
+interface PaystackTransactionData {
+  amount: number;
+  status: string;
+  reference: string;
+  metadata?: {
+    chatId?: string;
+    durationPaidFor?: number;
+  };
+}
+
+/**
  * 4. Fulfill the order, enforce math security, and grant access.
  */
 export async function handleSuccessfulPayment(
   reference: string,
-  paystackData: any,
+  paystackData: PaystackTransactionData,
 ) {
   // Fetch the local invoice truth
   const paymentRecord = await db

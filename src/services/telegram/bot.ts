@@ -21,6 +21,7 @@ export const bot = token ? new Bot<MyContext>(token) : null;
 // RAM Cache to protect the Database from being hammered by rapid updates
 const sessionCache = new Map<string, { state: string; lastUpdated: number }>();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const MAX_CACHE_SIZE = 10_000; // Prevent unbounded memory growth
 
 if (bot) {
   // Database State Sync Middleware
@@ -61,6 +62,16 @@ if (bot) {
         state: user.sessionState,
         lastUpdated: now,
       });
+
+      // Evict oldest entries if cache exceeds max size
+      if (sessionCache.size > MAX_CACHE_SIZE) {
+        const entries = [...sessionCache.entries()]
+          .sort((a, b) => a[1].lastUpdated - b[1].lastUpdated);
+        const toDelete = Math.floor(MAX_CACHE_SIZE * 0.2);
+        for (let i = 0; i < toDelete; i++) {
+          sessionCache.delete(entries[i][0]);
+        }
+      }
 
       ctx.dbState = user.sessionState as "command" | "support";
       await next();

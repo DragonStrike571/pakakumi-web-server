@@ -1,4 +1,4 @@
-// services/bot/risk.ts
+// services/telegram/risk.ts
 
 interface RiskProfile {
   bankroll: number;
@@ -48,32 +48,33 @@ export function generateRiskPlan({ bankroll, target, strategy }: RiskProfile) {
     sequence,
     warning:
       survivedRounds < 3
-        ? "🚨 DANGER: Your balance is too small for this target. You will lose everything fast."
-        : "✅ SAFE: Follow these exact bets so you don't go broke.",
+        ? "🚨 DANGER: Your cash is too little for this target. You will lose everything fast."
+        : "✅ SAFE: Follow these bets exactly and you have a good chance.",
   };
 }
 
 /**
- * Utility to format the plan into simple, direct Telegram text
+ * Format the plan into simple, direct text for Telegram.
+ * Written for standard Kenyan users — clear, no jargon.
  */
 export function formatRiskMessage(bankroll: number, target: number): string {
   const plan = generateRiskPlan({ bankroll, target, strategy: "conservative" });
 
-  let msg = `🛡️ **HOW TO SURVIVE** 🛡️\n\n`;
-  msg += `💰 **Your Cash:** KES ${bankroll}\n`;
-  msg += `🎯 **Target:** ${target}x\n\n`;
+  let msg = `🛡️ <b>HOW TO PLAY SMART</b> 🛡️\n\n`;
+  msg += `💰 <b>Your Cash:</b> KES ${bankroll.toLocaleString()}\n`;
+  msg += `🎯 <b>Target:</b> ${target}x\n\n`;
   msg += `${plan.warning}\n\n`;
 
-  msg += `🛑 **HARD STOP:** If you lose KES ${plan.maxLossLimit}, STOP PLAYING.\n\n`;
+  msg += `🛑 <b>STOP LIMIT:</b> If you have lost KES ${plan.maxLossLimit.toLocaleString()}, STOP. Do not continue.\n\n`;
 
   if (plan.survivedRounds >= 1) {
-    msg += `📝 **Your Betting Plan (Stop immediately after you win):**\n`;
+    msg += `📝 <b>Your Betting Plan:</b>\n<i>(Stop immediately after you win)</i>\n\n`;
     plan.sequence.forEach((s) => {
-      msg += `• Bet ${s.round}: Stake **KES ${s.bet}** _(Total spent: KES ${s.totalSpent})_\n`;
+      msg += `• Bet ${s.round}: Stake <b>KES ${s.bet.toLocaleString()}</b> <i>(Total spent: KES ${s.totalSpent.toLocaleString()})</i>\n`;
     });
   }
 
-  msg += `\n⚠️ _Never put all your money at once. If you miss all these bets, walk away. The game doesn't care about your feelings._`;
+  msg += `\n⚠️ <i>Never put all your money on one round. If you miss all these bets, walk away. Come back another time.</i>`;
 
   return msg;
 }

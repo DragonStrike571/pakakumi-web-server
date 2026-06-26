@@ -5,7 +5,16 @@ import { CORS_ORIGINS } from "../config/cors.js";
 
 type WsPayload =
   | { type: "welcome"; message: string }
-  | { type: "roundUpdate"; data: Round };
+  | { type: "roundUpdate"; data: Round }
+  | {
+      type: "analysisUpdate";
+      data: {
+        activeSignals: any[];
+        upcomingOpportunities: any[];
+        stats: any;
+        hitTargets: number[];
+      };
+    };
 
 function sendJson(socket: WebSocket, payload: WsPayload) {
   if (socket.readyState !== socket.OPEN) {
@@ -84,5 +93,17 @@ export function attachWebSocketServer(httpServer: Server) {
     });
   }
 
-  return { broadcastRoundUpdate };
+  function broadcastAnalysisUpdate(data: {
+    activeSignals: any[];
+    upcomingOpportunities: any[];
+    stats: any;
+    hitTargets: number[];
+  }) {
+    broadcastJson(wss, {
+      type: "analysisUpdate",
+      data,
+    });
+  }
+
+  return { broadcastRoundUpdate, broadcastAnalysisUpdate };
 }

@@ -16,6 +16,7 @@ import { auth } from "./lib/auth.js";
 import cors from "cors";
 import { pool } from "./db/index.js";
 import paystackRouter from "./routes/paystack.js";
+import analysisRouter from "./routes/analysis.js";
 
 // Core Daemons
 import { bot } from "./services/telegram/bot.js";
@@ -66,7 +67,10 @@ app.use(
 );
 
 app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  // Filter noisy health check and WebSocket upgrade logs
+  if (req.url !== "/health" && req.url !== "/ws") {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  }
   next();
 });
 
@@ -99,10 +103,11 @@ app.use("/strategies", strategiesRouter);
 app.use("/bot", botRouter);
 app.use("/account", accountRouter);
 app.use("/paystack", paystackRouter);
+app.use("/analysis", analysisRouter);
 
 // WEBHOOK REMOVED: Telegram now operates entirely via background polling
 
-const { broadcastRoundUpdate } = attachWebSocketServer(server);
+const { broadcastRoundUpdate, broadcastAnalysisUpdate } = attachWebSocketServer(server);
 app.locals.broadcastRoundUpdate = broadcastRoundUpdate;
 
 // Initialize Scraper
@@ -131,7 +136,32 @@ gameScraper.on("roundEnded", async (data) => {
     runAnalysis({
       bust: Number(savedRound.bust),
       createdAt: savedRound.createdAt,
-    }).catch((err) => console.error("❌ Analyzer error:", err));
+    })
+      .then((analysisResult) => {
+        if (analysisResult) {
+          broadcastAnalysisUpdate({
+            activeSignals: analysisResult.clusters.flatMap((c) =>
+              c.alerts.map((a) => ({
+                target: a.target,
+                confidence: a.confidence,
+                expectedRoundsRemaining: a.expectedRoundsRemaining,
+                reason: a.reason,
+              })),
+            ),
+            upcomingOpportunities: analysisResult.upcomingOpportunities.map(
+              (o) => ({
+                target: o.target,
+                confidence: o.confidence,
+                expectedRoundsRemaining: o.expectedRoundsRemaining,
+                reason: o.reason,
+              }),
+            ),
+            stats: analysisResult.stats,
+            hitTargets: analysisResult.hitTargets,
+          });
+        }
+      })
+      .catch((err) => console.error("❌ Analyzer error:", err));
   }
 });
 

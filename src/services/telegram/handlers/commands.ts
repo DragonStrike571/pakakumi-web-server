@@ -7,13 +7,16 @@ import { eq, desc, gte } from "drizzle-orm";
 import { generateAlgorithmBets } from "../../../utils/strategies/core.js";
 import { formatRiskMessage } from "../risk.js";
 
-// Backend source of truth for pricing to prevent client-side spoofing
+// ─── Pricing — 5 tiers for better conversion ────────────────────────────────
 const PRICING_PLANS: Record<string, { days: number; price: number }> = {
-  "0.5": { days: 0.5, price: 700 },
-  "1": { days: 1, price: 1300 },
-  "7": { days: 7, price: 4000 },
-  "30": { days: 30, price: 13000 },
+  "0.5": { days: 0.5, price: 200 },
+  "1": { days: 1, price: 350 },
+  "3": { days: 3, price: 800 },
+  "7": { days: 7, price: 1500 },
+  "30": { days: 30, price: 4000 },
 };
+
+// ─── Shared Utilities ───────────────────────────────────────────────────────
 
 async function isUserPremium(chatId: string): Promise<boolean> {
   const user = await db
@@ -25,27 +28,35 @@ async function isUserPremium(chatId: string): Promise<boolean> {
   return user.expiryTimestamp > new Date();
 }
 
-async function sendMainMenu(ctx: any) {
-  const menuKb = new InlineKeyboard()
+export function buildMainMenuKeyboard(botUsername: string): InlineKeyboard {
+  return new InlineKeyboard()
     .text("🚀 Get Premium", "menu_premium")
     .row()
     .url("💬 Join Free Chat", "https://t.me/pakakumi_oracle_free")
     .row()
-    .text("📖 How to Use", "menu_guide")
+    .text("📖 How It Works", "menu_guide")
     .row()
     .text("📅 My Status", "menu_status")
     .text("💬 Support", "menu_support");
+}
+
+async function sendMainMenu(ctx: MyContext) {
+  const botUsername = ctx.me?.username || "pk_oracle_bot";
+  const menuKb = buildMainMenuKeyboard(botUsername);
 
   await ctx.reply(
-    "📊 **Pakakumi Oracle**\n\n\n" +
-      "We track the game to find the best times to bet.\n\n" +
-      "🔧 **Bot Commands:**\n\n" +
-      "• `/last <multiplier> [count]`\n_See past hits (e.g., /last 50 3)_\n\n" +
-      "• `/generate <capital> <minBet> <multiplier> <targetReturn>`\n_Plan your bets (e.g., /generate 1000 10 2.0 1.5)_\n\n" +
-      "• `/terms`\n_Rules and Policies_",
-    { parse_mode: "Markdown", reply_markup: menuKb },
+    "📊 <b>Pakakumi Oracle</b>\n\n" +
+      "We watch the game and tell you the best times to play.\n\n" +
+      "🔧 <b>Commands:</b>\n\n" +
+      "• <code>/last 50 3</code>\nSee the last 3 times 50x appeared\n\n" +
+      "• <code>/generate 1000 10 2.0 1.5</code>\nPlan your bets — tells you exactly how much to stake each round\n\n" +
+      "• <code>/plan 5000 2.5</code>\nGet a survival plan for your balance\n\n" +
+      "• <code>/terms</code>\nRules and policies",
+    { parse_mode: "HTML", reply_markup: menuKb },
   );
 }
+
+// ─── Command Setup ──────────────────────────────────────────────────────────
 
 export function setupCommands(bot: Bot<MyContext>) {
   bot.command("start", async (ctx) => {
@@ -60,28 +71,28 @@ export function setupCommands(bot: Bot<MyContext>) {
     if (payload.startsWith("plan_")) {
       const target = payload.replace("plan_", "");
       const msg =
-        `🎯 **Target: ${target}x**\n\n` +
-        `Let's make sure you don't go broke hitting this.\n\n` +
-        `How much cash do you have right now? Type your balance and the target like this:\n\n` +
-        `\`/plan 1000 ${target}\``;
-      return ctx.reply(msg, { parse_mode: "Markdown" });
+        `🎯 <b>Target: ${target}x</b>\n\n` +
+        `Let's plan your bets properly so you don't go broke.\n\n` +
+        `How much cash do you have? Type it like this:\n\n` +
+        `<code>/plan 1000 ${target}</code>`;
+      return ctx.reply(msg, { parse_mode: "HTML" });
     }
 
     if (payload.startsWith("strat_")) {
       const target = payload.split("_")[1];
       return ctx.reply(
-        `⚙️ **Plan Your Bets**\n\n` +
-          `You are aiming for a ${target}x multiplier.\n\n` +
-          `To plan your stakes, reply with:\n\n` +
-          `\`/generate <capital> <minBet> ${target} <targetReturn>\`\n\n` +
-          `_Example: /generate 5000 20 ${target} 1.5_`,
-        { parse_mode: "Markdown" },
+        `⚙️ <b>Plan Your Bets</b>\n\n` +
+          `You want to hit ${target}x.\n\n` +
+          `Type this to plan your stakes:\n\n` +
+          `<code>/generate [your cash] [min bet] ${target} [recovery]</code>\n\n` +
+          `<i>Example: /generate 5000 20 ${target} 1.5</i>`,
+        { parse_mode: "HTML" },
       );
     }
 
     if (payload === "paid") {
       return ctx.reply(
-        "⏳ Welcome back! If you completed the payment, your Premium access link will arrive here within the next 15-30 seconds automatically.",
+        "⏳ If you completed the payment, your Premium access will arrive here in 15-30 seconds.",
       );
     }
 
@@ -91,20 +102,22 @@ export function setupCommands(bot: Bot<MyContext>) {
     await sendMainMenu(ctx);
   });
 
-  async function triggerPremiumMenu(ctx: any) {
+  async function triggerPremiumMenu(ctx: MyContext) {
     const tierKeyboard = new InlineKeyboard()
-      .text(`12 Hours - KES ${PRICING_PLANS["0.5"].price}`, "pay_0.5")
+      .text(`12 Hours — KES ${PRICING_PLANS["0.5"].price}`, "pay_0.5")
       .row()
-      .text(`1 Day - KES ${PRICING_PLANS["1"].price}`, "pay_1")
+      .text(`1 Day — KES ${PRICING_PLANS["1"].price}`, "pay_1")
       .row()
-      .text(`7 Days - KES ${PRICING_PLANS["7"].price}`, "pay_7")
+      .text(`3 Days — KES ${PRICING_PLANS["3"].price}`, "pay_3")
       .row()
-      .text(`30 Days - KES ${PRICING_PLANS["30"].price}`, "pay_30");
+      .text(`7 Days — KES ${PRICING_PLANS["7"].price}`, "pay_7")
+      .row()
+      .text(`30 Days — KES ${PRICING_PLANS["30"].price}`, "pay_30");
 
     await ctx.reply(
-      "⚡ **Choose your Premium Plan:**\n\n\n" +
-        "Get exact targets, live alerts, and full access to the `/last` and `/generate` commands.",
-      { parse_mode: "Markdown", reply_markup: tierKeyboard },
+      "⚡ <b>Choose Your Plan:</b>\n\n" +
+        "Get exact targets, early alerts, and the <code>/last</code> and <code>/generate</code> commands.",
+      { parse_mode: "HTML", reply_markup: tierKeyboard },
     );
   }
 
@@ -132,7 +145,7 @@ export function setupCommands(bot: Bot<MyContext>) {
       const duration = plan.days;
       const amountKES = plan.price;
 
-      const loadingMsg = await ctx.reply("⏳ Generating your M-Pesa link...");
+      const loadingMsg = await ctx.reply("⏳ Preparing your M-Pesa link...");
 
       try {
         const callbackUrl = `https://t.me/${bot.botInfo.username}?start=paid`;
@@ -146,18 +159,22 @@ export function setupCommands(bot: Bot<MyContext>) {
         );
 
         if (payment && payment.status) {
+          const durationLabel =
+            duration < 1 ? "12 Hours" : `${duration} Day${duration > 1 ? "s" : ""}`;
+
           await bot.api.editMessageText(
             chatId,
             loadingMsg.message_id,
-            `💳 **M-Pesa Payment Initiated**\n\n` +
-              `**Plan:** ${duration} Days\n\n` +
-              `1️⃣ Click the link below to open the secure payment portal.\n` +
-              `2️⃣ Enter your M-Pesa number and wait for the STK prompt on your phone.\n` +
-              `3️⃣ Enter your PIN.\n\n` +
-              `🔗 **[Open Payment Portal](${payment.data.authorization_url})**\n\n` +
-              `_⚠️ Note: M-Pesa can take up to 30 seconds to send the prompt. We verify payments every 30 seconds. Once paid, you will be automatically redirected here and granted access._`,
+            `💳 <b>Pay with M-Pesa</b>\n\n` +
+              `<b>Plan:</b> ${durationLabel}\n` +
+              `<b>Price:</b> KES ${amountKES}\n\n` +
+              `1️⃣ Click the link below\n` +
+              `2️⃣ Enter your M-Pesa number\n` +
+              `3️⃣ Enter your PIN when the prompt comes\n\n` +
+              `🔗 <b><a href="${payment.data.authorization_url}">Open Payment Page</a></b>\n\n` +
+              `<i>⚠️ M-Pesa can take up to 30 seconds to send the prompt. Once you pay, you will get your access link here automatically.</i>`,
             {
-              parse_mode: "Markdown",
+              parse_mode: "HTML",
               link_preview_options: { is_disabled: true },
             },
           );
@@ -166,7 +183,7 @@ export function setupCommands(bot: Bot<MyContext>) {
           await bot.api.editMessageText(
             chatId,
             loadingMsg.message_id,
-            "❌ Payment could not be generated at this time. Please try again.",
+            "❌ Could not create payment. Try again in a moment.",
           );
         }
       } catch (error) {
@@ -174,13 +191,13 @@ export function setupCommands(bot: Bot<MyContext>) {
         await bot.api.editMessageText(
           chatId,
           loadingMsg.message_id,
-          "❌ Payment system is currently busy. Try again in a minute.",
+          "❌ Payment system is busy. Try again in a minute.",
         );
       }
     }
   });
 
-  async function checkStatus(ctx: any) {
+  async function checkStatus(ctx: MyContext) {
     const chatId = ctx.chat!.id.toString();
     const isPremium = await isUserPremium(chatId);
     const user = await db
@@ -190,33 +207,34 @@ export function setupCommands(bot: Bot<MyContext>) {
       .then((res) => res[0]);
 
     if (!isPremium) {
-      await ctx.reply("❌ **Status:** Not Active", { parse_mode: "Markdown" });
+      await ctx.reply("❌ <b>Status:</b> Not Active", { parse_mode: "HTML" });
     } else {
       await ctx.reply(
-        `✅ **Status:** Active\n\nExpires on:\n*${user.expiryTimestamp?.toDateString()}*`,
-        { parse_mode: "Markdown" },
+        `✅ <b>Status:</b> Active\n\nExpires: <b>${user.expiryTimestamp?.toDateString()}</b>`,
+        { parse_mode: "HTML" },
       );
     }
   }
 
-  async function triggerGuide(ctx: any) {
+  async function triggerGuide(ctx: MyContext) {
     const guideText =
-      `📖 **How to read the Oracle**\n\n` +
-      `We don't guess. The bot calculates **Mean Reversion**—the mathematical point where a multiplier *must* drop to maintain the game's 99% RTP.\n\n` +
-      `🎯 **ACTION WINDOWS EXPLAINED:**\n\n` +
-      `**1️⃣ "X to Y rounds" (e.g., 5 to 15)**\n` +
-      `The game is building up to the drop. The math shows the multiplier is most likely to hit within this specific pocket of rounds.\n\n` +
-      `**2️⃣ "Within X rounds" (e.g., Within 10)**\n` +
-      `The target is highly concentrated. The drop is expected to happen before this round count runs out.\n\n` +
-      `**3️⃣ "High Risk / Late"**\n` +
-      `The mathematical drop point has already passed. The bot will tell you to budget enough stakes to cover one full natural probability cycle to catch the correction.\n\n` +
-      `💡 **THE GOLDEN RULE:**\n` +
-      `Click **'⚙️ Plan My Bets'** on any alert. The bot will do the math and tell you exactly how much to bet each round to survive the entire Action Window and still profit.`;
+      `📖 <b>How This Works</b>\n\n` +
+      `We watch every single game round 24/7 and track when each multiplier last appeared.\n\n` +
+      `<b>🎯 What the alerts mean:</b>\n\n` +
+      `<b>1️⃣ "5 to 15 games"</b>\n` +
+      `The target is expected to appear within this range. Spread your bets across these rounds.\n\n` +
+      `<b>2️⃣ "Within 10 games"</b>\n` +
+      `The target is very close. It could drop any moment.\n\n` +
+      `<b>3️⃣ "Late"</b>\n` +
+      `The target should have appeared already but hasn't. This means you need more bets to catch it.\n\n` +
+      `<b>💡 The Most Important Thing:</b>\n` +
+      `Always click <b>"⚙️ Plan My Bets"</b> on any alert. The bot tells you exactly how much to bet each round so you don't go broke waiting.\n\n` +
+      `<b>⚠️ Never</b> put all your money on one round. The plan spreads your cash across many rounds to give you the best chance.`;
 
-    await ctx.reply(guideText, { parse_mode: "Markdown" });
+    await ctx.reply(guideText, { parse_mode: "HTML" });
   }
 
-  async function triggerSupport(ctx: any) {
+  async function triggerSupport(ctx: MyContext) {
     const chatId = ctx.chat!.id.toString();
     await db
       .update(telegramUsers)
@@ -225,9 +243,9 @@ export function setupCommands(bot: Bot<MyContext>) {
     ctx.dbState = "support";
 
     await ctx.reply(
-      "🔒 **Support Open**\n\n\nType your message below. The admin will reply to you here.",
+      "🔒 <b>Support Open</b>\n\nType your message below. An admin will reply here.",
       {
-        parse_mode: "Markdown",
+        parse_mode: "HTML",
         reply_markup: {
           keyboard: [[{ text: "❌ Close Support" }]],
           resize_keyboard: true,
@@ -240,9 +258,10 @@ export function setupCommands(bot: Bot<MyContext>) {
     const chatId = ctx.chat!.id.toString();
     const args = ctx.match.trim().split(/\s+/);
     if (!args[0])
-      return ctx.reply("⚠️ **How to use:**\n\n`/last <multiplier> [count]`", {
-        parse_mode: "Markdown",
-      });
+      return ctx.reply(
+        "⚠️ <b>How to use:</b>\n\n<code>/last [multiplier] [count]</code>\n\nExample: <code>/last 50 3</code>",
+        { parse_mode: "HTML" },
+      );
 
     const target = parseFloat(args[0]);
     const limit = args[1] ? Math.min(parseInt(args[1]), 10) : 1;
@@ -257,7 +276,7 @@ export function setupCommands(bot: Bot<MyContext>) {
       .limit(isPremium ? limit : 1);
 
     if (history.length === 0)
-      return ctx.reply(`No records found for >= ${target}x.`);
+      return ctx.reply(`No results found for >= ${target}x.`);
 
     if (!isPremium) {
       const hit = history[0];
@@ -269,14 +288,14 @@ export function setupCommands(bot: Bot<MyContext>) {
       if (timeAgo > 1440) timeString = `${Math.floor(timeAgo / 1440)} days ago`;
 
       return ctx.reply(
-        `🔒 **Data Locked**\n\n\n` +
-          `The last **${target}x** hit **${timeString}**.\n\n\n` +
-          `_Upgrade to Premium to see the exact time and get up to 10 past results._`,
-        { parse_mode: "Markdown" },
+        `🔒 <b>Limited View</b>\n\n` +
+          `The last <b>${target}x</b> was <b>${timeString}</b>.\n\n` +
+          `<i>Get Premium to see exact times and up to 10 past results.</i>`,
+        { parse_mode: "HTML" },
       );
     }
 
-    let response = `📊 **Past results for >= ${target}x**\n\n\n`;
+    let response = `📊 <b>Past results for >= ${target}x</b>\n\n`;
     history.forEach((hit, index) => {
       const dateStr = hit.createdAt.toLocaleString("en-GB", {
         timeZone: "Africa/Nairobi",
@@ -285,9 +304,9 @@ export function setupCommands(bot: Bot<MyContext>) {
         hour: "2-digit",
         minute: "2-digit",
       });
-      response += `${index + 1}. **${hit.bust}x**\n_${dateStr}_\n\n`;
+      response += `${index + 1}. <b>${hit.bust}x</b>\n<i>${dateStr}</i>\n\n`;
     });
-    await ctx.reply(response, { parse_mode: "Markdown" });
+    await ctx.reply(response, { parse_mode: "HTML" });
   });
 
   bot.command("generate", async (ctx) => {
@@ -296,8 +315,9 @@ export function setupCommands(bot: Bot<MyContext>) {
 
     if (args.length < 4) {
       return ctx.reply(
-        "⚠️ **How to use:**\n\n`/generate <capital> <minBet> <multiplier> <targetReturn>`",
-        { parse_mode: "Markdown" },
+        "⚠️ <b>How to use:</b>\n\n<code>/generate [cash] [min bet] [multiplier] [recovery]</code>\n\n" +
+          "Example: <code>/generate 1000 10 2.0 1.5</code>",
+        { parse_mode: "HTML" },
       );
     }
 
@@ -308,8 +328,8 @@ export function setupCommands(bot: Bot<MyContext>) {
     const isPremium = await isUserPremium(chatId);
     if (!isPremium)
       return ctx.reply(
-        "🔒 **Locked**\n\nOnly Premium users can use the bot to plan their bets.",
-        { parse_mode: "Markdown" },
+        "🔒 <b>Premium Only</b>\n\nGet Premium to plan your bets with the bot.",
+        { parse_mode: "HTML" },
       );
 
     const sequence = generateAlgorithmBets(
@@ -321,26 +341,26 @@ export function setupCommands(bot: Bot<MyContext>) {
     );
     if (sequence.length === 0)
       return ctx.reply(
-        "❌ This plan is impossible with your capital. Try changing the numbers.",
+        "❌ This plan is not possible with your cash. Try different numbers.",
       );
 
     let response =
-      `⚙️ **Your Bet Plan**\n\n` +
-      `_Capital: ${capital}_\n` +
-      `_Target: ${multiplier}x_\n` +
-      `_Recovery: ${targetReturn}x_\n\n\n` +
-      `**What to bet:**\n\n`;
+      `⚙️ <b>Your Bet Plan</b>\n\n` +
+      `<i>Cash: KES ${capital}</i>\n` +
+      `<i>Target: ${multiplier}x</i>\n` +
+      `<i>Recovery: ${targetReturn}x</i>\n\n` +
+      `<b>What to bet each round:</b>\n\n`;
 
     const displayLimit = Math.min(sequence.length, 20);
 
     for (let i = 0; i < displayLimit; i++) {
-      response += `Round ${i + 1}: Bet **${sequence[i].amount}**\n`;
+      response += `Round ${i + 1}: Bet <b>KES ${sequence[i].amount}</b>\n`;
     }
 
     if (sequence.length > 20)
-      response += `\n_...and ${sequence.length - 20} more rounds._\n`;
-    response += `\n\n**Total losses you can survive:** ${sequence.length - 1}`;
-    await ctx.reply(response, { parse_mode: "Markdown" });
+      response += `\n<i>...and ${sequence.length - 20} more rounds.</i>\n`;
+    response += `\n<b>Total losses you can survive:</b> ${sequence.length - 1}`;
+    await ctx.reply(response, { parse_mode: "HTML" });
   });
 
   bot.command("plan", async (ctx) => {
@@ -349,8 +369,8 @@ export function setupCommands(bot: Bot<MyContext>) {
 
     if (args.length !== 2) {
       return ctx.reply(
-        "❌ **Wrong format.**\n\nType it like this: `/plan [YourCash] [Target]`\nExample: `/plan 5000 2.5`",
-        { parse_mode: "Markdown" },
+        "❌ <b>Wrong format.</b>\n\nType it like this: <code>/plan [your cash] [target]</code>\nExample: <code>/plan 5000 2.5</code>",
+        { parse_mode: "HTML" },
       );
     }
 
@@ -358,27 +378,32 @@ export function setupCommands(bot: Bot<MyContext>) {
     const target = Number(args[1]);
 
     if (isNaN(bankroll) || bankroll < 10) {
-      return ctx.reply("❌ Invalid cash amount. Minimum is 10 KES.");
+      return ctx.reply("❌ Amount too small. Minimum is KES 10.");
     }
     if (isNaN(target) || target <= 1.01) {
-      return ctx.reply("❌ Invalid target multiplier.");
+      return ctx.reply("❌ Invalid target. Must be above 1.01x.");
     }
 
     // Premium Validation Check
     const isPremium = await isUserPremium(chatId);
     if (!isPremium) {
       return ctx.reply(
-        "🔒 **Locked**\n\nOnly Premium users can use the bot to generate survival plans.",
-        { parse_mode: "Markdown" },
+        "🔒 <b>Premium Only</b>\n\nGet Premium to generate survival plans.",
+        { parse_mode: "HTML" },
       );
     }
 
     const riskMsg = formatRiskMessage(bankroll, target);
-    await ctx.reply(riskMsg, { parse_mode: "Markdown" });
+    await ctx.reply(riskMsg, { parse_mode: "HTML" });
   });
 
   bot.command("terms", async (ctx) => {
-    const legalText = `⚖️ **RULES**\n\n\n**1. NO REFUNDS**\nAll payments are final.\n\n**2. BANS**\nReversing an M-Pesa payment will get you permanently banned.\n\n**3. RISKS**\nThe bot gives you the best chances based on past data, but there are no guarantees. We are not responsible for money lost.\n\n**4. PRIVACY**\nWe do not share your info or track your personal bets.`;
-    await ctx.reply(legalText, { parse_mode: "Markdown" });
+    const legalText =
+      `⚖️ <b>RULES</b>\n\n` +
+      `<b>1. NO REFUNDS</b>\nAll payments are final.\n\n` +
+      `<b>2. BANS</b>\nReversing an M-Pesa payment gets you permanently banned.\n\n` +
+      `<b>3. RISKS</b>\nThe bot gives you the best chances based on past data, but nothing is guaranteed. We are not responsible for money lost.\n\n` +
+      `<b>4. PRIVACY</b>\nWe don't share your info or track your personal bets.`;
+    await ctx.reply(legalText, { parse_mode: "HTML" });
   });
 }

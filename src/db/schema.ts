@@ -276,6 +276,7 @@ export const systemStats = pgTable("system_stats", {
   id: integer("id").primaryKey().default(1), // Single row table
   hits: integer("hits").notNull().default(0),
   signals: integer("signals").notNull().default(0),
+  lastAlertRound: integer("last_alert_round").notNull().default(0),
 });
 
 export const pendingSignals = pgTable("pending_signals", {
@@ -284,4 +285,57 @@ export const pendingSignals = pgTable("pending_signals", {
   confidence: integer("confidence").notNull(),
   roundsElapsed: integer("rounds_elapsed").notNull().default(0),
   maxLifespan: integer("max_lifespan").notNull(),
+  cooldownExpiry: integer("cooldown_expiry").notNull().default(0), // round index at which cooldown expires
+  reason: text("reason"), // Human-readable reason for the signal
+  createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+});
+
+export const signalHistory = pgTable(
+  "signal_history",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    target: real("target").notNull(),
+    confidence: integer("confidence").notNull(),
+    outcome: text("outcome").notNull().default("pending"), // 'pending', 'hit', 'missed'
+    reason: text("reason"), // Why was this alert sent
+    expectedRoundsRemaining: integer("expected_rounds_remaining"),
+    actualRoundsToHit: integer("actual_rounds_to_hit"), // filled when resolved
+    bustValue: real("bust_value"), // the bust that resolved this signal
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    resolvedAt: timestamp("resolved_at", { mode: "date" }),
+  },
+  (table) => [
+    index("signal_history_target_idx").on(table.target),
+    index("signal_history_outcome_idx").on(table.outcome),
+    index("signal_history_created_idx").on(table.createdAt),
+  ],
+);
+
+export const analysisSnapshots = pgTable("analysis_snapshots", {
+  id: integer("id").primaryKey().default(1), // Single row — always the latest snapshot
+  activeSignals: jsonb("active_signals").$type<
+    {
+      target: number;
+      confidence: number;
+      expectedRoundsRemaining: number;
+      status: string;
+      reason: string;
+      roundsElapsed: number;
+    }[]
+  >(),
+  upcomingOpportunities: jsonb("upcoming_opportunities").$type<
+    {
+      target: number;
+      confidence: number;
+      expectedRoundsRemaining: number;
+      reason: string;
+    }[]
+  >(),
+  stats: jsonb("stats").$type<{
+    totalSignals: number;
+    totalHits: number;
+    accuracy: number;
+    roundsAnalyzed: number;
+  }>(),
+  updatedAt: timestamp("updated_at", { mode: "date" }).defaultNow().notNull(),
 });
