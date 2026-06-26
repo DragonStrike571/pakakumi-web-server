@@ -35,14 +35,14 @@ export async function runAnalysis(newRound?: {
 
   let pendingProofs = await db.select().from(pendingSignals);
 
-  // Array Bottleneck Fix (O(1) Push & Batch Slice)
+  // FIX 1: Array Bottleneck Fix (Fetch newest, then reverse for chronological order)
   if (cachedRounds.length === 0) {
-    // Fetch ASCENDING so oldest is [0], newest is end
-    cachedRounds = await db.query.rounds.findMany({
-      orderBy: [asc(rounds.createdAt)],
+    const latestRounds = await db.query.rounds.findMany({
+      orderBy: [desc(rounds.createdAt)],
       limit: 10000,
       columns: { bust: true, createdAt: true },
     });
+    cachedRounds = latestRounds.reverse();
   } else if (newRound) {
     cachedRounds.push(newRound); // O(1)
     if (cachedRounds.length > 11000) {
@@ -62,31 +62,35 @@ export async function runAnalysis(newRound?: {
   // STEP 1: EVALUATE PENDING SIGNALS & UPDATE STATS
   // =========================================================================
   if (newRound && pendingProofs.length > 0) {
+    let hitTargets: number[] = [];
+    let deadTargets: number[] = [];
+
+    // 1. Process Hits
     const hitSignals = pendingProofs.filter(
       (s) => newRound.bust >= Number(s.target),
     );
 
     if (hitSignals.length > 0) {
-      // 1. Update DB Stats
+      hitTargets = hitSignals.map((s) => Number(s.target));
+
+      // Update DB Stats
       stats.hits += hitSignals.length;
       await db
         .update(systemStats)
         .set({ hits: stats.hits })
         .where(eq(systemStats.id, 1));
 
-      // 2. Clear Hits from Cooldown and DB
-      const hitTargets = hitSignals.map((s) => Number(s.target));
+      // Clear Hits from Cooldown and DB
       hitTargets.forEach((t) => cooldownMap.delete(t));
       await db
         .delete(pendingSignals)
         .where(inArray(pendingSignals.target, hitTargets));
 
-      // 3. String Fix: Map all hits instead of reducing
+      // String Fix: Map all hits
       hitSignals.sort((a, b) => Number(a.target) - Number(b.target));
       const hitTargetsStr = hitSignals
         .map((s) => `${Number(s.target).toFixed(2)}x`)
         .join(", ");
-
       const winRate = ((stats.hits / Math.max(1, stats.signals)) * 100).toFixed(
         1,
       );
@@ -132,25 +136,31 @@ export async function runAnalysis(newRound?: {
       }
     }
 
-    // Queue Cleanup for Dead/Expired Signals
+    // 2. Queue Cleanup for Dead/Expired Signals
     const deadSignals = pendingProofs.filter(
       (s) =>
         newRound.bust < Number(s.target) &&
         s.roundsElapsed + 1 >= s.maxLifespan,
     );
+
     if (deadSignals.length > 0) {
-      const deadTargets = deadSignals.map((s) => Number(s.target));
+      deadTargets = deadSignals.map((s) => Number(s.target));
       deadTargets.forEach((t) => cooldownMap.delete(t));
       await db
         .delete(pendingSignals)
         .where(inArray(pendingSignals.target, deadTargets));
     }
 
-    // Update elapsed rounds for survivors
-    if (pendingProofs.length > 0 && deadSignals.length < pendingProofs.length) {
-      await db.execute(
-        sql`UPDATE pending_signals SET rounds_elapsed = rounds_elapsed + 1`,
-      );
+    // FIX 3: Update elapsed rounds ONLY for survivors
+    const survivorTargets = pendingProofs
+      .map((s) => Number(s.target))
+      .filter((t) => !hitTargets.includes(t) && !deadTargets.includes(t));
+
+    if (survivorTargets.length > 0) {
+      await db
+        .update(pendingSignals)
+        .set({ roundsElapsed: sql`rounds_elapsed + 1` })
+        .where(inArray(pendingSignals.target, survivorTargets));
     }
   }
 
@@ -164,7 +174,7 @@ export async function runAnalysis(newRound?: {
     const K = 5;
     const occIndices: number[] = [];
 
-    // Array Bottleneck Fix: Traverse BACKWARDS since end of array is the newest
+    // Traverse BACKWARDS since end of array is the newest
     for (let i = recentRounds.length - 1; i >= 0; i--) {
       if (recentRounds[i].bust >= target) {
         const distance = recentRounds.length - 1 - i;
@@ -246,9 +256,7 @@ export async function runAnalysis(newRound?: {
     let freeTargetDropped = false;
 
     for (const cluster of clusters) {
-      cluster.forEach((c) => cooldownMap.set(c.target, currentRoundIndex));
-
-      // Fix: Increment signals by total targets in cluster, not just 1
+      // FIX 2: Update database state BEFORE locking the cooldown map
       stats.signals += cluster.length;
       await db
         .update(systemStats)
@@ -282,7 +290,6 @@ export async function runAnalysis(newRound?: {
             : `${lowerLimit} to ${planRounds}`;
       } else {
         planRounds = baseExpectedGap;
-        // Fix: Actionable terminology instead of "Plan x"
         roundsRange = `Late: Budget for ${planRounds} bets`;
       }
 
@@ -320,6 +327,9 @@ export async function runAnalysis(newRound?: {
           .values(newSignalsToInsert)
           .onConflictDoNothing();
       }
+
+      // NOW set the cooldown, since DB persistence succeeded
+      cluster.forEach((c) => cooldownMap.set(c.target, currentRoundIndex));
 
       // 1. PREMIUM DISPATCH
       if (privateChannelId) {
