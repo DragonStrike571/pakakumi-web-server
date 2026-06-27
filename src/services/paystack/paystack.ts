@@ -69,7 +69,7 @@ export async function verifyPayment(reference: string) {
   const data = await response.json();
 
   // Guard against malformed responses
-  if (!data || typeof data !== 'object') {
+  if (!data || typeof data !== "object") {
     throw new Error(`Paystack verify returned invalid data for ${reference}`);
   }
 
@@ -84,7 +84,7 @@ export function startPaystackPolling() {
 
   const runPoller = async () => {
     try {
-      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+      const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000);
 
       const pendingPayments = await db
         .select()
@@ -92,7 +92,7 @@ export function startPaystackPolling() {
         .where(
           and(
             eq(payments.status, "pending"),
-            gte(payments.createdAt, oneHourAgo),
+            gte(payments.createdAt, fourHoursAgo),
           ),
         );
 
