@@ -237,7 +237,7 @@ export const payments = pgTable(
       .references(() => telegramUsers.chatId),
     amount: integer("amount").notNull(),
     status: text("status").default("pending").notNull(), // 'pending', 'success', 'failed'
-    durationPaidFor: integer("duration_paid_for").notNull(), // in days
+    durationPaidFor: numeric("duration_paid_for", { mode: "number" }).notNull(), // in days
     reference: text("reference").notNull().unique(), // Paystack reference
     createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { mode: "date" })
