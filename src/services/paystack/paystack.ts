@@ -169,31 +169,12 @@ export function startPaystackPolling() {
 
   const runPoller = async () => {
     try {
-      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
-
-      // A. CLEANUP: Hard-fail local records older than 2 hours to prevent database clutter
-      await db
-        .update(payments)
-        .set({ status: "failed" })
-        .where(
-          and(
-            eq(payments.status, "pending"),
-            lt(payments.createdAt, twoHoursAgo),
-          ),
-        );
-
-      // B. WIDE NET: Grab active pending transactions from the last 2 hours
+      // Fetch EVERY pending payment, regardless of age.
       const pendingPayments = await db
         .select()
         .from(payments)
-        .where(
-          and(
-            eq(payments.status, "pending"),
-            gte(payments.createdAt, twoHoursAgo),
-          ),
-        );
+        .where(eq(payments.status, "pending"));
 
-      // C. VERIFY & PACE
       for (const payment of pendingPayments) {
         try {
           const data = await verifyPayment(payment.reference);
@@ -202,11 +183,13 @@ export function startPaystackPolling() {
             const paystackStatus = data.data.status;
 
             if (paystackStatus === "success") {
+              // Fulfill the order and mark as success
               await handleSuccessfulPayment(payment.reference, data.data);
             } else if (
               paystackStatus === "failed" ||
               paystackStatus === "abandoned"
             ) {
+              // Paystack definitively marked it as dead. Kill it locally.
               await db
                 .update(payments)
                 .set({ status: "failed" })
@@ -222,6 +205,8 @@ export function startPaystackPolling() {
                   .catch(console.error);
               }
             }
+            // If paystackStatus is 'pending', 'ongoing', or anything else,
+            // do absolutely nothing. It remains 'pending' in the DB and will be checked again.
           }
 
           // THROTTLE: 200ms delay ensures max 5 requests/sec to prevent rate limiting
