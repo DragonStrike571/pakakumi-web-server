@@ -1,13 +1,28 @@
-// expiry.ts — Runs immediately on start, then hourly. Processes in batches.
+/**
+ * Expiry Kicker — Removes expired premium users from the private channel.
+ *
+ * Runs immediately on start, then hourly. Processes in batches.
+ * Features:
+ * - Admin guard: Never attempts to ban admins or channel creators
+ * - Rate-limited: All Telegram API calls go through the global rate limiter
+ * - Batch processing with configurable size
+ */
+
 import { db } from "../../db/index.js";
 import { telegramUsers } from "../../db/schema.js";
 import { lt } from "drizzle-orm";
 import { bot } from "./bot.js";
+import {
+  rateLimitedSend,
+  rateLimitedBan,
+  rateLimitedUnban,
+  rateLimitedGetChatMember,
+} from "./rate-limiter.js";
 
-// Helper to prevent API throttling
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const BATCH_SIZE = 20; // Process at most 20 users per cycle to avoid overloading
 
-const BATCH_SIZE = 20; // Process at most 20 users per cycle to avoid Telegram rate limits
+// Set of admin-level statuses that should never be kicked
+const ADMIN_STATUSES = new Set(["creator", "administrator"]);
 
 export function startExpiryKicker() {
   const PRIVATE_CHANNEL_ID = process.env.PRIVATE_CHANNEL_ID;
@@ -25,23 +40,74 @@ export function startExpiryKicker() {
 
       for (const user of expiredUsers) {
         try {
-          await bot!.api.banChatMember(PRIVATE_CHANNEL_ID, Number(user.chatId));
-          await sleep(200);
+          // ─── Admin Guard ────────────────────────────────────────────
+          // Check if the user is a channel admin before attempting to kick.
+          // This prevents dangerous operations on admin accounts.
+          const userId = Number(user.chatId);
+          let isAdmin = false;
 
-          await bot!.api.unbanChatMember(
-            PRIVATE_CHANNEL_ID,
-            Number(user.chatId),
-          );
-          await sleep(200);
+          try {
+            const member = await rateLimitedGetChatMember(
+              PRIVATE_CHANNEL_ID,
+              userId,
+              "low",
+            );
+            isAdmin = ADMIN_STATUSES.has(member.status);
+          } catch (memberErr: unknown) {
+            // If we can't check membership, the user may not be in the channel.
+            // Treat as safe to skip (not kick blindly).
+            const errMsg = memberErr instanceof Error ? memberErr.message : String(memberErr);
 
-          const msg =
+            // "user not found" or "member not found" means they're already out
+            if (errMsg.includes("not found") || errMsg.includes("PARTICIPANT_NOT_FOUND")) {
+              // User already left — just notify them
+              await rateLimitedSend(
+                user.chatId,
+                `⏳ <b>Subscription Expired</b>\n\n` +
+                  `Your premium access has ended.\n\n` +
+                  `Type /start to renew.`,
+                { parse_mode: "HTML" },
+                "low",
+              ).catch(console.error);
+              continue;
+            }
+
+            console.warn(
+              `⚠️ Could not check admin status for ${user.chatId}:`,
+              errMsg,
+            );
+            continue; // Skip this user and retry next cycle
+          }
+
+          if (isAdmin) {
+            console.warn(
+              `🛡️ Skipping expiry kick for admin user ${user.chatId}`,
+            );
+
+            // Notify the admin differently
+            await rateLimitedSend(
+              user.chatId,
+              `⏳ <b>Subscription Expired</b>\n\n` +
+                `Your premium subscription has ended, but you still have channel access as an admin.\n\n` +
+                `Type /start to renew when ready.`,
+              { parse_mode: "HTML" },
+              "low",
+            ).catch(console.error);
+            continue;
+          }
+
+          // ─── Safe to kick ───────────────────────────────────────────
+          await rateLimitedBan(PRIVATE_CHANNEL_ID, userId, "low");
+          await rateLimitedUnban(PRIVATE_CHANNEL_ID, userId, "low");
+
+          await rateLimitedSend(
+            user.chatId,
             `⏳ <b>Subscription Expired</b>\n\n` +
-            `Your premium access has ended. You have been removed from the live channel.\n\n` +
-            `Type /start to renew.`;
-          await bot!.api.sendMessage(user.chatId, msg, {
-            parse_mode: "HTML",
-          });
-          await sleep(500);
+              `Your premium access has ended. You have been removed from the live channel.\n\n` +
+              `Type /start to renew.`,
+            { parse_mode: "HTML" },
+            "low",
+          ).catch(console.error);
         } catch (err) {
           console.error(`Failed to kick user ${user.chatId}:`, err);
         }

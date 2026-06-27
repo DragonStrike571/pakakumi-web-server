@@ -1,12 +1,35 @@
-// messages.ts
+/**
+ * Message Handlers — Processes non-command text messages.
+ *
+ * Handles:
+ * 1. Admin replies to support tickets
+ * 2. Close support override
+ * 3. Support ticket creation
+ *
+ * All proactive messages (admin reply delivery, ticket forwarding) use the
+ * global rate limiter. Direct ctx.reply() calls are fine for inline responses.
+ */
+
 import { Bot, InlineKeyboard } from "grammy";
 import { MyContext } from "../bot.js";
 import { db } from "../../../db/index.js";
 import { telegramUsers, supportTickets } from "../../../db/schema.js";
 import { eq } from "drizzle-orm";
 import { buildMainMenuKeyboard } from "./commands.js";
+import { rateLimitedSend } from "../rate-limiter.js";
 
 const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID;
+
+// Maximum message length for Telegram API
+const MAX_TELEGRAM_MSG_LENGTH = 4096;
+
+/**
+ * Truncate a message to Telegram's max length, preserving HTML tags.
+ */
+function truncateMessage(text: string, maxLen: number = MAX_TELEGRAM_MSG_LENGTH): string {
+  if (text.length <= maxLen) return text;
+  return text.substring(0, maxLen - 20) + "\n\n<i>[truncated]</i>";
+}
 
 export function setupMessages(bot: Bot<MyContext>) {
   // Listen for both direct messages/groups AND channel posts
@@ -35,10 +58,11 @@ export function setupMessages(bot: Bot<MyContext>) {
         if (match && match[1]) {
           const targetUserId = match[1];
           try {
-            await bot.api.sendMessage(
+            await rateLimitedSend(
               targetUserId,
-              `📩 <b>Support Reply:</b>\n\n${text}`,
+              truncateMessage(`📩 <b>Support Reply:</b>\n\n${text}`),
               { parse_mode: "HTML" },
+              "high",
             );
             await ctx.reply("✅ Reply delivered to user.");
           } catch (err) {
@@ -82,17 +106,24 @@ export function setupMessages(bot: Bot<MyContext>) {
     if (ctx.dbState === "support") {
       const username = ctx.from?.username || ctx.from?.first_name || "Unknown";
 
+      // Sanitize input: cap message length
+      const sanitizedMessage = text.substring(0, 1000);
+
       const [ticket] = await db
         .insert(supportTickets)
-        .values({ chatId, message: text.substring(0, 1000) })
+        .values({ chatId, message: sanitizedMessage })
         .returning();
 
       if (ADMIN_CHANNEL_ID) {
-        await bot.api.sendMessage(
-          ADMIN_CHANNEL_ID,
-          `🎫 <b>Support Ticket (#${ticket.id})</b>\n[User ID: ${chatId}]\nUsername: @${username}\n\nMessage:\n${text}\n\n<i>Reply to this message to answer the user.</i>`,
-          { parse_mode: "HTML" },
+        const ticketMsg = truncateMessage(
+          `🎫 <b>Support Ticket (#${ticket.id})</b>\n[User ID: ${chatId}]\nUsername: @${username}\n\nMessage:\n${sanitizedMessage}\n\n<i>Reply to this message to answer the user.</i>`,
         );
+        await rateLimitedSend(
+          ADMIN_CHANNEL_ID,
+          ticketMsg,
+          { parse_mode: "HTML" },
+          "normal",
+        ).catch(console.error);
       }
 
       await ctx.reply(

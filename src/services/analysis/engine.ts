@@ -7,6 +7,8 @@
  * 3. Generate plain-language explanations for why alerts are sent
  * 4. Persist analysis results for frontend and historical queries
  * 5. Guarantee minimum signal frequency (no silent periods)
+ * 6. Track daily prediction stats (EAT timezone)
+ * 7. Calculate ideal planning rounds for budget safety
  */
 
 import { db } from "../../db/index.js";
@@ -16,6 +18,7 @@ import {
   pendingSignals,
   signalHistory,
   analysisSnapshots,
+  dailyStats,
 } from "../../db/schema.js";
 import { desc, eq, inArray, sql } from "drizzle-orm";
 
@@ -34,6 +37,9 @@ const DROUGHT_ROUND_LIMIT = 100; // force-scan at lower threshold after this man
 const DROUGHT_CONFIDENCE_THRESHOLD = 60;
 const K_OCCURRENCES = 5; // how many past occurrences to use for gap calculation
 
+// EAT timezone for daily stats
+const EAT_TIMEZONE = "Africa/Nairobi";
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface RawAlert {
@@ -43,6 +49,8 @@ export interface RawAlert {
   expectedRoundsRemaining: number;
   pureOverdueRatio: number;
   reason: string;
+  idealPlanRounds: number;
+  isLate: boolean;
 }
 
 export interface AlertCluster {
@@ -53,7 +61,9 @@ export interface AlertCluster {
   maxRemaining: number;
   roundsRange: string;
   planRounds: number;
+  idealPlanRounds: number;
   status: string;
+  isLate: boolean;
 }
 
 export interface AnalysisResult {
@@ -66,8 +76,25 @@ export interface AnalysisResult {
     accuracy: number;
     roundsAnalyzed: number;
   };
+  todayStats: {
+    totalPredictions: number;
+    totalHits: number;
+    totalMisses: number;
+    accuracy: number;
+  };
   hitTargets: number[];
   deadTargets: number[];
+}
+
+export interface CustomAnalysisResult {
+  roundCount: number;
+  multiplierDistribution: { tier: string; count: number; expected: number; status: "hot" | "cold" | "normal" }[];
+  highest: number;
+  lowest: number;
+  average: number;
+  median: number;
+  hotMultipliers: string[];
+  coldMultipliers: string[];
 }
 
 // ─── State ──────────────────────────────────────────────────────────────────
@@ -80,6 +107,156 @@ const cooldownMap = new Map<
   number,
   { setAtRound: number; expiresAtRound: number }
 >();
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * Get today's date string in EAT timezone (e.g., "2026-06-27").
+ */
+function getTodayEAT(): string {
+  return new Date().toLocaleDateString("en-CA", { timeZone: EAT_TIMEZONE });
+}
+
+/**
+ * Calculate ideal planning rounds for a target.
+ * This is the expected duration + a buffer based on the target size.
+ * The buffer ensures predictions are more likely to land within the stated range,
+ * protecting the platform's prediction legitimacy.
+ */
+function calculateIdealPlanRounds(
+  expectedRoundsRemaining: number,
+  target: number,
+  isLate: boolean,
+): number {
+  if (isLate) return 0; // Late status = unpredictable, no ideal calculation
+  const buffer = Math.ceil(target / (target - 1));
+  return expectedRoundsRemaining + buffer;
+}
+
+// ─── Daily Stats Helpers ────────────────────────────────────────────────────
+
+async function recordDailyPrediction(target: number): Promise<void> {
+  const today = getTodayEAT();
+  const nowStr = new Date().toISOString();
+
+  try {
+    const existing = await db
+      .select()
+      .from(dailyStats)
+      .where(eq(dailyStats.date, today))
+      .then((res) => res[0]);
+
+    if (existing) {
+      const targets = (existing.targets || []) as typeof dailyStats.$inferSelect.targets;
+      targets.push({
+        target,
+        hit: false,
+        resolved: false,
+        createdAt: nowStr,
+      });
+
+      await db
+        .update(dailyStats)
+        .set({
+          totalPredictions: existing.totalPredictions + 1,
+          targets,
+          updatedAt: new Date(),
+        })
+        .where(eq(dailyStats.date, today));
+    } else {
+      await db.insert(dailyStats).values({
+        date: today,
+        totalPredictions: 1,
+        totalHits: 0,
+        totalMisses: 0,
+        targets: [
+          {
+            target,
+            hit: false,
+            resolved: false,
+            createdAt: nowStr,
+          },
+        ],
+      });
+    }
+  } catch (err) {
+    console.error("❌ Error recording daily prediction:", err);
+  }
+}
+
+async function recordDailyHit(target: number, roundsToHit: number): Promise<void> {
+  const today = getTodayEAT();
+  const nowStr = new Date().toISOString();
+
+  try {
+    const existing = await db
+      .select()
+      .from(dailyStats)
+      .where(eq(dailyStats.date, today))
+      .then((res) => res[0]);
+
+    if (existing) {
+      const targets = (existing.targets || []) as typeof dailyStats.$inferSelect.targets;
+      // Find the most recent unresolved entry for this target
+      for (let i = targets.length - 1; i >= 0; i--) {
+        if (targets[i].target === target && !targets[i].resolved) {
+          targets[i].hit = true;
+          targets[i].resolved = true;
+          targets[i].roundsToHit = roundsToHit;
+          targets[i].resolvedAt = nowStr;
+          break;
+        }
+      }
+
+      await db
+        .update(dailyStats)
+        .set({
+          totalHits: existing.totalHits + 1,
+          targets,
+          updatedAt: new Date(),
+        })
+        .where(eq(dailyStats.date, today));
+    }
+  } catch (err) {
+    console.error("❌ Error recording daily hit:", err);
+  }
+}
+
+async function recordDailyMiss(target: number): Promise<void> {
+  const today = getTodayEAT();
+  const nowStr = new Date().toISOString();
+
+  try {
+    const existing = await db
+      .select()
+      .from(dailyStats)
+      .where(eq(dailyStats.date, today))
+      .then((res) => res[0]);
+
+    if (existing) {
+      const targets = (existing.targets || []) as typeof dailyStats.$inferSelect.targets;
+      for (let i = targets.length - 1; i >= 0; i--) {
+        if (targets[i].target === target && !targets[i].resolved) {
+          targets[i].hit = false;
+          targets[i].resolved = true;
+          targets[i].resolvedAt = nowStr;
+          break;
+        }
+      }
+
+      await db
+        .update(dailyStats)
+        .set({
+          totalMisses: existing.totalMisses + 1,
+          targets,
+          updatedAt: new Date(),
+        })
+        .where(eq(dailyStats.date, today));
+    }
+  } catch (err) {
+    console.error("❌ Error recording daily miss:", err);
+  }
+}
 
 // ─── Core Engine ────────────────────────────────────────────────────────────
 
@@ -130,6 +307,7 @@ export async function runAnalysisEngine(newRound?: {
       clusters: [],
       upcomingOpportunities: [],
       stats: { totalSignals: 0, totalHits: 0, accuracy: 0, roundsAnalyzed: 0 },
+      todayStats: { totalPredictions: 0, totalHits: 0, totalMisses: 0, accuracy: 0 },
       hitTargets: [],
       deadTargets: [],
     };
@@ -162,7 +340,7 @@ export async function runAnalysisEngine(newRound?: {
         .delete(pendingSignals)
         .where(inArray(pendingSignals.target, hitTargetsList));
 
-      // Record outcomes in signal_history
+      // Record outcomes in signal_history and daily stats
       for (const sig of hitSignals) {
         await db
           .update(signalHistory)
@@ -175,6 +353,8 @@ export async function runAnalysisEngine(newRound?: {
           .where(
             sql`${signalHistory.target} = ${Number(sig.target)} AND ${signalHistory.outcome} = 'pending'`,
           );
+
+        await recordDailyHit(Number(sig.target), sig.roundsElapsed);
       }
     }
 
@@ -192,7 +372,7 @@ export async function runAnalysisEngine(newRound?: {
         .delete(pendingSignals)
         .where(inArray(pendingSignals.target, deadTargetsList));
 
-      // Record misses in signal_history
+      // Record misses in signal_history and daily stats
       for (const sig of deadSignals) {
         await db
           .update(signalHistory)
@@ -204,6 +384,8 @@ export async function runAnalysisEngine(newRound?: {
           .where(
             sql`${signalHistory.target} = ${Number(sig.target)} AND ${signalHistory.outcome} = 'pending'`,
           );
+
+        await recordDailyMiss(Number(sig.target));
       }
     }
 
@@ -278,6 +460,16 @@ export async function runAnalysisEngine(newRound?: {
       confidence = Math.min(99, Math.round(baseConfidence));
     }
 
+    // Determine if this is a "Late" signal
+    const isLate = expectedRoundsRemaining === 0 && pureOverdueRatio >= 1.0;
+
+    // Calculate ideal planning rounds
+    const idealPlanRounds = calculateIdealPlanRounds(
+      expectedRoundsRemaining,
+      target,
+      isLate,
+    );
+
     // Generate explanation in plain language
     const reason = generateReason(target, currentGap, expectedGap, pureOverdueRatio, confidence);
 
@@ -288,6 +480,8 @@ export async function runAnalysisEngine(newRound?: {
       expectedRoundsRemaining,
       pureOverdueRatio,
       reason,
+      idealPlanRounds,
+      isLate,
     };
 
     // Collect upcoming opportunities (50-69% confidence) for frontend display
@@ -367,6 +561,9 @@ export async function runAnalysisEngine(newRound?: {
             outcome: "pending",
           });
 
+          // Record in daily stats
+          await recordDailyPrediction(alert.target);
+
           totalNewSignals++;
         }
       }
@@ -440,11 +637,15 @@ export async function runAnalysisEngine(newRound?: {
       set: { ...snapshotData, updatedAt: new Date() },
     });
 
+  // ─── Step 6: Get today's stats ────────────────────────────────────────
+  const todayStats = await getTodayStats();
+
   return {
     alerts: rawAlerts,
     clusters,
     upcomingOpportunities,
     stats: snapshotData.stats,
+    todayStats,
     hitTargets: hitTargetsList,
     deadTargets: deadTargetsList,
   };
@@ -464,6 +665,10 @@ function buildCluster(alerts: RawAlert[]): AlertCluster {
     Math.max(...alerts.map((c) => c.expectedGap)),
   );
 
+  // Check if all alerts are "Late"
+  const allLate = alerts.every((a) => a.isLate);
+  const isLate = allLate && maxRemaining === 0;
+
   let roundsRange = "";
   let planRounds = 0;
 
@@ -479,6 +684,12 @@ function buildCluster(alerts: RawAlert[]): AlertCluster {
     roundsRange = `Late: Budget for ${planRounds} bets`;
   }
 
+  // Calculate ideal plan rounds for the cluster
+  // Use the maximum idealPlanRounds from all alerts in the cluster
+  const idealPlanRounds = isLate
+    ? 0
+    : Math.max(...alerts.map((a) => a.idealPlanRounds));
+
   const status =
     alerts[0].pureOverdueRatio >= 1.5 ? "Very Overdue" : "Hot & Ready";
 
@@ -490,7 +701,9 @@ function buildCluster(alerts: RawAlert[]): AlertCluster {
     maxRemaining,
     roundsRange,
     planRounds,
+    idealPlanRounds,
     status,
+    isLate,
   };
 }
 
@@ -538,6 +751,94 @@ function generateReason(
   );
 }
 
+// ─── Custom Analysis (for /analyze command) ─────────────────────────────────
+
+/**
+ * Analyze a specific range of cached rounds for multiplier patterns.
+ * Used by the /analyze command.
+ */
+export function runCustomAnalysis(
+  roundCount: number,
+  startOffset: number = 0,
+): CustomAnalysisResult | null {
+  if (cachedRounds.length === 0) return null;
+
+  const endIdx = cachedRounds.length - startOffset;
+  const startIdx = Math.max(0, endIdx - roundCount);
+
+  if (endIdx <= 0 || startIdx >= endIdx) return null;
+
+  const slice = cachedRounds.slice(startIdx, endIdx);
+  const busts = slice.map((r) => r.bust);
+
+  if (busts.length === 0) return null;
+
+  // Multiplier distribution tiers
+  const tiers = [
+    { label: "1x–1.99x", min: 1, max: 2 },
+    { label: "2x–4.99x", min: 2, max: 5 },
+    { label: "5x–9.99x", min: 5, max: 10 },
+    { label: "10x–24.99x", min: 10, max: 25 },
+    { label: "25x–49.99x", min: 25, max: 50 },
+    { label: "50x–99.99x", min: 50, max: 100 },
+    { label: "100x–499.99x", min: 100, max: 500 },
+    { label: "500x+", min: 500, max: Infinity },
+  ];
+
+  const distribution = tiers.map((tier) => {
+    const count = busts.filter((b) => b >= tier.min && b < tier.max).length;
+    // Expected probability for each tier using house edge
+    const probMin = (1 - HOUSE_EDGE) / tier.min;
+    const probMax = tier.max === Infinity ? 0 : (1 - HOUSE_EDGE) / tier.max;
+    const expectedProb = probMin - probMax;
+    const expected = Math.round(expectedProb * busts.length);
+
+    let status: "hot" | "cold" | "normal" = "normal";
+    if (expected > 0) {
+      const ratio = count / expected;
+      if (ratio >= 1.3) status = "hot";
+      else if (ratio <= 0.7) status = "cold";
+    }
+
+    return { tier: tier.label, count, expected, status };
+  });
+
+  // Hot and cold multipliers (specific TARGETS)
+  const hotMultipliers: string[] = [];
+  const coldMultipliers: string[] = [];
+
+  for (const target of TARGETS) {
+    if (target > 500) continue; // Skip extremely rare targets for this analysis
+    const expectedGap = target / (1 - HOUSE_EDGE);
+    const expectedCount = busts.length / expectedGap;
+    if (expectedCount < 1) continue; // Not enough rounds for meaningful analysis
+
+    const actualCount = busts.filter((b) => b >= target).length;
+    const ratio = actualCount / expectedCount;
+
+    if (ratio >= 1.4) hotMultipliers.push(`${target}x (${actualCount} times vs ~${Math.round(expectedCount)} expected)`);
+    else if (ratio <= 0.6 && expectedCount >= 2) coldMultipliers.push(`${target}x (${actualCount} times vs ~${Math.round(expectedCount)} expected)`);
+  }
+
+  const sorted = [...busts].sort((a, b) => a - b);
+  const median = sorted.length % 2 === 0
+    ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+    : sorted[Math.floor(sorted.length / 2)];
+
+  return {
+    roundCount: busts.length,
+    multiplierDistribution: distribution,
+    highest: Math.max(...busts),
+    lowest: Math.min(...busts),
+    average: Math.round((busts.reduce((s, b) => s + b, 0) / busts.length) * 100) / 100,
+    median: Math.round(median * 100) / 100,
+    hotMultipliers: hotMultipliers.slice(0, 5),
+    coldMultipliers: coldMultipliers.slice(0, 5),
+  };
+}
+
+// ─── Public Accessors ───────────────────────────────────────────────────────
+
 /**
  * Get the current analysis snapshot from the database.
  * Used by the REST API for frontend access.
@@ -571,6 +872,39 @@ export async function getSystemStats() {
     .from(systemStats)
     .where(eq(systemStats.id, 1))
     .then((res) => res[0] || null);
+}
+
+/**
+ * Get today's stats (EAT timezone).
+ */
+export async function getTodayStats(): Promise<{
+  totalPredictions: number;
+  totalHits: number;
+  totalMisses: number;
+  accuracy: number;
+  targets?: typeof dailyStats.$inferSelect.targets;
+}> {
+  const today = getTodayEAT();
+  const row = await db
+    .select()
+    .from(dailyStats)
+    .where(eq(dailyStats.date, today))
+    .then((res) => res[0]);
+
+  if (!row) {
+    return { totalPredictions: 0, totalHits: 0, totalMisses: 0, accuracy: 0 };
+  }
+
+  const resolved = row.totalHits + row.totalMisses;
+  const accuracy = resolved > 0 ? Math.round((row.totalHits / resolved) * 100) : 0;
+
+  return {
+    totalPredictions: row.totalPredictions,
+    totalHits: row.totalHits,
+    totalMisses: row.totalMisses,
+    accuracy,
+    targets: row.targets,
+  };
 }
 
 /**

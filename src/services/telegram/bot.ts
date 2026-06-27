@@ -23,6 +23,14 @@ const sessionCache = new Map<string, { state: string; lastUpdated: number }>();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const MAX_CACHE_SIZE = 10_000; // Prevent unbounded memory growth
 
+/**
+ * Invalidate a user's session cache entry.
+ * Call this when session state is changed programmatically (outside middleware).
+ */
+export function invalidateSessionCache(chatId: string): void {
+  sessionCache.delete(chatId);
+}
+
 if (bot) {
   // Database State Sync Middleware
   bot.use(async (ctx, next) => {

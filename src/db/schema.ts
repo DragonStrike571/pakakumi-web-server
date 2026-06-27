@@ -339,3 +339,24 @@ export const analysisSnapshots = pgTable("analysis_snapshots", {
   }>(),
   updatedAt: timestamp("updated_at", { mode: "date" }).defaultNow().notNull(),
 });
+
+export const dailyStats = pgTable("daily_stats", {
+  date: text("date").primaryKey(), // "2026-06-27" in EAT timezone
+  totalPredictions: integer("total_predictions").default(0).notNull(),
+  totalHits: integer("total_hits").default(0).notNull(),
+  totalMisses: integer("total_misses").default(0).notNull(),
+  targets: jsonb("targets")
+    .$type<
+      {
+        target: number;
+        hit: boolean;
+        resolved: boolean;
+        roundsToHit?: number;
+        createdAt: string;
+        resolvedAt?: string;
+      }[]
+    >()
+    .default([])
+    .notNull(),
+  updatedAt: timestamp("updated_at", { mode: "date" }).defaultNow().notNull(),
+});

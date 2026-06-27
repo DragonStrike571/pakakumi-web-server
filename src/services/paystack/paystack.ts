@@ -2,6 +2,10 @@ import { db } from "../../db/index.js";
 import { payments, telegramUsers } from "../../db/schema.js";
 import { eq, and, gte, lt } from "drizzle-orm";
 import { bot } from "../telegram/bot.js";
+import {
+  rateLimitedSend,
+  rateLimitedCreateInviteLink,
+} from "../telegram/rate-limiter.js";
 
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || "";
 const PAYSTACK_BASE_URL = "https://api.paystack.co";
@@ -143,15 +147,20 @@ export async function handleSuccessfulPayment(
       const privateChannelId = process.env.PRIVATE_CHANNEL_ID;
       if (privateChannelId) {
         try {
-          const invite = await bot.api.createChatInviteLink(privateChannelId, {
-            member_limit: 1,
-            expire_date: Math.floor(Date.now() / 1000) + 24 * 60 * 60,
-          });
+          const invite = await rateLimitedCreateInviteLink(
+            privateChannelId,
+            {
+              member_limit: 1,
+              expire_date: Math.floor(Date.now() / 1000) + 24 * 60 * 60,
+            },
+            "high",
+          );
 
-          await bot.api.sendMessage(
+          await rateLimitedSend(
             chatId,
-            `🎉 **Payment Verified!**\n\nYour Premium Access has been secured until *${newExpiry.toDateString()}*.\n\nJoin the Premium Room here (Link expires after 1 use):\n${invite.invite_link}`,
-            { parse_mode: "Markdown" },
+            `🎉 <b>Payment Verified!</b>\n\nYour Premium Access has been secured until <b>${newExpiry.toDateString()}</b>.\n\nJoin the Premium Room here (Link expires after 1 use):\n${invite.invite_link}`,
+            { parse_mode: "HTML" },
+            "high",
           );
         } catch (err) {
           console.error("Failed to generate/send invite link:", err);
@@ -292,12 +301,11 @@ async function markPaymentFailed(payment: { reference: string; chatId: string })
     .where(eq(payments.reference, payment.reference));
 
   if (bot) {
-    await bot.api
-      .sendMessage(
-        payment.chatId,
-        "❌ **Payment Failed or Cancelled**\n\nThe request timed out, lacked funds, or was cancelled. Generate a new link to try again.",
-        { parse_mode: "Markdown" },
-      )
-      .catch(console.error);
+    await rateLimitedSend(
+      payment.chatId,
+      "❌ <b>Payment Failed or Cancelled</b>\n\nThe request timed out, lacked funds, or was cancelled. Generate a new link to try again.",
+      { parse_mode: "HTML" },
+      "normal",
+    ).catch(console.error);
   }
 }

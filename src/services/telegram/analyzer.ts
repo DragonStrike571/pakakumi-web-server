@@ -5,6 +5,10 @@
  * 1. Calls the analysis engine to get results
  * 2. Formats and dispatches alerts to Telegram channels
  * 3. Uses simple, clear language for Kenyan users
+ * 4. Includes ideal planning rounds in premium alerts
+ * 5. Scales free channel timing hints without revealing exact data
+ * 6. Includes today's accuracy in hit proof messages
+ * 7. All messages flow through the global rate limiter
  */
 
 import { bot } from "./bot.js";
@@ -14,6 +18,22 @@ import {
   FREE_CHANNEL_CONFIDENCE_THRESHOLD,
   type AnalysisResult,
 } from "../analysis/engine.js";
+import { rateLimitedSend } from "./rate-limiter.js";
+
+// ─── Free Channel Timing Obfuscation ────────────────────────────────────────
+
+/**
+ * Convert an approximate round count into a vague, scaled phrase.
+ * No exact numbers are revealed — words scale with the likely duration.
+ */
+function getVagueTimingPhrase(planRounds: number): string {
+  if (planRounds <= 5) return "Any moment now";
+  if (planRounds <= 15) return "Very soon";
+  if (planRounds <= 30) return "Coming up shortly";
+  if (planRounds <= 60) return "In the near future";
+  if (planRounds <= 120) return "Building up — keep watching";
+  return "Developing — patience needed";
+}
 
 /**
  * Main entry point — called on every new round from index.ts
@@ -40,13 +60,19 @@ export async function runAnalysis(newRound?: {
         ? ((result.stats.totalHits / result.stats.totalSignals) * 100).toFixed(1)
         : "0";
 
+    // Today's accuracy line
+    const todayLine = result.todayStats.totalPredictions > 0
+      ? `\n📈 <b>Today:</b> ${result.todayStats.accuracy}% accurate (${result.todayStats.totalHits}/${result.todayStats.totalHits + result.todayStats.totalMisses} resolved)`
+      : "";
+
     // Free Channel — proof message
     if (publicChannelId && bot) {
       const publicProofMsg =
         `🔥 <b>TARGET HIT!</b> 🔥\n\n` +
         `🎯 <b>Target:</b> &gt;${hitTargetsStr}\n` +
         `✅ <b>Game Result:</b> ${newRound.bust}x\n\n` +
-        `📊 <b>Our Track Record:</b> ${winRate}% correct\n\n` +
+        `📊 <b>Our Track Record:</b> ${winRate}% correct` +
+        `${todayLine}\n\n` +
         `Premium members got this alert before it happened.`;
 
       const publicKb = new InlineKeyboard()
@@ -57,12 +83,10 @@ export async function runAnalysis(newRound?: {
         .row()
         .url("🤖 Plan My Bets", `https://t.me/${botUsername}`);
 
-      await bot.api
-        .sendMessage(publicChannelId, publicProofMsg, {
-          parse_mode: "HTML",
-          reply_markup: publicKb,
-        })
-        .catch(console.error);
+      await rateLimitedSend(publicChannelId, publicProofMsg, {
+        parse_mode: "HTML",
+        reply_markup: publicKb,
+      }, "high").catch(console.error);
     }
 
     // Premium Channel — proof message
@@ -70,14 +94,13 @@ export async function runAnalysis(newRound?: {
       const premiumProofMsg =
         `✅ <b>TARGET CONFIRMED</b>\n\n` +
         `🎯 Targets: &gt;${hitTargetsStr}\n` +
-        `💰 Game Result: <b>${newRound.bust}x</b>\n\n` +
+        `💰 Game Result: <b>${newRound.bust}x</b>` +
+        `${todayLine}\n\n` +
         `<i>Waiting for the next opportunity.</i>`;
 
-      await bot.api
-        .sendMessage(privateChannelId, premiumProofMsg, {
-          parse_mode: "HTML",
-        })
-        .catch(console.error);
+      await rateLimitedSend(privateChannelId, premiumProofMsg, {
+        parse_mode: "HTML",
+      }, "high").catch(console.error);
     }
   }
 
@@ -86,17 +109,31 @@ export async function runAnalysis(newRound?: {
     let freeTargetDropped = false;
 
     for (const cluster of result.clusters) {
-      // 1. PREMIUM CHANNEL — Full alert with reasoning
+      // 1. PREMIUM CHANNEL — Full alert with reasoning + ideal plan
       if (privateChannelId) {
         // Pick the most relevant reason from the cluster
         const mainReason =
           cluster.alerts[0].reason || "The pattern shows this target is ready.";
 
+        // Build the ideal plan line
+        let idealLine = "";
+        if (cluster.isLate) {
+          idealLine =
+            `\n⚠️ <b>Caution:</b> Timing is unpredictable right now. ` +
+            `This target is overdue and the exact timing cannot be estimated. ` +
+            `Proceed with smaller bets and extra patience.`;
+        } else if (cluster.idealPlanRounds > 0) {
+          idealLine =
+            `\n📋 <b>Ideal Plan:</b> Budget for up to <b>${cluster.idealPlanRounds}</b> rounds` +
+            `\n<i>(${cluster.roundsRange} expected + safety buffer for the target size)</i>`;
+        }
+
         const premiumMsg =
           `⚠️ <b>NEW TARGET ALERT</b>\n\n` +
           `🎯 <b>Target:</b> &gt;${cluster.targetsStr}\n\n` +
           `📖 <b>Why:</b> ${mainReason}\n\n` +
-          `⏱️ <b>Best Time to Play:</b> ${cluster.roundsRange} games\n` +
+          `⏱️ <b>Expected Window:</b> ${cluster.roundsRange} games\n` +
+          `${idealLine}\n` +
           `📊 <b>How Sure:</b> ${cluster.avgConfidence}%\n` +
           `🔥 <b>Status:</b> ${cluster.status}\n\n` +
           `<i>Use the bot to plan your bets before you start.</i>`;
@@ -109,12 +146,10 @@ export async function runAnalysis(newRound?: {
           .row()
           .url("❓ How to Read This", `https://t.me/${botUsername}?start=guide`);
 
-        await bot.api
-          .sendMessage(privateChannelId, premiumMsg, {
-            parse_mode: "HTML",
-            reply_markup: premiumKb,
-          })
-          .catch(console.error);
+        await rateLimitedSend(privateChannelId, premiumMsg, {
+          parse_mode: "HTML",
+          reply_markup: premiumKb,
+        }, "normal").catch(console.error);
       }
 
       // 2. FREE CHANNEL — Teaser with occasional free drop
@@ -125,19 +160,22 @@ export async function runAnalysis(newRound?: {
         const isFreeDrop = !freeTargetDropped && Math.random() < 0.2;
         let teaseMsg = "";
 
+        // Get vague timing phrase for free channel (no exact numbers)
+        const vaguePhrase = getVagueTimingPhrase(cluster.planRounds);
+
         if (isFreeDrop) {
           freeTargetDropped = true;
           teaseMsg =
             `🎁 <b>FREE TARGET</b> 🎁\n\n` +
             `🎯 <b>Target:</b> &gt;${cluster.alerts[0].target}x\n\n` +
-            `⏱️ <b>Best Time to Play:</b> ${cluster.roundsRange} games\n\n` +
+            `⏱️ <b>When:</b> ${vaguePhrase}\n\n` +
             `This is a free premium target. Plan your bets properly and don't force it.`;
         } else {
           teaseMsg =
             `🚨 <b>NEW ALERT</b> 🚨\n\n` +
             `📊 <b>How Sure:</b> ${cluster.avgConfidence}%\n` +
             `🎯 <b>Target:</b> [PREMIUM ONLY]\n\n` +
-            `⏱️ <b>Best Time to Play:</b> ${cluster.roundsRange} games\n\n` +
+            `⏱️ <b>Timing:</b> ${vaguePhrase}\n\n` +
             `The exact target was just sent to Premium members.`;
         }
 
@@ -148,12 +186,10 @@ export async function runAnalysis(newRound?: {
           .row()
           .url("❓ How It Works", `https://t.me/${botUsername}?start=guide`);
 
-        await bot.api
-          .sendMessage(publicChannelId, teaseMsg, {
-            parse_mode: "HTML",
-            reply_markup: publicKb,
-          })
-          .catch(console.error);
+        await rateLimitedSend(publicChannelId, teaseMsg, {
+          parse_mode: "HTML",
+          reply_markup: publicKb,
+        }, "low").catch(console.error);
       }
     }
   }

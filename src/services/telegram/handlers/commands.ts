@@ -1,3 +1,17 @@
+/**
+ * Telegram Command Handlers
+ *
+ * All bot commands: /start, /last, /generate, /plan, /today, /analyze,
+ * /howtobet, /terms, and callback query handlers.
+ *
+ * Design principles:
+ * - Simple, non-technical language for standard Kenyan users
+ * - Input validation with sane caps on all parameters
+ * - Strategy bet plans with aggregated same-amount rounds
+ * - Inline quick explanations + full /howtobet guide
+ * - Proactive bot.api calls use the global rate limiter
+ */
+
 import { Bot, InlineKeyboard } from "grammy";
 import { MyContext } from "../bot.js";
 import { initializePayment } from "../../paystack/paystack.js";
@@ -6,6 +20,24 @@ import { telegramUsers, rounds } from "../../../db/schema.js";
 import { eq, desc, gte } from "drizzle-orm";
 import { generateAlgorithmBets } from "../../../utils/strategies/core.js";
 import { formatRiskMessage } from "../risk.js";
+import { rateLimitedSend, rateLimitedEdit } from "../rate-limiter.js";
+import {
+  runCustomAnalysis,
+  getTodayStats,
+} from "../../analysis/engine.js";
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+/** Maximum Telegram message length */
+const MAX_MSG_LENGTH = 4096;
+
+/** Input validation caps */
+const MAX_MULTIPLIER = 3000;
+const MAX_CAPITAL = 10_000_000;
+const MIN_BET = 5;
+const MAX_LAST_COUNT = 10;
+const MAX_ANALYZE_ROUNDS_FREE = 20;
+const MAX_ANALYZE_ROUNDS_PREMIUM = 500;
 
 // ─── Pricing — 5 tiers for better conversion ────────────────────────────────
 const PRICING_PLANS: Record<string, { days: number; price: number }> = {
@@ -28,12 +60,83 @@ async function isUserPremium(chatId: string): Promise<boolean> {
   return user.expiryTimestamp > new Date();
 }
 
+/**
+ * Truncate a message to Telegram's max length.
+ */
+function truncateMessage(text: string): string {
+  if (text.length <= MAX_MSG_LENGTH) return text;
+  return text.substring(0, MAX_MSG_LENGTH - 20) + "\n\n<i>[truncated]</i>";
+}
+
+/**
+ * Aggregate consecutive same-amount bets into ranges.
+ * e.g., [10, 10, 10, 15, 15, 20] → "Rounds 1-3: KES 10 each\nRounds 4-5: KES 15 each\nRound 6: KES 20"
+ */
+function aggregateBets(
+  sequence: { amount: number; cashout: number }[],
+  maxDisplay: number = 30,
+): { lines: string[]; totalRounds: number; hiddenRounds: number } {
+  const lines: string[] = [];
+  let i = 0;
+  const limit = Math.min(sequence.length, maxDisplay);
+
+  while (i < limit) {
+    const amount = sequence[i].amount;
+    let rangeEnd = i;
+
+    // Find the end of this same-amount group
+    while (rangeEnd + 1 < limit && sequence[rangeEnd + 1].amount === amount) {
+      rangeEnd++;
+    }
+
+    if (i === rangeEnd) {
+      lines.push(`Round ${i + 1}: Bet <b>KES ${amount.toLocaleString()}</b>`);
+    } else {
+      lines.push(
+        `Rounds ${i + 1}-${rangeEnd + 1}: Bet <b>KES ${amount.toLocaleString()}</b> each`,
+      );
+    }
+
+    i = rangeEnd + 1;
+  }
+
+  return {
+    lines,
+    totalRounds: sequence.length,
+    hiddenRounds: Math.max(0, sequence.length - maxDisplay),
+  };
+}
+
+/**
+ * Format a human-readable remaining time string.
+ * e.g., "3 days, 4 hours left"
+ */
+function formatTimeRemaining(expiryDate: Date): string {
+  const now = new Date();
+  const diffMs = expiryDate.getTime() - now.getTime();
+
+  if (diffMs <= 0) return "Expired";
+
+  const days = Math.floor(diffMs / (24 * 60 * 60 * 1000));
+  const hours = Math.floor((diffMs % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
+  const minutes = Math.floor((diffMs % (60 * 60 * 1000)) / (60 * 1000));
+
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days} day${days !== 1 ? "s" : ""}`);
+  if (hours > 0) parts.push(`${hours} hour${hours !== 1 ? "s" : ""}`);
+  if (days === 0 && minutes > 0)
+    parts.push(`${minutes} minute${minutes !== 1 ? "s" : ""}`);
+
+  return parts.join(", ") + " left";
+}
+
 export function buildMainMenuKeyboard(botUsername: string): InlineKeyboard {
   return new InlineKeyboard()
     .text("🚀 Get Premium", "menu_premium")
     .row()
     .url("💬 Join Free Chat", "https://t.me/pakakumi_oracle_free")
     .row()
+    .text("📊 Today's Results", "menu_today")
     .text("📖 How It Works", "menu_guide")
     .row()
     .text("📅 My Status", "menu_status")
@@ -46,11 +149,14 @@ async function sendMainMenu(ctx: MyContext) {
 
   await ctx.reply(
     "📊 <b>Pakakumi Oracle</b>\n\n" +
-      "We watch the game and tell you the best times to play.\n\n" +
-      "🔧 <b>Commands:</b>\n\n" +
+      "We watch the game 24/7 and tell you the best times to play.\n\n" +
+      "🔧 <b>What You Can Do:</b>\n\n" +
+      "• <code>/today</code>\nSee today's predictions and how many hit ✅\n\n" +
       "• <code>/last 50 3</code>\nSee the last 3 times 50x appeared\n\n" +
-      "• <code>/generate 1000 10 2.0 1.5</code>\nPlan your bets — tells you exactly how much to stake each round\n\n" +
+      "• <code>/analyze 100</code>\nAnalyze the last 100 rounds for patterns\n\n" +
+      "• <code>/generate 1000 10 2.0 1.5</code>\nGet a bet plan — tells you exactly how much to stake each round\n\n" +
       "• <code>/plan 5000 2.5</code>\nGet a survival plan for your balance\n\n" +
+      "• <code>/howtobet</code>\nLearn how to read and use bet plans\n\n" +
       "• <code>/terms</code>\nRules and policies",
     { parse_mode: "HTML", reply_markup: menuKb },
   );
@@ -116,7 +222,7 @@ export function setupCommands(bot: Bot<MyContext>) {
 
     await ctx.reply(
       "⚡ <b>Choose Your Plan:</b>\n\n" +
-        "Get exact targets, early alerts, and the <code>/last</code> and <code>/generate</code> commands.",
+        "Get exact targets, early alerts, and the <code>/last</code>, <code>/generate</code>, and <code>/analyze</code> commands.",
       { parse_mode: "HTML", reply_markup: tierKeyboard },
     );
   }
@@ -131,6 +237,7 @@ export function setupCommands(bot: Bot<MyContext>) {
     if (data === "menu_guide") return triggerGuide(ctx);
     if (data === "menu_status") return checkStatus(ctx);
     if (data === "menu_support") return triggerSupport(ctx);
+    if (data === "menu_today") return handleToday(ctx);
 
     if (data.startsWith("pay_")) {
       const [, daysStr] = data.split("_");
@@ -162,7 +269,7 @@ export function setupCommands(bot: Bot<MyContext>) {
           const durationLabel =
             duration < 1 ? "12 Hours" : `${duration} Day${duration > 1 ? "s" : ""}`;
 
-          await bot.api.editMessageText(
+          await rateLimitedEdit(
             chatId,
             loadingMsg.message_id,
             `💳 <b>Pay with M-Pesa</b>\n\n` +
@@ -177,25 +284,32 @@ export function setupCommands(bot: Bot<MyContext>) {
               parse_mode: "HTML",
               link_preview_options: { is_disabled: true },
             },
+            "high",
           );
         } else {
           console.error("❌ Paystack initialization rejected:", payment);
-          await bot.api.editMessageText(
+          await rateLimitedEdit(
             chatId,
             loadingMsg.message_id,
             "❌ Could not create payment. Try again in a moment.",
+            undefined,
+            "normal",
           );
         }
       } catch (error) {
         console.error("❌ Payment Network Error:", error);
-        await bot.api.editMessageText(
+        await rateLimitedEdit(
           chatId,
           loadingMsg.message_id,
           "❌ Payment system is busy. Try again in a minute.",
+          undefined,
+          "normal",
         );
       }
     }
   });
+
+  // ─── /status (callback handler) ─────────────────────────────────────────
 
   async function checkStatus(ctx: MyContext) {
     const chatId = ctx.chat!.id.toString();
@@ -207,32 +321,72 @@ export function setupCommands(bot: Bot<MyContext>) {
       .then((res) => res[0]);
 
     if (!isPremium) {
-      await ctx.reply("❌ <b>Status:</b> Not Active", { parse_mode: "HTML" });
-    } else {
       await ctx.reply(
-        `✅ <b>Status:</b> Active\n\nExpires: <b>${user.expiryTimestamp?.toDateString()}</b>`,
+        "❌ <b>Status:</b> Not Active\n\n" +
+          "🔓 <b>What you get with Premium:</b>\n" +
+          "• Exact target alerts before they hit\n" +
+          "• Full <code>/last</code> history (up to 10 results)\n" +
+          "• <code>/generate</code> and <code>/plan</code> bet planning\n" +
+          "• Full <code>/analyze</code> access (up to 500 rounds)\n" +
+          "• Access to the live Premium channel\n\n" +
+          "Type <code>/start</code> to see pricing.",
+        { parse_mode: "HTML" },
+      );
+    } else {
+      const timeLeft = user.expiryTimestamp
+        ? formatTimeRemaining(user.expiryTimestamp)
+        : "Unknown";
+
+      await ctx.reply(
+        `✅ <b>Status:</b> Active\n\n` +
+          `📅 <b>Expires:</b> ${user.expiryTimestamp?.toDateString()}\n` +
+          `⏳ <b>Time Left:</b> ${timeLeft}`,
         { parse_mode: "HTML" },
       );
     }
   }
 
+  // ─── /guide (callback handler) ──────────────────────────────────────────
+
   async function triggerGuide(ctx: MyContext) {
     const guideText =
-      `📖 <b>How This Works</b>\n\n` +
-      `We watch every single game round 24/7 and track when each multiplier last appeared.\n\n` +
-      `<b>🎯 What the alerts mean:</b>\n\n` +
+      `📖 <b>How Pakakumi Oracle Works</b>\n\n` +
+      `We watch every single game round 24/7 and track when each multiplier last appeared. ` +
+      `Using pattern analysis, we predict when specific targets are most likely to show up.\n\n` +
+      `<b>🎯 Understanding the Alerts:</b>\n\n` +
       `<b>1️⃣ "5 to 15 games"</b>\n` +
-      `The target is expected to appear within this range. Spread your bets across these rounds.\n\n` +
+      `The target is expected to appear within this range of rounds. ` +
+      `Spread your bets across these rounds — don't dump everything on one.\n\n` +
       `<b>2️⃣ "Within 10 games"</b>\n` +
-      `The target is very close. It could drop any moment.\n\n` +
+      `The target is very close. It could drop any moment. ` +
+      `This is a strong signal.\n\n` +
       `<b>3️⃣ "Late"</b>\n` +
-      `The target should have appeared already but hasn't. This means you need more bets to catch it.\n\n` +
-      `<b>💡 The Most Important Thing:</b>\n` +
-      `Always click <b>"⚙️ Plan My Bets"</b> on any alert. The bot tells you exactly how much to bet each round so you don't go broke waiting.\n\n` +
-      `<b>⚠️ Never</b> put all your money on one round. The plan spreads your cash across many rounds to give you the best chance.`;
+      `The target should have appeared already but hasn't. ` +
+      `The timing is unpredictable, so use smaller bets and extra patience.\n\n` +
+      `<b>4️⃣ "Ideal Plan: Budget for X rounds"</b>\n` +
+      `This is the number of rounds you should ideally prepare for. ` +
+      `It includes the expected window PLUS a safety buffer based on the target size. ` +
+      `Always plan for this number, not the minimum.\n\n` +
+      `<b>📊 Available Commands:</b>\n\n` +
+      `• <code>/today</code> — See today's predictions and accuracy\n` +
+      `• <code>/last 50 3</code> — When did 50x last appear? (shows 3 results)\n` +
+      `• <code>/analyze 100</code> — Analyze the last 100 rounds for patterns\n` +
+      `• <code>/generate 1000 10 2.0 1.5</code> — Get a detailed bet plan\n` +
+      `• <code>/plan 5000 2.5</code> — Get a survival plan for your balance\n` +
+      `• <code>/howtobet</code> — Full guide on reading and using bet plans\n\n` +
+      `<b>⚠️ Common Mistakes to Avoid:</b>\n\n` +
+      `❌ Betting all your money on one round\n` +
+      `❌ Ignoring the bet plan and betting random amounts\n` +
+      `❌ Chasing losses after the plan runs out\n` +
+      `❌ Not using <code>/generate</code> to plan before you start\n\n` +
+      `<b>💡 The Golden Rule:</b>\n` +
+      `Always click <b>"⚙️ Plan My Bets"</b> on any alert. ` +
+      `The bot tells you exactly how much to bet each round so you don't go broke waiting.`;
 
-    await ctx.reply(guideText, { parse_mode: "HTML" });
+    await ctx.reply(truncateMessage(guideText), { parse_mode: "HTML" });
   }
+
+  // ─── /support (callback handler) ────────────────────────────────────────
 
   async function triggerSupport(ctx: MyContext) {
     const chatId = ctx.chat!.id.toString();
@@ -254,18 +408,84 @@ export function setupCommands(bot: Bot<MyContext>) {
     );
   }
 
+  // ─── /today — Daily predictions showcase ────────────────────────────────
+
+  async function handleToday(ctx: MyContext) {
+    try {
+      const stats = await getTodayStats();
+
+      const today = new Date().toLocaleDateString("en-GB", {
+        timeZone: "Africa/Nairobi",
+        day: "numeric",
+        month: "short",
+        year: "numeric",
+      });
+
+      let msg =
+        `📊 <b>Today's Predictions</b> (${today})\n\n` +
+        `🎯 <b>Predictions Made:</b> ${stats.totalPredictions}\n` +
+        `✅ <b>Correct:</b> ${stats.totalHits}\n` +
+        `❌ <b>Missed:</b> ${stats.totalMisses}\n` +
+        `⏳ <b>Waiting:</b> ${stats.totalPredictions - stats.totalHits - stats.totalMisses}\n\n` +
+        `📈 <b>Today's Accuracy:</b> ${stats.accuracy}%\n`;
+
+      // Show recent target details (last 10)
+      if (stats.targets && stats.targets.length > 0) {
+        msg += `\n<b>Recent Targets:</b>\n`;
+
+        const recentTargets = stats.targets.slice(-10).reverse();
+        for (const t of recentTargets) {
+          if (t.resolved && t.hit) {
+            msg += `✅ ${t.target}x — Hit in ${t.roundsToHit || "?"} rounds\n`;
+          } else if (t.resolved && !t.hit) {
+            msg += `❌ ${t.target}x — Missed\n`;
+          } else {
+            msg += `⏳ ${t.target}x — Waiting...\n`;
+          }
+        }
+      }
+
+      if (stats.totalPredictions === 0) {
+        msg += `\n<i>No predictions yet today. The bot is watching and will alert when patterns emerge.</i>`;
+      }
+
+      await ctx.reply(truncateMessage(msg), { parse_mode: "HTML" });
+    } catch (err) {
+      console.error("Error in /today:", err);
+      await ctx.reply("❌ Could not load today's stats. Try again in a moment.");
+    }
+  }
+
+  bot.command("today", async (ctx) => {
+    await handleToday(ctx);
+  });
+
+  // ─── /last — Past occurrences lookup ────────────────────────────────────
+
   bot.command("last", async (ctx) => {
     const chatId = ctx.chat!.id.toString();
     const args = ctx.match.trim().split(/\s+/);
     if (!args[0])
       return ctx.reply(
-        "⚠️ <b>How to use:</b>\n\n<code>/last [multiplier] [count]</code>\n\nExample: <code>/last 50 3</code>",
+        "⚠️ <b>How to use:</b>\n\n<code>/last [multiplier] [count]</code>\n\nExample: <code>/last 50 3</code>\n\n<i>This shows you when a specific multiplier last appeared.</i>",
         { parse_mode: "HTML" },
       );
 
     const target = parseFloat(args[0]);
-    const limit = args[1] ? Math.min(parseInt(args[1]), 10) : 1;
-    if (isNaN(target) || isNaN(limit)) return ctx.reply("❌ Use numbers only.");
+    const limit = args[1] ? Math.min(parseInt(args[1]), MAX_LAST_COUNT) : 1;
+
+    if (isNaN(target) || isNaN(limit) || target <= 0 || limit <= 0) {
+      return ctx.reply("❌ Use positive numbers only. Example: <code>/last 50 3</code>", {
+        parse_mode: "HTML",
+      });
+    }
+
+    if (target > MAX_MULTIPLIER) {
+      return ctx.reply(
+        `❌ Maximum multiplier is ${MAX_MULTIPLIER}x. Example: <code>/last 100 3</code>`,
+        { parse_mode: "HTML" },
+      );
+    }
 
     const isPremium = await isUserPremium(chatId);
     const history = await db
@@ -290,7 +510,7 @@ export function setupCommands(bot: Bot<MyContext>) {
       return ctx.reply(
         `🔒 <b>Limited View</b>\n\n` +
           `The last <b>${target}x</b> was <b>${timeString}</b>.\n\n` +
-          `<i>Get Premium to see exact times and up to 10 past results.</i>`,
+          `<i>Get Premium to see exact times and up to ${MAX_LAST_COUNT} past results.</i>`,
         { parse_mode: "HTML" },
       );
     }
@@ -306,8 +526,113 @@ export function setupCommands(bot: Bot<MyContext>) {
       });
       response += `${index + 1}. <b>${hit.bust}x</b>\n<i>${dateStr}</i>\n\n`;
     });
-    await ctx.reply(response, { parse_mode: "HTML" });
+    await ctx.reply(truncateMessage(response), { parse_mode: "HTML" });
   });
+
+  // ─── /analyze — Custom round analysis ───────────────────────────────────
+
+  bot.command("analyze", async (ctx) => {
+    const chatId = ctx.chat!.id.toString();
+    const args = ctx.match.trim().split(/\s+/);
+
+    if (!args[0]) {
+      return ctx.reply(
+        "⚠️ <b>How to use:</b>\n\n" +
+          "<code>/analyze [rounds]</code> — Analyze the last N rounds\n" +
+          "<code>/analyze [start] [end]</code> — Analyze a specific range\n\n" +
+          "Examples:\n" +
+          "• <code>/analyze 50</code> — Last 50 rounds\n" +
+          "• <code>/analyze 100 200</code> — Rounds 100 to 200 ago\n\n" +
+          "<i>This shows you which multipliers are running hot or cold.</i>",
+        { parse_mode: "HTML" },
+      );
+    }
+
+    const isPremium = await isUserPremium(chatId);
+    const maxRounds = isPremium ? MAX_ANALYZE_ROUNDS_PREMIUM : MAX_ANALYZE_ROUNDS_FREE;
+
+    let roundCount: number;
+    let startOffset = 0;
+
+    if (args.length >= 2) {
+      // Range mode: /analyze 100 200
+      const rangeStart = parseInt(args[0]);
+      const rangeEnd = parseInt(args[1]);
+
+      if (isNaN(rangeStart) || isNaN(rangeEnd) || rangeStart <= 0 || rangeEnd <= 0) {
+        return ctx.reply("❌ Use positive numbers only. Example: <code>/analyze 100 200</code>", {
+          parse_mode: "HTML",
+        });
+      }
+
+      if (rangeStart >= rangeEnd) {
+        return ctx.reply("❌ The first number must be smaller than the second. Example: <code>/analyze 100 200</code>", {
+          parse_mode: "HTML",
+        });
+      }
+
+      roundCount = Math.min(rangeEnd - rangeStart, maxRounds);
+      startOffset = rangeStart;
+    } else {
+      // Simple mode: /analyze 100
+      roundCount = parseInt(args[0]);
+      if (isNaN(roundCount) || roundCount <= 0) {
+        return ctx.reply("❌ Use a positive number. Example: <code>/analyze 100</code>", {
+          parse_mode: "HTML",
+        });
+      }
+      roundCount = Math.min(roundCount, maxRounds);
+    }
+
+    if (!isPremium && roundCount > MAX_ANALYZE_ROUNDS_FREE) {
+      roundCount = MAX_ANALYZE_ROUNDS_FREE;
+    }
+
+    const result = runCustomAnalysis(roundCount, startOffset);
+
+    if (!result) {
+      return ctx.reply("❌ Not enough round data available yet. Try again later.");
+    }
+
+    let msg =
+      `🔍 <b>Round Analysis</b> (${result.roundCount} rounds)\n\n` +
+      `📈 <b>Highest:</b> ${result.highest}x\n` +
+      `📉 <b>Lowest:</b> ${result.lowest}x\n` +
+      `📊 <b>Average:</b> ${result.average}x\n` +
+      `📊 <b>Median:</b> ${result.median}x\n\n`;
+
+    // Distribution table
+    msg += `<b>Multiplier Distribution:</b>\n`;
+    for (const tier of result.multiplierDistribution) {
+      const indicator =
+        tier.status === "hot" ? "🔥" : tier.status === "cold" ? "🧊" : "  ";
+      msg += `${indicator} ${tier.tier}: <b>${tier.count}</b> (expected ~${tier.expected})\n`;
+    }
+
+    // Hot multipliers
+    if (result.hotMultipliers.length > 0) {
+      msg += `\n🔥 <b>Running Hot:</b>\n`;
+      for (const hot of result.hotMultipliers) {
+        msg += `• ${hot}\n`;
+      }
+    }
+
+    // Cold multipliers
+    if (result.coldMultipliers.length > 0) {
+      msg += `\n🧊 <b>Running Cold:</b>\n`;
+      for (const cold of result.coldMultipliers) {
+        msg += `• ${cold}\n`;
+      }
+    }
+
+    if (!isPremium) {
+      msg += `\n<i>Free users can analyze up to ${MAX_ANALYZE_ROUNDS_FREE} rounds. Get Premium for up to ${MAX_ANALYZE_ROUNDS_PREMIUM} rounds.</i>`;
+    }
+
+    await ctx.reply(truncateMessage(msg), { parse_mode: "HTML" });
+  });
+
+  // ─── /generate — Bet plan generator ─────────────────────────────────────
 
   bot.command("generate", async (ctx) => {
     const chatId = ctx.chat!.id.toString();
@@ -315,20 +640,45 @@ export function setupCommands(bot: Bot<MyContext>) {
 
     if (args.length < 4) {
       return ctx.reply(
-        "⚠️ <b>How to use:</b>\n\n<code>/generate [cash] [min bet] [multiplier] [recovery]</code>\n\n" +
-          "Example: <code>/generate 1000 10 2.0 1.5</code>",
+        "⚠️ <b>How to use:</b>\n\n" +
+          "<code>/generate [cash] [min bet] [multiplier] [recovery]</code>\n\n" +
+          "Example: <code>/generate 1000 10 2.0 1.5</code>\n\n" +
+          "<i>This tells you exactly how much to bet each round so you can survive long enough to hit your target.</i>\n\n" +
+          "<b>What the numbers mean:</b>\n" +
+          "• <b>Cash:</b> How much money you have\n" +
+          "• <b>Min bet:</b> Smallest bet you want to start with\n" +
+          "• <b>Multiplier:</b> The target you're aiming for (e.g., 2.0x)\n" +
+          "• <b>Recovery:</b> How much profit you want when you hit (1.5 = 50% profit)",
         { parse_mode: "HTML" },
       );
     }
 
     const [capital, minBet, multiplier, targetReturn] = args.map(parseFloat);
-    if ([capital, minBet, multiplier, targetReturn].some(isNaN))
-      return ctx.reply("❌ Use numbers only.");
+
+    if ([capital, minBet, multiplier, targetReturn].some(isNaN)) {
+      return ctx.reply("❌ Use numbers only. Example: <code>/generate 1000 10 2.0 1.5</code>", {
+        parse_mode: "HTML",
+      });
+    }
+
+    // Input validation caps
+    if (capital <= 0 || capital > MAX_CAPITAL) {
+      return ctx.reply(`❌ Cash must be between 1 and ${MAX_CAPITAL.toLocaleString()}.`);
+    }
+    if (minBet < MIN_BET) {
+      return ctx.reply(`❌ Minimum bet must be at least KES ${MIN_BET}.`);
+    }
+    if (multiplier <= 1.01 || multiplier > MAX_MULTIPLIER) {
+      return ctx.reply(`❌ Multiplier must be between 1.01x and ${MAX_MULTIPLIER}x.`);
+    }
+    if (targetReturn <= 0 || targetReturn > 100) {
+      return ctx.reply("❌ Recovery must be between 0.1 and 100.");
+    }
 
     const isPremium = await isUserPremium(chatId);
     if (!isPremium)
       return ctx.reply(
-        "🔒 <b>Premium Only</b>\n\nGet Premium to plan your bets with the bot.",
+        "🔒 <b>Premium Only</b>\n\nGet Premium to plan your bets with the bot.\n\nType <code>/start</code> to see pricing.",
         { parse_mode: "HTML" },
       );
 
@@ -341,27 +691,40 @@ export function setupCommands(bot: Bot<MyContext>) {
     );
     if (sequence.length === 0)
       return ctx.reply(
-        "❌ This plan is not possible with your cash. Try different numbers.",
+        "❌ This plan is not possible with your cash. Try a lower target or higher starting amount.",
       );
+
+    // Aggregate same-amount bets
+    const { lines, totalRounds, hiddenRounds } = aggregateBets(sequence);
 
     let response =
       `⚙️ <b>Your Bet Plan</b>\n\n` +
-      `<i>Cash: KES ${capital}</i>\n` +
+      `<i>Cash: KES ${capital.toLocaleString()}</i>\n` +
       `<i>Target: ${multiplier}x</i>\n` +
-      `<i>Recovery: ${targetReturn}x</i>\n\n` +
+      `<i>Recovery: ${targetReturn}x profit when you hit</i>\n\n` +
       `<b>What to bet each round:</b>\n\n`;
 
-    const displayLimit = Math.min(sequence.length, 20);
+    response += lines.join("\n") + "\n";
 
-    for (let i = 0; i < displayLimit; i++) {
-      response += `Round ${i + 1}: Bet <b>KES ${sequence[i].amount}</b>\n`;
+    if (hiddenRounds > 0) {
+      response += `\n<i>...and ${hiddenRounds} more rounds.</i>\n`;
     }
 
-    if (sequence.length > 20)
-      response += `\n<i>...and ${sequence.length - 20} more rounds.</i>\n`;
-    response += `\n<b>Total losses you can survive:</b> ${sequence.length - 1}`;
-    await ctx.reply(response, { parse_mode: "HTML" });
+    response +=
+      `\n<b>Total rounds you can survive:</b> ${totalRounds - 1}\n\n` +
+      `──────────────────\n` +
+      `📖 <b>Quick Guide:</b>\n` +
+      `• Start from Round 1, go in order\n` +
+      `• Set your cashout to <b>${multiplier}x</b> every round\n` +
+      `• If you <b>WIN</b> at any point — <b>STOP</b>. You've made profit\n` +
+      `• If you reach the last round — <b>STOP</b>. Don't chase\n` +
+      `• Amounts increase because each round covers all previous losses\n\n` +
+      `<i>Type /howtobet for the full guide on using bet plans.</i>`;
+
+    await ctx.reply(truncateMessage(response), { parse_mode: "HTML" });
   });
+
+  // ─── /plan — Survival plan ──────────────────────────────────────────────
 
   bot.command("plan", async (ctx) => {
     const chatId = ctx.chat!.id.toString();
@@ -369,7 +732,10 @@ export function setupCommands(bot: Bot<MyContext>) {
 
     if (args.length !== 2) {
       return ctx.reply(
-        "❌ <b>Wrong format.</b>\n\nType it like this: <code>/plan [your cash] [target]</code>\nExample: <code>/plan 5000 2.5</code>",
+        "❌ <b>Wrong format.</b>\n\n" +
+          "Type it like this: <code>/plan [your cash] [target]</code>\n" +
+          "Example: <code>/plan 5000 2.5</code>\n\n" +
+          "<i>This gives you a safe betting plan that protects your balance.</i>",
         { parse_mode: "HTML" },
       );
     }
@@ -377,25 +743,97 @@ export function setupCommands(bot: Bot<MyContext>) {
     const bankroll = Number(args[0]);
     const target = Number(args[1]);
 
-    if (isNaN(bankroll) || bankroll < 10) {
-      return ctx.reply("❌ Amount too small. Minimum is KES 10.");
+    if (isNaN(bankroll) || bankroll < 10 || bankroll > MAX_CAPITAL) {
+      return ctx.reply(`❌ Amount must be between KES 10 and ${MAX_CAPITAL.toLocaleString()}.`);
     }
-    if (isNaN(target) || target <= 1.01) {
-      return ctx.reply("❌ Invalid target. Must be above 1.01x.");
+    if (isNaN(target) || target <= 1.01 || target > MAX_MULTIPLIER) {
+      return ctx.reply(`❌ Target must be between 1.01x and ${MAX_MULTIPLIER}x.`);
     }
 
     // Premium Validation Check
     const isPremium = await isUserPremium(chatId);
     if (!isPremium) {
       return ctx.reply(
-        "🔒 <b>Premium Only</b>\n\nGet Premium to generate survival plans.",
+        "🔒 <b>Premium Only</b>\n\nGet Premium to generate survival plans.\n\nType <code>/start</code> to see pricing.",
         { parse_mode: "HTML" },
       );
     }
 
     const riskMsg = formatRiskMessage(bankroll, target);
-    await ctx.reply(riskMsg, { parse_mode: "HTML" });
+
+    // Add inline quick guide
+    const fullMsg =
+      riskMsg +
+      `\n\n──────────────────\n` +
+      `📖 <b>Quick Guide:</b>\n` +
+      `• Follow the bets in order, one per round\n` +
+      `• Set cashout to <b>${target}x</b> each time\n` +
+      `• <b>Stop immediately</b> after you win — that's your profit\n` +
+      `• If you lose all bets, <b>walk away</b>. Come back later\n\n` +
+      `<i>Type /howtobet for the full breakdown.</i>`;
+
+    await ctx.reply(truncateMessage(fullMsg), { parse_mode: "HTML" });
   });
+
+  // ─── /howtobet — Full betting guide ─────────────────────────────────────
+
+  bot.command("howtobet", async (ctx) => {
+    const guideMsg =
+      `📖 <b>HOW TO USE BET PLANS</b>\n\n` +
+      `This guide explains everything about the bet plans from <code>/generate</code> and <code>/plan</code>.\n\n` +
+      `──────────────────\n\n` +
+      `<b>1️⃣ WHAT THE NUMBERS MEAN</b>\n\n` +
+      `When you type <code>/generate 1000 10 2.0 1.5</code>:\n\n` +
+      `• <b>1000</b> = Your total cash (KES 1,000)\n` +
+      `• <b>10</b> = Your smallest bet (KES 10)\n` +
+      `• <b>2.0</b> = Your target multiplier (2x)\n` +
+      `• <b>1.5</b> = Your recovery target (you want to get back 1.5x what you've spent)\n\n` +
+      `The bot then calculates exactly how much to bet each round.\n\n` +
+      `──────────────────\n\n` +
+      `<b>2️⃣ WHY AMOUNTS INCREASE</b>\n\n` +
+      `Each round's bet is calculated to recover ALL previous losses PLUS your desired profit.\n\n` +
+      `Example with 2x target:\n` +
+      `• Round 1: Bet KES 10. If 2x hits, you win KES 20 (profit: KES 10)\n` +
+      `• Round 2: Bet KES 15. If 2x hits, you win KES 30 (covers Round 1 loss + profit)\n` +
+      `• Round 3: Bet KES 25. If 2x hits, you win KES 50 (covers Round 1+2 losses + profit)\n\n` +
+      `This is why each bet is bigger — it needs to pay for everything before it.\n\n` +
+      `──────────────────\n\n` +
+      `<b>3️⃣ WHAT IS "RECOVERY"?</b>\n\n` +
+      `The recovery number controls how much profit you make when you hit.\n\n` +
+      `• <b>1.0</b> = Break even (just get your money back)\n` +
+      `• <b>1.5</b> = 50% profit on top of your losses\n` +
+      `• <b>2.0</b> = 100% profit (double your total spent)\n\n` +
+      `Higher recovery = higher profit but fewer rounds you can survive.\n` +
+      `Lower recovery = less profit but you can survive more rounds.\n\n` +
+      `<i>💡 Tip: 1.5 is the sweet spot for most people.</i>\n\n` +
+      `──────────────────\n\n` +
+      `<b>4️⃣ HOW TO FOLLOW THE PLAN</b>\n\n` +
+      `Step by step:\n\n` +
+      `1. Look at the "Rounds" line (e.g., "Rounds 1-3: Bet KES 10 each")\n` +
+      `2. Go to Pakakumi and bet that exact amount\n` +
+      `3. Set your cashout to the target multiplier\n` +
+      `4. If you <b>WIN</b> → STOP. Collect your profit. You're done.\n` +
+      `5. If you <b>LOSE</b> → Move to the next line and bet that amount\n` +
+      `6. If you reach the last round and lose → STOP. Walk away.\n\n` +
+      `──────────────────\n\n` +
+      `<b>5️⃣ COMMON MISTAKES</b>\n\n` +
+      `❌ <b>Betting random amounts:</b> The plan only works if you follow the exact amounts.\n\n` +
+      `❌ <b>Continuing after the plan ends:</b> If all rounds are used, you are at your loss limit. STOP.\n\n` +
+      `❌ <b>Using all your money:</b> The plan already uses your full cash. Don't add more.\n\n` +
+      `❌ <b>Changing the cashout:</b> Always use the same target multiplier for every round.\n\n` +
+      `❌ <b>Skipping rounds:</b> Each bet is calculated based on the ones before it.\n\n` +
+      `──────────────────\n\n` +
+      `<b>6️⃣ WHICH PLAN IS RIGHT FOR ME?</b>\n\n` +
+      `• <b>Small budget (under KES 500):</b> Use lower targets like 2x or 3x\n` +
+      `• <b>Medium budget (KES 500-5000):</b> Try 5x to 10x targets\n` +
+      `• <b>Large budget (KES 5000+):</b> You can go for 20x+ targets\n\n` +
+      `The more rounds you can survive, the better your chances. ` +
+      `Always aim for at least 15+ rounds of survival.`;
+
+    await ctx.reply(truncateMessage(guideMsg), { parse_mode: "HTML" });
+  });
+
+  // ─── /terms ─────────────────────────────────────────────────────────────
 
   bot.command("terms", async (ctx) => {
     const legalText =
