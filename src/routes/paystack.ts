@@ -19,7 +19,7 @@ router.get("/callback", async (req, res) => {
     
     if (data.status && data.data.status === "success") {
       // Process successful payment
-      await handleSuccessfulPayment(reference, data.data.metadata);
+      await handleSuccessfulPayment(reference, data.data);
       res.send("Payment successful! You can close this window and return to Telegram.");
     } else {
       res.send("Payment verification is pending or failed. Please check your Telegram bot for updates.");

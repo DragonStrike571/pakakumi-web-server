@@ -163,64 +163,141 @@ export async function handleSuccessfulPayment(
 
 /**
  * 4. The web-hook free background polling loop.
+ *
+ * IMPORTANT: Paystack marks transactions as "abandoned" almost immediately
+ * after initialization if the user hasn't visited the checkout page yet.
+ * This does NOT mean the user cancelled — it simply means they haven't
+ * completed the payment flow. We must give users a generous grace period
+ * before treating "abandoned" as a terminal state.
  */
 export function startPaystackPolling() {
-  const POLLING_INTERVAL = 15 * 1000; // 15 seconds
+  const POLLING_INTERVAL = 30 * 1000; // 30 seconds between poll cycles
+  const FRESH_PAYMENT_GRACE_MS = 2 * 60 * 1000; // Skip payments younger than 2 minutes
+  const ABANDONED_GRACE_MS = 30 * 60 * 1000; // Only fail "abandoned" after 30 minutes
+  const MAX_PENDING_AGE_MS = 24 * 60 * 60 * 1000; // Auto-expire after 24 hours
 
   const runPoller = async () => {
     try {
-      // Fetch EVERY pending payment, regardless of age.
       const pendingPayments = await db
         .select()
         .from(payments)
         .where(eq(payments.status, "pending"));
 
+      if (pendingPayments.length > 0) {
+        console.log(
+          `[Paystack Poller] Checking ${pendingPayments.length} pending payment(s)`,
+        );
+      }
+
       for (const payment of pendingPayments) {
         try {
-          const data = await verifyPayment(payment.reference);
+          const paymentAge = Date.now() - new Date(payment.createdAt).getTime();
 
-          if (data.status && data.data) {
-            const paystackStatus = data.data.status;
-
-            if (paystackStatus === "success") {
-              // Fulfill the order and mark as success
-              await handleSuccessfulPayment(payment.reference, data.data);
-            } else if (
-              paystackStatus === "failed" ||
-              paystackStatus === "abandoned"
-            ) {
-              // Paystack definitively marked it as dead. Kill it locally.
-              await db
-                .update(payments)
-                .set({ status: "failed" })
-                .where(eq(payments.reference, payment.reference));
-
-              if (bot) {
-                await bot.api
-                  .sendMessage(
-                    payment.chatId,
-                    "❌ **Payment Failed or Cancelled**\n\nThe request timed out, lacked funds, or was cancelled. Generate a new link to try again.",
-                    { parse_mode: "Markdown" },
-                  )
-                  .catch(console.error);
-              }
-            }
-            // If paystackStatus is 'pending', 'ongoing', or anything else,
-            // do absolutely nothing. It remains 'pending' in the DB and will be checked again.
+          // Skip very fresh payments — give the user time to reach the checkout page
+          if (paymentAge < FRESH_PAYMENT_GRACE_MS) {
+            console.log(
+              `[Paystack Poller] Skipping ${payment.reference} — only ${Math.round(paymentAge / 1000)}s old`,
+            );
+            continue;
           }
 
-          // THROTTLE: 200ms delay ensures max 5 requests/sec to prevent rate limiting
+          // Auto-expire extremely stale payments without even calling Paystack
+          if (paymentAge > MAX_PENDING_AGE_MS) {
+            console.log(
+              `[Paystack Poller] Expiring ${payment.reference} — over 24h old`,
+            );
+            await db
+              .update(payments)
+              .set({ status: "failed" })
+              .where(eq(payments.reference, payment.reference));
+            continue;
+          }
+
+          const data = await verifyPayment(payment.reference);
+
+          // Log the raw Paystack response for debugging
+          const paystackStatus = data?.data?.status;
+          console.log(
+            `[Paystack Poller] ${payment.reference} → Paystack status: "${paystackStatus}" (age: ${Math.round(paymentAge / 1000)}s)`,
+          );
+
+          if (!data || !data.status || !data.data) {
+            // Paystack API call itself failed or returned unexpected shape.
+            // Do NOT mark the payment as failed — just skip and retry next cycle.
+            console.warn(
+              `[Paystack Poller] Unexpected response for ${payment.reference}:`,
+              JSON.stringify(data).slice(0, 300),
+            );
+            continue;
+          }
+
+          if (paystackStatus === "success") {
+            console.log(
+              `[Paystack Poller] ✅ Payment ${payment.reference} succeeded!`,
+            );
+            await handleSuccessfulPayment(payment.reference, data.data);
+          } else if (paystackStatus === "failed") {
+            // "failed" is a hard terminal state from Paystack (card declined, etc.)
+            console.log(
+              `[Paystack Poller] ❌ Payment ${payment.reference} definitively failed`,
+            );
+            await markPaymentFailed(payment);
+          } else if (paystackStatus === "abandoned") {
+            // "abandoned" is NOT immediately terminal. Paystack sets this when
+            // the user hasn't completed checkout yet — they may still come back.
+            // Only mark as failed after the grace period.
+            if (paymentAge > ABANDONED_GRACE_MS) {
+              console.log(
+                `[Paystack Poller] ❌ Payment ${payment.reference} abandoned for ${Math.round(paymentAge / 60000)}min — marking failed`,
+              );
+              await markPaymentFailed(payment);
+            } else {
+              console.log(
+                `[Paystack Poller] ⏳ Payment ${payment.reference} shows "abandoned" but only ${Math.round(paymentAge / 60000)}min old — waiting`,
+              );
+            }
+          }
+          // For any other status ("pending", "ongoing", etc.), do nothing.
+          // The payment stays "pending" in our DB and will be rechecked next cycle.
+
+          // THROTTLE: 200ms delay between Paystack API calls to prevent rate limiting
           await new Promise((res) => setTimeout(res, 200));
         } catch (err) {
-          console.error(`Error polling payment ${payment.reference}:`, err);
+          // Network error, timeout, etc. — do NOT mark the payment as failed.
+          console.error(
+            `[Paystack Poller] Error checking ${payment.reference}:`,
+            err,
+          );
         }
       }
     } catch (err) {
-      console.error("Error in paystack polling loop:", err);
+      console.error("[Paystack Poller] Fatal error in polling loop:", err);
     } finally {
       setTimeout(runPoller, POLLING_INTERVAL);
     }
   };
 
+  // Start the first poll cycle
+  console.log("[Paystack Poller] Started — polling every 30s");
   setTimeout(runPoller, POLLING_INTERVAL);
+}
+
+/**
+ * Helper: mark a payment as failed and notify the user via Telegram.
+ */
+async function markPaymentFailed(payment: { reference: string; chatId: string }) {
+  await db
+    .update(payments)
+    .set({ status: "failed" })
+    .where(eq(payments.reference, payment.reference));
+
+  if (bot) {
+    await bot.api
+      .sendMessage(
+        payment.chatId,
+        "❌ **Payment Failed or Cancelled**\n\nThe request timed out, lacked funds, or was cancelled. Generate a new link to try again.",
+        { parse_mode: "Markdown" },
+      )
+      .catch(console.error);
+  }
 }
