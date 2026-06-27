@@ -1,10 +1,20 @@
 import { db } from "../../db/index.js";
 import { payments, telegramUsers } from "../../db/schema.js";
-import { eq, and, gte } from "drizzle-orm";
+import { eq, and, gte, lt } from "drizzle-orm";
 import { bot } from "../telegram/bot.js";
 
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || "";
 const PAYSTACK_BASE_URL = "https://api.paystack.co";
+
+interface PaystackTransactionData {
+  amount: number;
+  status: string;
+  reference: string;
+  metadata?: {
+    chatId?: string;
+    durationPaidFor?: number;
+  };
+}
 
 /**
  * 1. Initialize the payment and lock the parameters in the local database.
@@ -18,7 +28,6 @@ export async function initializePayment(
 ) {
   if (!PAYSTACK_SECRET_KEY) throw new Error("PAYSTACK_SECRET_KEY is not set");
 
-  // Paystack expects the lowest denomination (cents/kobo)
   const amountInCents = Math.round(amountKES * 100);
 
   const response = await fetch(`${PAYSTACK_BASE_URL}/transaction/initialize`, {
@@ -39,11 +48,10 @@ export async function initializePayment(
   const data = await response.json();
 
   if (data.status) {
-    // SECURITY: Lock the expected amount and duration in our database.
     await db.insert(payments).values({
       reference: data.data.reference,
       chatId,
-      amount: amountKES, // Storing flat KES amount for easy cross-referencing
+      amount: amountKES,
       durationPaidFor,
       status: "pending",
     });
@@ -68,7 +76,6 @@ export async function verifyPayment(reference: string) {
 
   const data = await response.json();
 
-  // Guard against malformed responses
   if (!data || typeof data !== "object") {
     throw new Error(`Paystack verify returned invalid data for ${reference}`);
   }
@@ -77,41 +84,118 @@ export async function verifyPayment(reference: string) {
 }
 
 /**
- * 3. The web-hook free background polling loop.
+ * 3. Fulfill the order, enforce math security, and grant access.
+ */
+export async function handleSuccessfulPayment(
+  reference: string,
+  paystackData: PaystackTransactionData,
+) {
+  const paymentRecord = await db
+    .select()
+    .from(payments)
+    .where(eq(payments.reference, reference))
+    .then((res) => res[0]);
+
+  if (!paymentRecord || paymentRecord.status === "success") return;
+
+  const actualPaidKES = paystackData.amount / 100;
+  if (actualPaidKES < paymentRecord.amount) {
+    console.error(
+      `🚨 Underpayment detected for ${reference}. Expected ${paymentRecord.amount}, got ${actualPaidKES}`,
+    );
+    await db
+      .update(payments)
+      .set({ status: "failed" })
+      .where(eq(payments.reference, reference));
+    return;
+  }
+
+  await db
+    .update(payments)
+    .set({ status: "success" })
+    .where(eq(payments.reference, reference));
+
+  const chatId = paymentRecord.chatId;
+  const duration = paymentRecord.durationPaidFor;
+
+  const user = await db
+    .select()
+    .from(telegramUsers)
+    .where(eq(telegramUsers.chatId, chatId))
+    .then((res) => res[0]);
+
+  if (user) {
+    const now = new Date();
+    const currentExpiry =
+      user.expiryTimestamp && user.expiryTimestamp > now
+        ? user.expiryTimestamp
+        : now;
+    const newExpiry = new Date(
+      currentExpiry.getTime() + duration * 24 * 60 * 60 * 1000,
+    );
+
+    await db
+      .update(telegramUsers)
+      .set({ expiryTimestamp: newExpiry })
+      .where(eq(telegramUsers.chatId, chatId));
+
+    if (bot) {
+      const privateChannelId = process.env.PRIVATE_CHANNEL_ID;
+      if (privateChannelId) {
+        try {
+          const invite = await bot.api.createChatInviteLink(privateChannelId, {
+            member_limit: 1,
+            expire_date: Math.floor(Date.now() / 1000) + 24 * 60 * 60,
+          });
+
+          await bot.api.sendMessage(
+            chatId,
+            `🎉 **Payment Verified!**\n\nYour Premium Access has been secured until *${newExpiry.toDateString()}*.\n\nJoin the Premium Room here (Link expires after 1 use):\n${invite.invite_link}`,
+            { parse_mode: "Markdown" },
+          );
+        } catch (err) {
+          console.error("Failed to generate/send invite link:", err);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * 4. The web-hook free background polling loop.
  */
 export function startPaystackPolling() {
   const POLLING_INTERVAL = 15 * 1000; // 15 seconds
 
   const runPoller = async () => {
     try {
-      const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000);
+      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
 
+      // A. CLEANUP: Hard-fail local records older than 2 hours to prevent database clutter
+      await db
+        .update(payments)
+        .set({ status: "failed" })
+        .where(
+          and(
+            eq(payments.status, "pending"),
+            lt(payments.createdAt, twoHoursAgo),
+          ),
+        );
+
+      // B. WIDE NET: Grab active pending transactions from the last 2 hours
       const pendingPayments = await db
         .select()
         .from(payments)
         .where(
           and(
             eq(payments.status, "pending"),
-            gte(payments.createdAt, fourHoursAgo),
+            gte(payments.createdAt, twoHoursAgo),
           ),
         );
 
+      // C. VERIFY & PACE
       for (const payment of pendingPayments) {
         try {
-          const paymentTime = new Date(payment.createdAt).getTime();
-          const ageMinutes = (Date.now() - paymentTime) / 60000;
-
-          // Timezone / STK Push Grace Period Fix
-          if (ageMinutes < 0.5) continue;
-
-          if (ageMinutes > 15) {
-            await db
-              .update(payments)
-              .set({ status: "failed" })
-              .where(eq(payments.reference, payment.reference));
-            continue;
-          }
-
           const data = await verifyPayment(payment.reference);
 
           if (data.status && data.data) {
@@ -132,13 +216,15 @@ export function startPaystackPolling() {
                 await bot.api
                   .sendMessage(
                     payment.chatId,
-                    "❌ **Payment Failed or Cancelled**\n\nThe M-Pesa request timed out, lacked funds, or was cancelled. If you still want Premium, please generate a new link.",
+                    "❌ **Payment Failed or Cancelled**\n\nThe request timed out, lacked funds, or was cancelled. Generate a new link to try again.",
                     { parse_mode: "Markdown" },
                   )
                   .catch(console.error);
               }
             }
           }
+
+          // THROTTLE: 200ms delay ensures max 5 requests/sec to prevent rate limiting
           await new Promise((res) => setTimeout(res, 200));
         } catch (err) {
           console.error(`Error polling payment ${payment.reference}:`, err);
@@ -152,101 +238,4 @@ export function startPaystackPolling() {
   };
 
   setTimeout(runPoller, POLLING_INTERVAL);
-}
-
-/**
- * Shape of Paystack transaction data after verification.
- */
-interface PaystackTransactionData {
-  amount: number;
-  status: string;
-  reference: string;
-  metadata?: {
-    chatId?: string;
-    durationPaidFor?: number;
-  };
-}
-
-/**
- * 4. Fulfill the order, enforce math security, and grant access.
- */
-export async function handleSuccessfulPayment(
-  reference: string,
-  paystackData: PaystackTransactionData,
-) {
-  // Fetch the local invoice truth
-  const paymentRecord = await db
-    .select()
-    .from(payments)
-    .where(eq(payments.reference, reference))
-    .then((res) => res[0]);
-
-  if (!paymentRecord || paymentRecord.status === "success") return;
-
-  // SECURITY CHECK: Did they pay the full amount?
-  // Paystack returns amount in cents. Divide by 100 to get KES.
-  const actualPaidKES = paystackData.amount / 100;
-  if (actualPaidKES < paymentRecord.amount) {
-    console.error(
-      `🚨 Underpayment detected for ${reference}. Expected ${paymentRecord.amount}, got ${actualPaidKES}`,
-    );
-    await db
-      .update(payments)
-      .set({ status: "failed" })
-      .where(eq(payments.reference, reference));
-    return;
-  }
-
-  // Update invoice to success
-  await db
-    .update(payments)
-    .set({ status: "success" })
-    .where(eq(payments.reference, reference));
-
-  const chatId = paymentRecord.chatId;
-  const duration = paymentRecord.durationPaidFor;
-
-  const user = await db
-    .select()
-    .from(telegramUsers)
-    .where(eq(telegramUsers.chatId, chatId))
-    .then((res) => res[0]);
-
-  if (user) {
-    const now = new Date();
-    // If active, add to existing expiry. If expired/null, add to NOW.
-    const currentExpiry =
-      user.expiryTimestamp && user.expiryTimestamp > now
-        ? user.expiryTimestamp
-        : now;
-    const newExpiry = new Date(
-      currentExpiry.getTime() + duration * 24 * 60 * 60 * 1000,
-    );
-
-    await db
-      .update(telegramUsers)
-      .set({ expiryTimestamp: newExpiry })
-      .where(eq(telegramUsers.chatId, chatId));
-
-    // Dispatch the invite link via Bot API
-    if (bot) {
-      const privateChannelId = process.env.PRIVATE_CHANNEL_ID;
-      if (privateChannelId) {
-        try {
-          const invite = await bot.api.createChatInviteLink(privateChannelId, {
-            member_limit: 1, // Single-use prevents link sharing
-            expire_date: Math.floor(Date.now() / 1000) + 24 * 60 * 60, // Must click within 24 hours
-          });
-
-          await bot.api.sendMessage(
-            chatId,
-            `🎉 **Payment Verified!**\n\nYour Premium Access has been secured until *${newExpiry.toDateString()}*.\n\nJoin the Premium Room here (Link expires after 1 use):\n${invite.invite_link}`,
-            { parse_mode: "Markdown" },
-          );
-        } catch (err) {
-          console.error("Failed to generate/send invite link:", err);
-        }
-      }
-    }
-  }
 }
