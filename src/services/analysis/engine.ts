@@ -88,7 +88,12 @@ export interface AnalysisResult {
 
 export interface CustomAnalysisResult {
   roundCount: number;
-  multiplierDistribution: { tier: string; count: number; expected: number; status: "hot" | "cold" | "normal" }[];
+  multiplierDistribution: {
+    tier: string;
+    count: number;
+    expected: number;
+    status: "hot" | "cold" | "normal";
+  }[];
   highest: number;
   lowest: number;
   average: number;
@@ -129,7 +134,7 @@ function calculateIdealPlanRounds(
   isLate: boolean,
 ): number {
   if (isLate) return 0; // Late status = unpredictable, no ideal calculation
-  const buffer = Math.ceil(target / (target - 1));
+  const buffer = Math.ceil(target / (1 - HOUSE_EDGE));
   return expectedRoundsRemaining + buffer;
 }
 
@@ -147,7 +152,8 @@ async function recordDailyPrediction(target: number): Promise<void> {
       .then((res) => res[0]);
 
     if (existing) {
-      const targets = (existing.targets || []) as typeof dailyStats.$inferSelect.targets;
+      const targets = (existing.targets ||
+        []) as typeof dailyStats.$inferSelect.targets;
       targets.push({
         target,
         hit: false,
@@ -184,7 +190,10 @@ async function recordDailyPrediction(target: number): Promise<void> {
   }
 }
 
-async function recordDailyHit(target: number, roundsToHit: number): Promise<void> {
+async function recordDailyHit(
+  target: number,
+  roundsToHit: number,
+): Promise<void> {
   const today = getTodayEAT();
   const nowStr = new Date().toISOString();
 
@@ -196,7 +205,8 @@ async function recordDailyHit(target: number, roundsToHit: number): Promise<void
       .then((res) => res[0]);
 
     if (existing) {
-      const targets = (existing.targets || []) as typeof dailyStats.$inferSelect.targets;
+      const targets = (existing.targets ||
+        []) as typeof dailyStats.$inferSelect.targets;
       // Find the most recent unresolved entry for this target
       for (let i = targets.length - 1; i >= 0; i--) {
         if (targets[i].target === target && !targets[i].resolved) {
@@ -234,7 +244,8 @@ async function recordDailyMiss(target: number): Promise<void> {
       .then((res) => res[0]);
 
     if (existing) {
-      const targets = (existing.targets || []) as typeof dailyStats.$inferSelect.targets;
+      const targets = (existing.targets ||
+        []) as typeof dailyStats.$inferSelect.targets;
       for (let i = targets.length - 1; i >= 0; i--) {
         if (targets[i].target === target && !targets[i].resolved) {
           targets[i].hit = false;
@@ -307,7 +318,12 @@ export async function runAnalysisEngine(newRound?: {
       clusters: [],
       upcomingOpportunities: [],
       stats: { totalSignals: 0, totalHits: 0, accuracy: 0, roundsAnalyzed: 0 },
-      todayStats: { totalPredictions: 0, totalHits: 0, totalMisses: 0, accuracy: 0 },
+      todayStats: {
+        totalPredictions: 0,
+        totalHits: 0,
+        totalMisses: 0,
+        accuracy: 0,
+      },
       hitTargets: [],
       deadTargets: [],
     };
@@ -412,9 +428,7 @@ export async function runAnalysisEngine(newRound?: {
     : SIGNAL_CONFIDENCE_THRESHOLD;
 
   // Use a Set for O(1) lookup of pending targets
-  const pendingTargetSet = new Set(
-    pendingProofs.map((s) => Number(s.target)),
-  );
+  const pendingTargetSet = new Set(pendingProofs.map((s) => Number(s.target)));
 
   const rawAlerts: RawAlert[] = [];
   const upcomingOpportunities: RawAlert[] = [];
@@ -443,7 +457,10 @@ export async function runAnalysisEngine(newRound?: {
     if (gapsUsed > 0) {
       const sumOfPreviousGaps = occIndices[gapsUsed] - occIndices[0];
       const expectedTotalForNextGaps = (gapsUsed + 1) * expectedGap;
-      expectedNextGap = Math.max(1, expectedTotalForNextGaps - sumOfPreviousGaps);
+      expectedNextGap = Math.max(
+        1,
+        expectedTotalForNextGaps - sumOfPreviousGaps,
+      );
     }
 
     const expectedRoundsRemaining = Math.max(
@@ -471,7 +488,13 @@ export async function runAnalysisEngine(newRound?: {
     );
 
     // Generate explanation in plain language
-    const reason = generateReason(target, currentGap, expectedGap, pureOverdueRatio, confidence);
+    const reason = generateReason(
+      target,
+      currentGap,
+      expectedGap,
+      pureOverdueRatio,
+      confidence,
+    );
 
     const alert: RawAlert = {
       target,
@@ -525,10 +548,7 @@ export async function runAnalysisEngine(newRound?: {
     for (const cluster of clusters) {
       for (const alert of cluster.alerts) {
         // Set cooldown with TTL based on expected gap
-        const cooldownTTL = Math.max(
-          20,
-          Math.round(alert.expectedGap * 1.5),
-        );
+        const cooldownTTL = Math.max(20, Math.round(alert.expectedGap * 1.5));
         cooldownMap.set(alert.target, {
           setAtRound: currentRoundIndex,
           expiresAtRound: currentRoundIndex + cooldownTTL,
@@ -618,9 +638,7 @@ export async function runAnalysisEngine(newRound?: {
       totalSignals: stats.signals,
       totalHits: stats.hits,
       accuracy:
-        stats.signals > 0
-          ? Math.round((stats.hits / stats.signals) * 100)
-          : 0,
+        stats.signals > 0 ? Math.round((stats.hits / stats.signals) * 100) : 0,
       roundsAnalyzed: cachedRounds.length,
     },
   };
@@ -659,8 +677,12 @@ function buildCluster(alerts: RawAlert[]): AlertCluster {
     alerts.reduce((sum, c) => sum + c.confidence, 0) / alerts.length,
   );
 
-  const minRemaining = Math.min(...alerts.map((c) => c.expectedRoundsRemaining));
-  const maxRemaining = Math.max(...alerts.map((c) => c.expectedRoundsRemaining));
+  const minRemaining = Math.min(
+    ...alerts.map((c) => c.expectedRoundsRemaining),
+  );
+  const maxRemaining = Math.max(
+    ...alerts.map((c) => c.expectedRoundsRemaining),
+  );
   const baseExpectedGap = Math.round(
     Math.max(...alerts.map((c) => c.expectedGap)),
   );
@@ -816,21 +838,29 @@ export function runCustomAnalysis(
     const actualCount = busts.filter((b) => b >= target).length;
     const ratio = actualCount / expectedCount;
 
-    if (ratio >= 1.4) hotMultipliers.push(`${target}x (${actualCount} times vs ~${Math.round(expectedCount)} expected)`);
-    else if (ratio <= 0.6 && expectedCount >= 2) coldMultipliers.push(`${target}x (${actualCount} times vs ~${Math.round(expectedCount)} expected)`);
+    if (ratio >= 1.4)
+      hotMultipliers.push(
+        `${target}x (${actualCount} times vs ~${Math.round(expectedCount)} expected)`,
+      );
+    else if (ratio <= 0.6 && expectedCount >= 2)
+      coldMultipliers.push(
+        `${target}x (${actualCount} times vs ~${Math.round(expectedCount)} expected)`,
+      );
   }
 
   const sorted = [...busts].sort((a, b) => a - b);
-  const median = sorted.length % 2 === 0
-    ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
-    : sorted[Math.floor(sorted.length / 2)];
+  const median =
+    sorted.length % 2 === 0
+      ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+      : sorted[Math.floor(sorted.length / 2)];
 
   return {
     roundCount: busts.length,
     multiplierDistribution: distribution,
     highest: Math.max(...busts),
     lowest: Math.min(...busts),
-    average: Math.round((busts.reduce((s, b) => s + b, 0) / busts.length) * 100) / 100,
+    average:
+      Math.round((busts.reduce((s, b) => s + b, 0) / busts.length) * 100) / 100,
     median: Math.round(median * 100) / 100,
     hotMultipliers: hotMultipliers.slice(0, 5),
     coldMultipliers: coldMultipliers.slice(0, 5),
@@ -896,7 +926,8 @@ export async function getTodayStats(): Promise<{
   }
 
   const resolved = row.totalHits + row.totalMisses;
-  const accuracy = resolved > 0 ? Math.round((row.totalHits / resolved) * 100) : 0;
+  const accuracy =
+    resolved > 0 ? Math.round((row.totalHits / resolved) * 100) : 0;
 
   return {
     totalPredictions: row.totalPredictions,

@@ -412,6 +412,8 @@ export function setupCommands(bot: Bot<MyContext>) {
 
   async function handleToday(ctx: MyContext) {
     try {
+      const chatId = ctx.chat!.id.toString();
+      const isPremium = await isUserPremium(chatId);
       const stats = await getTodayStats();
 
       const today = new Date().toLocaleDateString("en-GB", {
@@ -421,19 +423,31 @@ export function setupCommands(bot: Bot<MyContext>) {
         year: "numeric",
       });
 
+      const waiting = stats.totalPredictions - stats.totalHits - stats.totalMisses;
+
       let msg =
         `📊 <b>Today's Predictions</b> (${today})\n\n` +
         `🎯 <b>Predictions Made:</b> ${stats.totalPredictions}\n` +
         `✅ <b>Correct:</b> ${stats.totalHits}\n` +
-        `❌ <b>Missed:</b> ${stats.totalMisses}\n` +
-        `⏳ <b>Waiting:</b> ${stats.totalPredictions - stats.totalHits - stats.totalMisses}\n\n` +
-        `📈 <b>Today's Accuracy:</b> ${stats.accuracy}%\n`;
+        `❌ <b>Missed:</b> ${stats.totalMisses}\n`;
+
+      // Only show waiting count to premium users
+      if (isPremium) {
+        msg += `⏳ <b>Waiting:</b> ${waiting}\n`;
+      }
+
+      msg += `\n📈 <b>Today's Accuracy:</b> ${stats.accuracy}%\n`;
 
       // Show recent target details (last 10)
       if (stats.targets && stats.targets.length > 0) {
         msg += `\n<b>Recent Targets:</b>\n`;
 
-        const recentTargets = stats.targets.slice(-10).reverse();
+        // Filter targets: free users only see resolved predictions
+        const allTargets = stats.targets.slice(-10).reverse();
+        const recentTargets = isPremium
+          ? allTargets
+          : allTargets.filter((t) => t.resolved);
+
         for (const t of recentTargets) {
           if (t.resolved && t.hit) {
             msg += `✅ ${t.target}x — Hit in ${t.roundsToHit || "?"} rounds\n`;
@@ -442,6 +456,10 @@ export function setupCommands(bot: Bot<MyContext>) {
           } else {
             msg += `⏳ ${t.target}x — Waiting...\n`;
           }
+        }
+
+        if (!isPremium && waiting > 0) {
+          msg += `\n🔒 <i>${waiting} live prediction${waiting !== 1 ? "s" : ""} hidden. Get Premium to see targets before they resolve.</i>\n`;
         }
       }
 
