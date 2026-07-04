@@ -20,7 +20,7 @@ import {
   analysisSnapshots,
   dailyStats,
 } from "../../db/schema.js";
-import { desc, eq, inArray, sql } from "drizzle-orm";
+import { desc, eq, inArray, sql, lt } from "drizzle-orm";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -39,6 +39,14 @@ const K_OCCURRENCES = 5; // how many past occurrences to use for gap calculation
 
 // EAT timezone for daily stats
 const EAT_TIMEZONE = "Africa/Nairobi";
+
+// ─── Bandwidth Optimization Constants ───────────────────────────────────────
+// These control how often we write to the DB to reduce bandwidth from ~1.5GB/day
+
+const SNAPSHOT_WRITE_INTERVAL = 5; // Write analysisSnapshots every N rounds (was every round)
+const DAILY_STATS_FLUSH_INTERVAL = 10; // Flush dailyStats to DB every N rounds (was every event)
+const HISTORY_PRUNE_INTERVAL = 500; // Prune old signal_history every N rounds
+const HISTORY_RETENTION_DAYS = 30; // Keep signal_history entries for N days
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -113,6 +121,45 @@ const cooldownMap = new Map<
   { setAtRound: number; expiresAtRound: number }
 >();
 
+// ─── In-Memory Caches (bandwidth optimization) ──────────────────────────────
+
+// Cached system stats — loaded once from DB, written only when values change
+let cachedSystemStats: { id: number; hits: number; signals: number; lastAlertRound: number } | null = null;
+let systemStatsDirty = false;
+
+// Cached daily stats — accumulated in memory, flushed periodically
+let cachedDailyStats: {
+  date: string;
+  totalPredictions: number;
+  totalHits: number;
+  totalMisses: number;
+  targets: {
+    target: number;
+    hit: boolean;
+    resolved: boolean;
+    roundsToHit?: number;
+    createdAt: string;
+    resolvedAt?: string;
+  }[];
+} | null = null;
+let dailyStatsDirty = false;
+
+// In-memory pending signals — avoids duplicate SELECTs
+let cachedPendingSignals: typeof pendingSignals.$inferSelect[] | null = null;
+
+// Throttle counters
+let roundsSinceLastSnapshotWrite = 0;
+let roundsSinceLastDailyFlush = 0;
+let roundsSinceLastHistoryPrune = 0;
+
+// Last snapshot data for the public accessor to use between DB writes
+let lastSnapshotData: {
+  activeSignals: any[];
+  upcomingOpportunities: any[];
+  stats: any;
+  updatedAt: Date;
+} | null = null;
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /**
@@ -138,11 +185,23 @@ function calculateIdealPlanRounds(
   return expectedRoundsRemaining + buffer;
 }
 
-// ─── Daily Stats Helpers ────────────────────────────────────────────────────
+// ─── Daily Stats Helpers (In-Memory with Periodic Flush) ────────────────────
 
-async function recordDailyPrediction(target: number): Promise<void> {
+/**
+ * Ensure the in-memory daily stats cache is loaded and current.
+ * Loads from DB on first call or day rollover. All subsequent reads are from memory.
+ */
+async function ensureDailyStatsLoaded(): Promise<void> {
   const today = getTodayEAT();
-  const nowStr = new Date().toISOString();
+
+  if (cachedDailyStats && cachedDailyStats.date === today) {
+    return; // Already loaded for today
+  }
+
+  // Day rollover or first load — flush any pending data for the old day first
+  if (cachedDailyStats && cachedDailyStats.date !== today && dailyStatsDirty) {
+    await flushDailyStats();
+  }
 
   try {
     const existing = await db
@@ -152,120 +211,206 @@ async function recordDailyPrediction(target: number): Promise<void> {
       .then((res) => res[0]);
 
     if (existing) {
-      const targets = (existing.targets ||
-        []) as typeof dailyStats.$inferSelect.targets;
-      targets.push({
-        target,
-        hit: false,
-        resolved: false,
-        createdAt: nowStr,
-      });
-
-      await db
-        .update(dailyStats)
-        .set({
-          totalPredictions: existing.totalPredictions + 1,
-          targets,
-          updatedAt: new Date(),
-        })
-        .where(eq(dailyStats.date, today));
-    } else {
-      await db.insert(dailyStats).values({
+      cachedDailyStats = {
         date: today,
-        totalPredictions: 1,
+        totalPredictions: existing.totalPredictions,
+        totalHits: existing.totalHits,
+        totalMisses: existing.totalMisses,
+        targets: (existing.targets || []) as typeof dailyStats.$inferSelect.targets,
+      };
+    } else {
+      cachedDailyStats = {
+        date: today,
+        totalPredictions: 0,
         totalHits: 0,
         totalMisses: 0,
-        targets: [
-          {
-            target,
-            hit: false,
-            resolved: false,
-            createdAt: nowStr,
-          },
-        ],
+        targets: [],
+      };
+      // Insert the initial row so flushes can UPDATE
+      await db.insert(dailyStats).values({
+        date: today,
+        totalPredictions: 0,
+        totalHits: 0,
+        totalMisses: 0,
+        targets: [],
       });
     }
+    dailyStatsDirty = false;
   } catch (err) {
-    console.error("❌ Error recording daily prediction:", err);
+    console.error("❌ Error loading daily stats:", err);
   }
 }
 
-async function recordDailyHit(
-  target: number,
-  roundsToHit: number,
-): Promise<void> {
-  const today = getTodayEAT();
-  const nowStr = new Date().toISOString();
+/**
+ * Flush the in-memory daily stats to the database.
+ * Called periodically (every DAILY_STATS_FLUSH_INTERVAL rounds) instead of per-event.
+ */
+async function flushDailyStats(): Promise<void> {
+  if (!cachedDailyStats || !dailyStatsDirty) return;
 
   try {
-    const existing = await db
-      .select()
-      .from(dailyStats)
-      .where(eq(dailyStats.date, today))
-      .then((res) => res[0]);
+    await db
+      .update(dailyStats)
+      .set({
+        totalPredictions: cachedDailyStats.totalPredictions,
+        totalHits: cachedDailyStats.totalHits,
+        totalMisses: cachedDailyStats.totalMisses,
+        targets: cachedDailyStats.targets,
+        updatedAt: new Date(),
+      })
+      .where(eq(dailyStats.date, cachedDailyStats.date));
 
-    if (existing) {
-      const targets = (existing.targets ||
-        []) as typeof dailyStats.$inferSelect.targets;
-      // Find the most recent unresolved entry for this target
-      for (let i = targets.length - 1; i >= 0; i--) {
-        if (targets[i].target === target && !targets[i].resolved) {
-          targets[i].hit = true;
-          targets[i].resolved = true;
-          targets[i].roundsToHit = roundsToHit;
-          targets[i].resolvedAt = nowStr;
-          break;
-        }
-      }
-
-      await db
-        .update(dailyStats)
-        .set({
-          totalHits: existing.totalHits + 1,
-          targets,
-          updatedAt: new Date(),
-        })
-        .where(eq(dailyStats.date, today));
-    }
+    dailyStatsDirty = false;
   } catch (err) {
-    console.error("❌ Error recording daily hit:", err);
+    console.error("❌ Error flushing daily stats:", err);
   }
 }
 
-async function recordDailyMiss(target: number): Promise<void> {
-  const today = getTodayEAT();
+/**
+ * Record a prediction in the in-memory daily stats (no DB hit).
+ */
+function recordDailyPrediction(target: number): void {
+  if (!cachedDailyStats) return;
+
+  cachedDailyStats.totalPredictions += 1;
+  cachedDailyStats.targets.push({
+    target,
+    hit: false,
+    resolved: false,
+    createdAt: new Date().toISOString(),
+  });
+  dailyStatsDirty = true;
+}
+
+/**
+ * Record a hit in the in-memory daily stats (no DB hit).
+ */
+function recordDailyHit(target: number, roundsToHit: number): void {
+  if (!cachedDailyStats) return;
+
   const nowStr = new Date().toISOString();
+  const targets = cachedDailyStats.targets;
+
+  for (let i = targets.length - 1; i >= 0; i--) {
+    if (targets[i].target === target && !targets[i].resolved) {
+      targets[i].hit = true;
+      targets[i].resolved = true;
+      targets[i].roundsToHit = roundsToHit;
+      targets[i].resolvedAt = nowStr;
+      break;
+    }
+  }
+
+  // Keep array bounded
+  if (targets.length > 50) {
+    targets.splice(0, targets.length - 50);
+  }
+
+  cachedDailyStats.totalHits += 1;
+  dailyStatsDirty = true;
+}
+
+/**
+ * Record a miss in the in-memory daily stats (no DB hit).
+ */
+function recordDailyMiss(target: number): void {
+  if (!cachedDailyStats) return;
+
+  const nowStr = new Date().toISOString();
+  const targets = cachedDailyStats.targets;
+
+  for (let i = targets.length - 1; i >= 0; i--) {
+    if (targets[i].target === target && !targets[i].resolved) {
+      targets[i].hit = false;
+      targets[i].resolved = true;
+      targets[i].resolvedAt = nowStr;
+      break;
+    }
+  }
+
+  // Keep array bounded
+  if (targets.length > 50) {
+    targets.splice(0, targets.length - 50);
+  }
+
+  cachedDailyStats.totalMisses += 1;
+  dailyStatsDirty = true;
+}
+
+// ─── System Stats Helpers (In-Memory Cache) ─────────────────────────────────
+
+/**
+ * Load system stats from DB into memory (once). All subsequent reads are from cache.
+ */
+async function ensureSystemStatsLoaded(): Promise<void> {
+  if (cachedSystemStats) return;
+
+  const row = await db
+    .select()
+    .from(systemStats)
+    .where(eq(systemStats.id, 1))
+    .then((res) => res[0]);
+
+  if (row) {
+    cachedSystemStats = { ...row };
+  } else {
+    cachedSystemStats = { id: 1, hits: 0, signals: 0, lastAlertRound: 0 };
+    await db.insert(systemStats).values(cachedSystemStats);
+  }
+  systemStatsDirty = false;
+}
+
+/**
+ * Flush system stats to DB only if they changed.
+ */
+async function flushSystemStats(): Promise<void> {
+  if (!cachedSystemStats || !systemStatsDirty) return;
 
   try {
-    const existing = await db
-      .select()
-      .from(dailyStats)
-      .where(eq(dailyStats.date, today))
-      .then((res) => res[0]);
-
-    if (existing) {
-      const targets = (existing.targets ||
-        []) as typeof dailyStats.$inferSelect.targets;
-      for (let i = targets.length - 1; i >= 0; i--) {
-        if (targets[i].target === target && !targets[i].resolved) {
-          targets[i].hit = false;
-          targets[i].resolved = true;
-          targets[i].resolvedAt = nowStr;
-          break;
-        }
-      }
-
-      await db
-        .update(dailyStats)
-        .set({
-          totalMisses: existing.totalMisses + 1,
-          targets,
-          updatedAt: new Date(),
-        })
-        .where(eq(dailyStats.date, today));
-    }
+    await db
+      .update(systemStats)
+      .set({
+        signals: cachedSystemStats.signals,
+        hits: cachedSystemStats.hits,
+        lastAlertRound: cachedSystemStats.lastAlertRound,
+      })
+      .where(eq(systemStats.id, 1));
+    systemStatsDirty = false;
   } catch (err) {
-    console.error("❌ Error recording daily miss:", err);
+    console.error("❌ Error flushing system stats:", err);
+  }
+}
+
+// ─── Pending Signals Cache ──────────────────────────────────────────────────
+
+/**
+ * Load pending signals from DB into memory (once per engine lifecycle).
+ */
+async function ensurePendingSignalsLoaded(): Promise<void> {
+  if (cachedPendingSignals !== null) return;
+  cachedPendingSignals = await db.select().from(pendingSignals);
+}
+
+// ─── Signal History Pruning ─────────────────────────────────────────────────
+
+/**
+ * Delete resolved signal_history entries older than HISTORY_RETENTION_DAYS.
+ * Runs periodically to prevent unbounded table growth.
+ */
+async function pruneSignalHistory(): Promise<void> {
+  try {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - HISTORY_RETENTION_DAYS);
+
+    const result = await db
+      .delete(signalHistory)
+      .where(
+        sql`${signalHistory.outcome} != 'pending' AND ${signalHistory.createdAt} < ${cutoff}`,
+      );
+
+    console.log(`🧹 Pruned signal_history entries older than ${HISTORY_RETENTION_DAYS} days`);
+  } catch (err) {
+    console.error("❌ Error pruning signal history:", err);
   }
 }
 
@@ -279,19 +424,14 @@ export async function runAnalysisEngine(newRound?: {
   bust: number;
   createdAt: Date;
 }): Promise<AnalysisResult> {
-  // ─── Load persisted state ─────────────────────────────────────────────
-  let stats = await db
-    .select()
-    .from(systemStats)
-    .where(eq(systemStats.id, 1))
-    .then((res) => res[0]);
+  // ─── Load persisted state (from cache, not DB) ────────────────────────
+  await ensureSystemStatsLoaded();
+  const stats = cachedSystemStats!;
 
-  if (!stats) {
-    stats = { id: 1, hits: 0, signals: 0, lastAlertRound: 0 };
-    await db.insert(systemStats).values(stats);
-  }
+  await ensurePendingSignalsLoaded();
+  let pendingProofs = cachedPendingSignals!;
 
-  let pendingProofs = await db.select().from(pendingSignals);
+  await ensureDailyStatsLoaded();
 
   // ─── Load round cache ─────────────────────────────────────────────────
   if (cachedRounds.length === 0) {
@@ -349,12 +489,18 @@ export async function runAnalysisEngine(newRound?: {
     if (hitSignals.length > 0) {
       hitTargetsList = hitSignals.map((s) => Number(s.target));
       stats.hits += hitSignals.length;
+      systemStatsDirty = true;
 
       // Clear from cooldown
       hitTargetsList.forEach((t) => cooldownMap.delete(t));
       await db
         .delete(pendingSignals)
         .where(inArray(pendingSignals.target, hitTargetsList));
+
+      // Remove from in-memory cache
+      cachedPendingSignals = cachedPendingSignals!.filter(
+        (s) => !hitTargetsList.includes(Number(s.target)),
+      );
 
       // Record outcomes in signal_history and daily stats
       for (const sig of hitSignals) {
@@ -370,7 +516,7 @@ export async function runAnalysisEngine(newRound?: {
             sql`${signalHistory.target} = ${Number(sig.target)} AND ${signalHistory.outcome} = 'pending'`,
           );
 
-        await recordDailyHit(Number(sig.target), sig.roundsElapsed);
+        recordDailyHit(Number(sig.target), sig.roundsElapsed);
       }
     }
 
@@ -388,6 +534,11 @@ export async function runAnalysisEngine(newRound?: {
         .delete(pendingSignals)
         .where(inArray(pendingSignals.target, deadTargetsList));
 
+      // Remove from in-memory cache
+      cachedPendingSignals = cachedPendingSignals!.filter(
+        (s) => !deadTargetsList.includes(Number(s.target)),
+      );
+
       // Record misses in signal_history and daily stats
       for (const sig of deadSignals) {
         await db
@@ -401,7 +552,7 @@ export async function runAnalysisEngine(newRound?: {
             sql`${signalHistory.target} = ${Number(sig.target)} AND ${signalHistory.outcome} = 'pending'`,
           );
 
-        await recordDailyMiss(Number(sig.target));
+        recordDailyMiss(Number(sig.target));
       }
     }
 
@@ -417,7 +568,17 @@ export async function runAnalysisEngine(newRound?: {
         .update(pendingSignals)
         .set({ roundsElapsed: sql`${pendingSignals.roundsElapsed} + 1` })
         .where(inArray(pendingSignals.target, survivorTargets));
+
+      // Update in-memory cache
+      for (const s of cachedPendingSignals!) {
+        if (survivorTargets.includes(Number(s.target))) {
+          s.roundsElapsed += 1;
+        }
+      }
     }
+
+    // Refresh local reference after mutations
+    pendingProofs = cachedPendingSignals!;
   }
 
   // ─── Step 2: Generate signals ─────────────────────────────────────────
@@ -559,18 +720,26 @@ export async function runAnalysisEngine(newRound?: {
           const maxLifespan =
             cluster.planRounds + Math.ceil(alert.target * 0.85);
 
+          const newPendingRow = {
+            id: alert.target.toString(),
+            target: alert.target,
+            confidence: alert.confidence,
+            roundsElapsed: 0,
+            maxLifespan,
+            cooldownExpiry: currentRoundIndex + cooldownTTL,
+            reason: alert.reason,
+          };
+
           await db
             .insert(pendingSignals)
-            .values({
-              id: alert.target.toString(),
-              target: alert.target,
-              confidence: alert.confidence,
-              roundsElapsed: 0,
-              maxLifespan,
-              cooldownExpiry: currentRoundIndex + cooldownTTL,
-              reason: alert.reason,
-            })
+            .values(newPendingRow)
             .onConflictDoNothing();
+
+          // Add to in-memory cache
+          cachedPendingSignals!.push({
+            ...newPendingRow,
+            createdAt: new Date(),
+          } as typeof pendingSignals.$inferSelect);
 
           // Record in signal history
           await db.insert(signalHistory).values({
@@ -581,40 +750,39 @@ export async function runAnalysisEngine(newRound?: {
             outcome: "pending",
           });
 
-          // Record in daily stats
-          await recordDailyPrediction(alert.target);
+          // Record in daily stats (in-memory, no DB hit)
+          recordDailyPrediction(alert.target);
 
           totalNewSignals++;
         }
       }
     }
 
-    // Batch update stats once at the end
+    // Update in-memory stats (will be flushed later)
     if (totalNewSignals > 0) {
       stats.signals += totalNewSignals;
       stats.lastAlertRound = currentRoundIndex;
-      await db
-        .update(systemStats)
-        .set({
-          signals: stats.signals,
-          hits: stats.hits,
-          lastAlertRound: stats.lastAlertRound,
-        })
-        .where(eq(systemStats.id, 1));
+      systemStatsDirty = true;
     }
-  } else if (hitTargetsList.length > 0) {
-    // Still update hits even if no new clusters
-    await db
-      .update(systemStats)
-      .set({ hits: stats.hits })
-      .where(eq(systemStats.id, 1));
   }
 
-  // ─── Step 5: Update analysis snapshot for frontend ────────────────────
-  const refreshedPending = await db.select().from(pendingSignals);
+  // ─── Step 5: Flush dirty caches & throttled writes ────────────────────
+  // Flush system stats if dirty (only when values actually changed)
+  if (systemStatsDirty) {
+    await flushSystemStats();
+  }
 
+  // Flush daily stats periodically (not every event)
+  roundsSinceLastDailyFlush++;
+  if (dailyStatsDirty && roundsSinceLastDailyFlush >= DAILY_STATS_FLUSH_INTERVAL) {
+    await flushDailyStats();
+    roundsSinceLastDailyFlush = 0;
+  }
+
+  // ─── Step 6: Update analysis snapshot (throttled) ─────────────────────
+  // Build snapshot from in-memory pending signals (no duplicate DB read)
   const snapshotData = {
-    activeSignals: refreshedPending.map((s) => ({
+    activeSignals: cachedPendingSignals!.map((s) => ({
       target: Number(s.target),
       confidence: s.confidence,
       expectedRoundsRemaining: Math.max(0, s.maxLifespan - s.roundsElapsed),
@@ -643,20 +811,35 @@ export async function runAnalysisEngine(newRound?: {
     },
   };
 
-  await db
-    .insert(analysisSnapshots)
-    .values({
-      id: 1,
-      ...snapshotData,
-      updatedAt: new Date(),
-    })
-    .onConflictDoUpdate({
-      target: analysisSnapshots.id,
-      set: { ...snapshotData, updatedAt: new Date() },
-    });
+  // Always update the in-memory snapshot (for WebSocket broadcasts & API)
+  lastSnapshotData = { ...snapshotData, updatedAt: new Date() };
 
-  // ─── Step 6: Get today's stats ────────────────────────────────────────
-  const todayStats = await getTodayStats();
+  // Only write to DB every SNAPSHOT_WRITE_INTERVAL rounds
+  roundsSinceLastSnapshotWrite++;
+  if (roundsSinceLastSnapshotWrite >= SNAPSHOT_WRITE_INTERVAL) {
+    await db
+      .insert(analysisSnapshots)
+      .values({
+        id: 1,
+        ...snapshotData,
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: analysisSnapshots.id,
+        set: { ...snapshotData, updatedAt: new Date() },
+      });
+    roundsSinceLastSnapshotWrite = 0;
+  }
+
+  // ─── Step 7: Periodic signal_history pruning ──────────────────────────
+  roundsSinceLastHistoryPrune++;
+  if (roundsSinceLastHistoryPrune >= HISTORY_PRUNE_INTERVAL) {
+    await pruneSignalHistory();
+    roundsSinceLastHistoryPrune = 0;
+  }
+
+  // ─── Step 8: Get today's stats (from memory) ──────────────────────────
+  const todayStats = getTodayStatsFromCache();
 
   return {
     alerts: rawAlerts,
@@ -870,10 +1053,15 @@ export function runCustomAnalysis(
 // ─── Public Accessors ───────────────────────────────────────────────────────
 
 /**
- * Get the current analysis snapshot from the database.
- * Used by the REST API for frontend access.
+ * Get the current analysis snapshot.
+ * Returns from in-memory cache first (always fresh), falls back to DB.
  */
 export async function getAnalysisSnapshot() {
+  if (lastSnapshotData) {
+    return lastSnapshotData;
+  }
+
+  // Fallback to DB (only on first call before engine has run)
   return await db
     .select()
     .from(analysisSnapshots)
@@ -895,8 +1083,13 @@ export async function getSignalHistory(limit = 50, offset = 0) {
 
 /**
  * Get current system stats.
+ * Returns from in-memory cache if available.
  */
 export async function getSystemStats() {
+  if (cachedSystemStats) {
+    return cachedSystemStats;
+  }
+
   return await db
     .select()
     .from(systemStats)
@@ -905,7 +1098,34 @@ export async function getSystemStats() {
 }
 
 /**
+ * Get today's stats from in-memory cache (no DB hit).
+ * Used internally by the engine.
+ */
+function getTodayStatsFromCache(): {
+  totalPredictions: number;
+  totalHits: number;
+  totalMisses: number;
+  accuracy: number;
+} {
+  if (!cachedDailyStats) {
+    return { totalPredictions: 0, totalHits: 0, totalMisses: 0, accuracy: 0 };
+  }
+
+  const resolved = cachedDailyStats.totalHits + cachedDailyStats.totalMisses;
+  const accuracy =
+    resolved > 0 ? Math.round((cachedDailyStats.totalHits / resolved) * 100) : 0;
+
+  return {
+    totalPredictions: cachedDailyStats.totalPredictions,
+    totalHits: cachedDailyStats.totalHits,
+    totalMisses: cachedDailyStats.totalMisses,
+    accuracy,
+  };
+}
+
+/**
  * Get today's stats (EAT timezone).
+ * Public API — returns from cache if available, otherwise DB.
  */
 export async function getTodayStats(): Promise<{
   totalPredictions: number;
@@ -914,6 +1134,22 @@ export async function getTodayStats(): Promise<{
   accuracy: number;
   targets?: typeof dailyStats.$inferSelect.targets;
 }> {
+  // If in-memory cache is loaded, return from it
+  if (cachedDailyStats && cachedDailyStats.date === getTodayEAT()) {
+    const resolved = cachedDailyStats.totalHits + cachedDailyStats.totalMisses;
+    const accuracy =
+      resolved > 0 ? Math.round((cachedDailyStats.totalHits / resolved) * 100) : 0;
+
+    return {
+      totalPredictions: cachedDailyStats.totalPredictions,
+      totalHits: cachedDailyStats.totalHits,
+      totalMisses: cachedDailyStats.totalMisses,
+      accuracy,
+      targets: cachedDailyStats.targets,
+    };
+  }
+
+  // Fallback to DB (before engine has initialized)
   const today = getTodayEAT();
   const row = await db
     .select()
