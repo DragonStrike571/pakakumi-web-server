@@ -25,7 +25,7 @@ import { desc, eq, inArray, sql, lt } from "drizzle-orm";
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const HOUSE_EDGE = 0.01; // 1%
-const TARGETS = [
+export const TARGETS = [
   2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90,
   100, 150, 200, 250, 300, 350, 400, 450, 500, 600, 700, 800, 900, 1000, 1500,
   2000, 2500, 3000,
@@ -92,6 +92,14 @@ export interface AnalysisResult {
   };
   hitTargets: number[];
   deadTargets: number[];
+  activeSignals: {
+    target: number;
+    confidence: number;
+    expectedRoundsRemaining: number;
+    status: string;
+    reason: string;
+    roundsElapsed: number;
+  }[];
 }
 
 export interface CustomAnalysisResult {
@@ -466,6 +474,7 @@ export async function runAnalysisEngine(newRound?: {
       },
       hitTargets: [],
       deadTargets: [],
+      activeSignals: [],
     };
   }
 
@@ -849,6 +858,7 @@ export async function runAnalysisEngine(newRound?: {
     todayStats,
     hitTargets: hitTargetsList,
     deadTargets: deadTargetsList,
+    activeSignals: snapshotData.activeSignals,
   };
 }
 
