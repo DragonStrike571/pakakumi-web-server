@@ -192,7 +192,10 @@ router.post("/balance", balanceLimiter, async (req: Request, res: Response) => {
 
   console.log("[Balance] Starting balance check...");
 
+  const BALANCE_TIMEOUT_MS = 30_000; // Hard timeout for the entire balance check
+
   const { data: balance, error: scrapeError } = await trycatch(async () => {
+    const balancePromise = (async () => {
     const { context } = await balancePool.getContext();
 
     try {
@@ -272,6 +275,14 @@ router.post("/balance", balanceLimiter, async (req: Request, res: Response) => {
     } finally {
       await balancePool.releaseContext(context);
     }
+    })();
+
+    // Hard timeout to prevent indefinite hangs
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Balance check timed out after 30s")), BALANCE_TIMEOUT_MS),
+    );
+
+    return await Promise.race([balancePromise, timeout]);
   });
 
   if (scrapeError) {

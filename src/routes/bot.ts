@@ -1,5 +1,4 @@
 import { Router, Request, Response } from "express";
-import { botManager } from "../services/bot/manager.js";
 import { db } from "../db/index.js";
 import {
   strategies,
@@ -15,6 +14,7 @@ import { AuthenticatedRequest } from "../types/express.js";
 import { requireActiveAccess } from "../middleware/access.js";
 import rateLimit from "express-rate-limit";
 import { decrypt } from "../utils/crypto.js";
+import { botManager } from "../services/bot/manager.js";
 
 const router = Router();
 
@@ -96,6 +96,7 @@ router.post("/start", botLimiter, async (req: Request, res: Response) => {
   }
 
   const { data, error } = await trycatch(async () => {
+    // 1. Validate strategy access FIRST (before creating any DB records)
     const { data: strategy, error: strategyError } = await trycatch(
       async () => {
         return await db.query.strategies.findFirst({
@@ -147,15 +148,22 @@ router.post("/start", botLimiter, async (req: Request, res: Response) => {
       throw new Error("Auth info missing");
     }
 
-    const sessionId = await botManager.startSession(
-      userId,
-      strategyId,
-      strategy.config as any,
-      initialCapital,
-      auth,
-    );
+    // 2. Only insert session AFTER all validation passes
+    const [session] = await db
+      .insert(botSessions)
+      .values({
+        userId,
+        strategyId,
+        status: "pending",
+        initialCapital,
+        currentCapital: initialCapital,
+        totalProfit: 0,
+        currentStep: 0,
+        logs: [],
+      })
+      .returning();
 
-    return sessionId;
+    return session.id;
   });
 
   if (error) {
@@ -181,20 +189,21 @@ router.post("/:sessionId/stop", async (req: Request, res: Response) => {
   const sessionId = req.params.sessionId as string;
   const userId = (req as AuthenticatedRequest).user.id;
 
-  // Verify ownership: only the session owner can stop it
-  const session = botManager.getSession(sessionId);
+  // Verify ownership
+  const session = await db.query.botSessions.findFirst({
+    where: and(eq(botSessions.id, sessionId), eq(botSessions.userId, userId)),
+  });
+
   if (!session) {
-    res.status(404).json({ error: "Session not found or already stopped" });
+    res.status(404).json({ error: "Session not found or you do not own it" });
     return;
   }
 
-  if (session.userId !== userId) {
-    res.status(403).json({ error: "You do not own this session" });
-    return;
-  }
-
-  const { data: stopped, error } = await trycatch(async () => {
-    return await botManager.stopSession(sessionId as string);
+  const { error } = await trycatch(async () => {
+    return await db
+      .update(botSessions)
+      .set({ status: "stopped", endedAt: new Date() })
+      .where(eq(botSessions.id, sessionId));
   });
 
   if (error) {
@@ -202,21 +211,12 @@ router.post("/:sessionId/stop", async (req: Request, res: Response) => {
     return;
   }
 
-  if (stopped) {
-    res.json({ status: "stopped" });
-  } else {
-    res.status(404).json({ error: "Session not found or already stopped" });
-  }
+  res.json({ status: "stopped" });
 });
 
 router.get("/status", async (req: Request, res: Response) => {
   const userId = (req as AuthenticatedRequest).user.id;
 
-  // Get in-memory active session IDs
-  const activeSessions = botManager.getActiveSessionsForUser(userId);
-  const activeIds = new Set(activeSessions.map((s) => s.sessionId));
-
-  // Fetch full session details from DB
   const { data: dbSessions, error } = await trycatch(async () => {
     return await db
       .select()
@@ -235,7 +235,7 @@ router.get("/status", async (req: Request, res: Response) => {
     sessionId: s.id,
     userId: s.userId,
     strategyId: s.strategyId,
-    status: activeIds.has(s.id) ? "running" : s.status,
+    status: s.status,
     initialCapital: s.initialCapital,
     currentCapital: s.currentCapital,
     totalProfit: s.totalProfit,

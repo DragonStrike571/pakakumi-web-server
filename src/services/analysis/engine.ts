@@ -100,6 +100,14 @@ export interface AnalysisResult {
     reason: string;
     roundsElapsed: number;
   }[];
+  correlationStreaks: number[][];
+  correlationClusters: {
+    targets: number[];
+    median: number;
+    selectedTarget: number;
+    clusterSize: number;
+    avgConfidence: number;
+  }[];
 }
 
 export interface CustomAnalysisResult {
@@ -162,9 +170,26 @@ let roundsSinceLastHistoryPrune = 0;
 
 // Last snapshot data for the public accessor to use between DB writes
 let lastSnapshotData: {
-  activeSignals: any[];
-  upcomingOpportunities: any[];
-  stats: any;
+  activeSignals: {
+    target: number;
+    confidence: number;
+    expectedRoundsRemaining: number;
+    status: string;
+    reason: string;
+    roundsElapsed: number;
+  }[];
+  upcomingOpportunities: {
+    target: number;
+    confidence: number;
+    expectedRoundsRemaining: number;
+    reason: string;
+  }[];
+  stats: {
+    totalSignals: number;
+    totalHits: number;
+    accuracy: number;
+    roundsAnalyzed: number;
+  };
   updatedAt: Date;
 } | null = null;
 
@@ -475,6 +500,8 @@ export async function runAnalysisEngine(newRound?: {
       hitTargets: [],
       deadTargets: [],
       activeSignals: [],
+      correlationStreaks: [],
+      correlationClusters: [],
     };
   }
 
@@ -850,6 +877,72 @@ export async function runAnalysisEngine(newRound?: {
   // ─── Step 8: Get today's stats (from memory) ──────────────────────────
   const todayStats = getTodayStatsFromCache();
 
+  // ─── Step 9: Aggregate Correlation Streaks ──────────────────────────────
+  // Cluster active signals by proximity in the TARGETS array.
+  // Gap of >1 TARGETS index between two active signals = separate clusters.
+  // Minimum 3 targets per cluster.
+  const activeTargetValues = snapshotData.activeSignals.map((s) => s.target).sort((a, b) => a - b);
+  const activeIndices = activeTargetValues
+    .map((t) => TARGETS.indexOf(t))
+    .filter((idx) => idx !== -1)
+    .sort((a, b) => a - b);
+
+  // Deduplicate indices
+  const uniqueIndices = [...new Set(activeIndices)];
+
+  let currentStreak: number[] = [];
+  const correlationStreaks: number[][] = [];
+
+  for (let i = 0; i < uniqueIndices.length; i++) {
+    if (currentStreak.length === 0) {
+      currentStreak.push(uniqueIndices[i]);
+    } else {
+      const gap = uniqueIndices[i] - currentStreak[currentStreak.length - 1];
+      // Allow gap of up to 1 (adjacent or one target slot apart)
+      if (gap <= 2) {
+        currentStreak.push(uniqueIndices[i]);
+      } else {
+        if (currentStreak.length >= 3) correlationStreaks.push([...currentStreak].map(idx => TARGETS[idx]));
+        currentStreak = [uniqueIndices[i]];
+      }
+    }
+  }
+  if (currentStreak.length >= 3) correlationStreaks.push([...currentStreak].map(idx => TARGETS[idx]));
+
+  // Build rich correlation cluster metadata for auto-play
+  const correlationClusters = correlationStreaks.map((targets) => {
+    const sorted = [...targets].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    const median = sorted.length % 2 === 0
+      ? (sorted[mid - 1] + sorted[mid]) / 2
+      : sorted[mid];
+
+    // Select the lower set-target below the median from TARGETS
+    let selectedTarget = sorted[0]; // fallback to lowest
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      if (sorted[i] <= median) {
+        selectedTarget = sorted[i];
+        break;
+      }
+    }
+
+    // Average confidence from active signals in this cluster
+    const clusterSignals = snapshotData.activeSignals.filter(
+      (s) => targets.includes(s.target),
+    );
+    const avgConfidence = clusterSignals.length > 0
+      ? Math.round(clusterSignals.reduce((sum, s) => sum + s.confidence, 0) / clusterSignals.length)
+      : 0;
+
+    return {
+      targets,
+      median,
+      selectedTarget,
+      clusterSize: targets.length,
+      avgConfidence,
+    };
+  });
+
   return {
     alerts: rawAlerts,
     clusters,
@@ -859,6 +952,8 @@ export async function runAnalysisEngine(newRound?: {
     hitTargets: hitTargetsList,
     deadTargets: deadTargetsList,
     activeSignals: snapshotData.activeSignals,
+    correlationStreaks,
+    correlationClusters,
   };
 }
 

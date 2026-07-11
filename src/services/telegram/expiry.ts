@@ -11,7 +11,7 @@
 import { db } from "../../db/index.js";
 import { telegramUsers } from "../../db/schema.js";
 import { lt } from "drizzle-orm";
-import { bot } from "./bot.js";
+import { bot, invalidateSessionCache } from "./bot.js";
 import {
   rateLimitedSend,
   rateLimitedBan,
@@ -80,25 +80,16 @@ export function startExpiryKicker() {
           }
 
           if (isAdmin) {
-            console.warn(
-              `🛡️ Skipping expiry kick for admin user ${user.chatId}`,
-            );
-
-            // Notify the admin differently
-            await rateLimitedSend(
-              user.chatId,
-              `⏳ <b>Subscription Expired</b>\n\n` +
-                `Your premium subscription has ended, but you still have channel access as an admin.\n\n` +
-                `Type /start to renew when ready.`,
-              { parse_mode: "HTML" },
-              "low",
-            ).catch(console.error);
+            // Admins keep channel access — skip silently, no nagging messages
             continue;
           }
 
           // ─── Safe to kick ───────────────────────────────────────────
           await rateLimitedBan(PRIVATE_CHANNEL_ID, userId, "low");
           await rateLimitedUnban(PRIVATE_CHANNEL_ID, userId, "low");
+
+          // Invalidate the session cache so the next message doesn't use stale state
+          invalidateSessionCache(user.chatId);
 
           await rateLimitedSend(
             user.chatId,

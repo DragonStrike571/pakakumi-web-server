@@ -190,7 +190,7 @@ export function setupCommands(bot: Bot<MyContext>) {
         `⚙️ <b>Plan Your Bets</b>\n\n` +
           `You want to hit ${target}x.\n\n` +
           `Type this to plan your stakes:\n\n` +
-          `<code>/generate [your cash] [min bet] ${target} [recovery]</code>\n\n` +
+          `<code>/generate [your cash] [min bet] ${target} [profit target]</code>\n\n` +
           `<i>Example: /generate 5000 20 ${target} 1.5</i>`,
         { parse_mode: "HTML" },
       );
@@ -659,14 +659,14 @@ export function setupCommands(bot: Bot<MyContext>) {
     if (args.length < 4) {
       return ctx.reply(
         "⚠️ <b>How to use:</b>\n\n" +
-          "<code>/generate [cash] [min bet] [multiplier] [recovery]</code>\n\n" +
+          "<code>/generate [cash] [min bet] [multiplier] [profit target]</code>\n\n" +
           "Example: <code>/generate 1000 10 2.0 1.5</code>\n\n" +
           "<i>This tells you exactly how much to bet each round so you can survive long enough to hit your target.</i>\n\n" +
           "<b>What the numbers mean:</b>\n" +
           "• <b>Cash:</b> How much money you have\n" +
           "• <b>Min bet:</b> Smallest bet you want to start with\n" +
           "• <b>Multiplier:</b> The target you're aiming for (e.g., 2.0x)\n" +
-          "• <b>Recovery:</b> How much profit you want when you hit (1.5 = 50% profit)",
+          "• <b>Profit target:</b> How much profit you want when you hit (1.5 = 50% profit)",
         { parse_mode: "HTML" },
       );
     }
@@ -690,7 +690,7 @@ export function setupCommands(bot: Bot<MyContext>) {
       return ctx.reply(`❌ Multiplier must be between 1.01x and ${MAX_MULTIPLIER}x.`);
     }
     if (targetReturn <= 0 || targetReturn > 100) {
-      return ctx.reply("❌ Recovery must be between 0.1 and 100.");
+      return ctx.reply("❌ Profit target must be between 0.1 and 100.");
     }
 
     const isPremium = await isUserPremium(chatId);
@@ -719,7 +719,7 @@ export function setupCommands(bot: Bot<MyContext>) {
       `⚙️ <b>Your Bet Plan</b>\n\n` +
       `<i>Cash: KES ${capital.toLocaleString()}</i>\n` +
       `<i>Target: ${multiplier}x</i>\n` +
-      `<i>Recovery: ${targetReturn}x profit when you hit</i>\n\n` +
+      `<i>Profit target: ${targetReturn}x profit when you hit</i>\n\n` +
       `<b>What to bet each round:</b>\n\n`;
 
     response += lines.join("\n") + "\n";
@@ -816,13 +816,13 @@ export function setupCommands(bot: Bot<MyContext>) {
       `• Round 3: Bet KES 25. If 2x hits, you win KES 50 (covers Round 1+2 losses + profit)\n\n` +
       `This is why each bet is bigger — it needs to pay for everything before it.\n\n` +
       `──────────────────\n\n` +
-      `<b>3️⃣ WHAT IS "RECOVERY"?</b>\n\n` +
-      `The recovery number controls how much profit you make when you hit.\n\n` +
+      `<b>3️⃣ WHAT IS "PROFIT TARGET"?</b>\n\n` +
+      `The profit target number controls how much profit you make when you hit.\n\n` +
       `• <b>1.0</b> = Break even (just get your money back)\n` +
       `• <b>1.5</b> = 50% profit on top of your losses\n` +
       `• <b>2.0</b> = 100% profit (double your total spent)\n\n` +
-      `Higher recovery = higher profit but fewer rounds you can survive.\n` +
-      `Lower recovery = less profit but you can survive more rounds.\n\n` +
+      `Higher profit target = higher profit but fewer rounds you can survive.\n` +
+      `Lower profit target = less profit but you can survive more rounds.\n\n` +
       `<i>💡 Tip: 1.5 is the sweet spot for most people.</i>\n\n` +
       `──────────────────\n\n` +
       `<b>4️⃣ HOW TO FOLLOW THE PLAN</b>\n\n` +
@@ -861,5 +861,44 @@ export function setupCommands(bot: Bot<MyContext>) {
       `<b>3. RISKS</b>\nThe bot gives you the best chances based on past data, but nothing is guaranteed. We are not responsible for money lost.\n\n` +
       `<b>4. PRIVACY</b>\nWe don't share your info or track your personal bets.`;
     await ctx.reply(legalText, { parse_mode: "HTML" });
+  });
+
+  // ─── /lugha — Toggle between English and Swahili ──────────────────────
+
+  bot.command("lugha", async (ctx) => {
+    const chatId = ctx.chat!.id.toString();
+
+    // Get current language
+    const user = await db
+      .select({ language: telegramUsers.language })
+      .from(telegramUsers)
+      .where(eq(telegramUsers.chatId, chatId))
+      .then((res) => res[0]);
+
+    const currentLang = user?.language || "en";
+    const newLang = currentLang === "en" ? "sw" : "en";
+
+    await db
+      .update(telegramUsers)
+      .set({ language: newLang })
+      .where(eq(telegramUsers.chatId, chatId));
+
+    if (newLang === "sw") {
+      await ctx.reply(
+        `🇰🇪 <b>Lugha imebadilishwa kuwa Kiswahili</b>\n\n` +
+          `Sasa utapokea ujumbe muhimu kwa Kiswahili.\n\n` +
+          `📌 Amri zote zinabaki sawa: /start, /today, /generate, /plan, /analyze\n\n` +
+          `Bonyeza /lugha tena kubadilisha kurudi kwa Kiingereza.`,
+        { parse_mode: "HTML" },
+      );
+    } else {
+      await ctx.reply(
+        `🇬🇧 <b>Language switched to English</b>\n\n` +
+          `You will now receive key messages in English.\n\n` +
+          `📌 All commands stay the same: /start, /today, /generate, /plan, /analyze\n\n` +
+          `Type /lugha again to switch to Swahili.`,
+        { parse_mode: "HTML" },
+      );
+    }
   });
 }

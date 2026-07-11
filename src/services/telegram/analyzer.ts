@@ -20,6 +20,10 @@ import {
   type AnalysisResult,
 } from "../analysis/engine.js";
 import { rateLimitedSend } from "./rate-limiter.js";
+import {
+  processAutoPlayOpportunities,
+  clearResolvedCluster,
+} from "../auto-play.js";
 
 // ─── Free Channel Timing Obfuscation ────────────────────────────────────────
 
@@ -196,54 +200,36 @@ export async function runAnalysis(newRound?: {
   }
 
   // ─── Aggregate Correlation Alerts ──────────────────────────────────────
-  if (bot && privateChannelId && result.activeSignals.length >= 3) {
-    // 1. Get all active targets sorted
-    const activeTargetValues = result.activeSignals.map((s) => s.target).sort((a, b) => a - b);
-
-    // 2. Map them to their index in the TARGETS array
-    const activeIndices = activeTargetValues
-      .map((t) => TARGETS.indexOf(t))
-      .filter((idx) => idx !== -1)
-      .sort((a, b) => a - b);
-
-    // 3. Find streaks of consecutive indices
-    let currentStreak: number[] = [];
-    const streaks: number[][] = [];
-
-    for (let i = 0; i < activeIndices.length; i++) {
-      if (currentStreak.length === 0) {
-        currentStreak.push(activeIndices[i]);
-      } else {
-        if (activeIndices[i] === currentStreak[currentStreak.length - 1] + 1) {
-          currentStreak.push(activeIndices[i]);
-        } else {
-          if (currentStreak.length >= 3) streaks.push([...currentStreak]);
-          currentStreak = [activeIndices[i]];
-        }
-      }
-    }
-    if (currentStreak.length >= 3) streaks.push(currentStreak);
-
-    // 4. Dispatch alert for each streak if it contains a NEWLY GENERATED alert
+  if (bot && privateChannelId && result.correlationStreaks.length > 0) {
     const newTargetValues = new Set(result.alerts.map((a) => a.target));
 
-    for (const streak of streaks) {
-      const streakTargets = streak.map((idx) => TARGETS[idx]);
+    for (const streakTargets of result.correlationStreaks) {
       const hasNewTarget = streakTargets.some((t) => newTargetValues.has(t));
 
       if (hasNewTarget) {
         const targetsStr = streakTargets.map((t) => `${t}x`).join(", ");
         const correlationMsg =
           `🔗 <b>AGGREGATE CORRELATION DETECTED</b>\n\n` +
-          `A strong pattern has emerged. Multiple consecutive targets are active simultaneously:\n\n` +
+          `Several targets are lining up at the same time. This usually means a big round is coming soon.\n\n` +
           `🎯 <b>Correlated Targets:</b> &gt;${targetsStr}\n\n` +
-          `💡 <b>What this means:</b> When ${streakTargets.length} or more sequential targets build up, it increases the probability of a breakout coming quite soon to clear them in one go. Proceed with a consolidated plan.`;
+          `💡 <b>What this means:</b> ${streakTargets.length} targets are all waiting to be hit. When this many line up together, the chance of a big round is much higher. Plan your bets carefully.`;
 
         await rateLimitedSend(privateChannelId, correlationMsg, {
           parse_mode: "HTML",
         }, "high").catch(console.error);
       }
     }
+  }
+
+  // ─── Process Auto-Play Opportunities ───────────────────────────────────
+  // Write opportunities to DB for the local bot to pick up
+  if (result.correlationClusters.length > 0) {
+    processAutoPlayOpportunities(result).catch(console.error);
+  }
+
+  // Clear resolved clusters when targets are hit
+  if (result.hitTargets.length > 0) {
+    clearResolvedCluster(result.hitTargets);
   }
 
   return result;

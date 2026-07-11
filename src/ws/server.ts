@@ -3,16 +3,46 @@ import { WebSocket, WebSocketServer } from "ws";
 import { Round } from "../validation/rounds.js";
 import { CORS_ORIGINS } from "../config/cors.js";
 
+// ─── Typed WS Payload Interfaces ────────────────────────────────────────────
+
+interface WsActiveSignal {
+  target: number;
+  confidence: number;
+  expectedRoundsRemaining: number;
+  status: string;
+  reason: string;
+  roundsElapsed: number;
+}
+
+interface WsUpcomingOpportunity {
+  target: number;
+  confidence: number;
+  expectedGap: number;
+  expectedRoundsRemaining: number;
+  pureOverdueRatio: number;
+  reason: string;
+  idealPlanRounds: number;
+  isLate: boolean;
+}
+
+interface WsAnalysisStats {
+  totalSignals: number;
+  totalHits: number;
+  accuracy: number;
+  roundsAnalyzed: number;
+}
+
 type WsPayload =
   | { type: "welcome"; message: string }
   | { type: "roundUpdate"; data: Round }
   | {
       type: "analysisUpdate";
       data: {
-        activeSignals: any[];
-        upcomingOpportunities: any[];
-        stats: any;
+        activeSignals: WsActiveSignal[];
+        upcomingOpportunities: WsUpcomingOpportunity[];
+        stats: WsAnalysisStats;
         hitTargets: number[];
+        correlationStreaks: number[][];
       };
     };
 
@@ -24,13 +54,16 @@ function sendJson(socket: WebSocket, payload: WsPayload) {
   socket.send(JSON.stringify(payload));
 }
 
-function broadcastJson(wss: WebSocketServer, payload: WsPayload) {
+/**
+ * Broadcast a pre-serialized JSON string to all connected clients.
+ * Serializes once instead of per-client for better performance at scale.
+ */
+function broadcastPreSerialized(wss: WebSocketServer, serialized: string) {
   for (const client of wss.clients) {
     if (client.readyState !== client.OPEN) {
       continue;
     }
-
-    client.send(JSON.stringify(payload));
+    client.send(serialized);
   }
 }
 
@@ -87,22 +120,19 @@ export function attachWebSocketServer(httpServer: Server) {
   });
 
   function broadcastRoundUpdate(round: Round) {
-    broadcastJson(wss, {
-      type: "roundUpdate",
-      data: round,
-    });
+    const payload: WsPayload = { type: "roundUpdate", data: round };
+    broadcastPreSerialized(wss, JSON.stringify(payload));
   }
 
   function broadcastAnalysisUpdate(data: {
-    activeSignals: any[];
-    upcomingOpportunities: any[];
-    stats: any;
+    activeSignals: WsActiveSignal[];
+    upcomingOpportunities: WsUpcomingOpportunity[];
+    stats: WsAnalysisStats;
     hitTargets: number[];
+    correlationStreaks: number[][];
   }) {
-    broadcastJson(wss, {
-      type: "analysisUpdate",
-      data,
-    });
+    const payload: WsPayload = { type: "analysisUpdate", data };
+    broadcastPreSerialized(wss, JSON.stringify(payload));
   }
 
   return { broadcastRoundUpdate, broadcastAnalysisUpdate };

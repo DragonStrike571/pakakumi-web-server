@@ -10,7 +10,6 @@ import { roundService } from "./services/round.js";
 import strategiesRouter from "./routes/strategies.js";
 import botRouter from "./routes/bot.js";
 import accountRouter from "./routes/account.js";
-import { botManager } from "./services/bot/manager.js";
 import { toNodeHandler } from "better-auth/node";
 import { auth } from "./lib/auth.js";
 import cors from "cors";
@@ -84,7 +83,7 @@ const authLimiter = rateLimit({
 });
 
 app.use("/api/auth", authLimiter, toNodeHandler(auth));
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
 
 app.get("/", (req: Request, res: Response) => {
   res.send("Pakakumi Web Server is running!");
@@ -140,20 +139,25 @@ gameScraper.on("roundEnded", async (data) => {
       .then((analysisResult) => {
         if (analysisResult) {
           broadcastAnalysisUpdate({
-            activeSignals: analysisResult.clusters.flatMap((c) =>
-              c.alerts.map((a) => ({
-                target: a.target,
-                confidence: a.confidence,
-                expectedRoundsRemaining: a.expectedRoundsRemaining,
-                reason: a.reason,
-              })),
-            ),
+            activeSignals: analysisResult.activeSignals.map((a) => ({
+              target: a.target,
+              confidence: a.confidence,
+              expectedRoundsRemaining: a.expectedRoundsRemaining,
+              status: a.status,
+              reason: a.reason,
+              roundsElapsed: a.roundsElapsed,
+            })),
+            correlationStreaks: analysisResult.correlationStreaks,
             upcomingOpportunities: analysisResult.upcomingOpportunities.map(
               (o) => ({
                 target: o.target,
                 confidence: o.confidence,
+                expectedGap: o.expectedGap,
                 expectedRoundsRemaining: o.expectedRoundsRemaining,
+                pureOverdueRatio: o.pureOverdueRatio,
                 reason: o.reason,
+                idealPlanRounds: o.idealPlanRounds,
+                isLate: o.isLate,
               }),
             ),
             stats: analysisResult.stats,
@@ -170,7 +174,7 @@ gameScraper
   .catch((err) => console.error("❌ Failed to start scraper:", err));
 
 // Initialize Services & Background Daemons
-Promise.all([roundService.initialize(), botManager.initialize()])
+Promise.all([roundService.initialize()])
   .then(() => {
     console.log("✅ Core services initialized");
 
@@ -221,11 +225,6 @@ async function shutdown(signal: string) {
   await trycatch(async () => {
     await gameScraper.stop();
     console.log("✅ Scraper stopped");
-  });
-
-  await trycatch(async () => {
-    await botManager.shutdownAll();
-    console.log("✅ Bot manager shut down");
   });
 
   // Safely terminate Telegram polling connections

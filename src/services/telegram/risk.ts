@@ -48,7 +48,7 @@ export function generateRiskPlan({ bankroll, target, strategy }: RiskProfile) {
     sequence,
     warning:
       survivedRounds < 3
-        ? "🚨 DANGER: Your cash is too little for this target. You will lose everything fast."
+        ? "🚨 WARNING: Your money is too little for this target. You will lose it very quickly. Try a smaller target or add more cash."
         : "✅ SAFE: Follow these bets exactly and you have a good chance.",
   };
 }

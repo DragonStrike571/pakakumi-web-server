@@ -219,6 +219,7 @@ export const telegramUsers = pgTable(
     username: text("username"),
     expiryTimestamp: timestamp("expiry_timestamp", { mode: "date" }),
     sessionState: text("session_state").notNull().default("command"), // 'command' | 'support'
+    language: text("language").notNull().default("en"), // 'en' | 'sw' — for Swahili toggle
     createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { mode: "date" })
       .defaultNow()
@@ -360,3 +361,48 @@ export const dailyStats = pgTable("daily_stats", {
     .notNull(),
   updatedAt: timestamp("updated_at", { mode: "date" }).defaultNow().notNull(),
 });
+
+export const autoPlayConfig = pgTable(
+  "auto_play_config",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    enabled: boolean("enabled").notNull().default(false),
+    strategyId: uuid("strategy_id").references(() => strategies.id),
+    credentialId: uuid("credential_id").references(() => pakakumiCredentials.id),
+    maxLossPerPlay: numeric("max_loss_per_play", { mode: "number" }), // Max capital to risk per auto-play
+    maxDailyLoss: numeric("max_daily_loss", { mode: "number" }), // Global daily loss cap
+    capitalPercentage: real("capital_percentage").notNull().default(5), // 5-10% of capital
+    cooldownMinutes: integer("cooldown_minutes").notNull().default(30),
+    minClusterSize: integer("min_cluster_size").notNull().default(3), // Minimum correlation targets
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
+      .defaultNow()
+      .notNull()
+      .$onUpdateFn(() => new Date()),
+  },
+  (table) => [index("auto_play_config_user_idx").on(table.userId)],
+);
+
+export const autoPlayOpportunities = pgTable(
+  "auto_play_opportunities",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    clusterTargets: jsonb("cluster_targets").$type<number[]>().notNull(), // e.g. [30, 35, 40, 45]
+    selectedTarget: real("selected_target").notNull(), // The lower-set target below median
+    medianTarget: real("median_target").notNull(),
+    clusterSize: integer("cluster_size").notNull(),
+    avgConfidence: integer("avg_confidence").notNull(),
+    status: text("status").notNull().default("pending"), // 'pending' | 'claimed' | 'completed' | 'expired'
+    claimedBy: text("claimed_by").references(() => users.id),
+    sessionId: uuid("session_id").references(() => botSessions.id),
+    createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+    expiresAt: timestamp("expires_at", { mode: "date" }).notNull(),
+  },
+  (table) => [
+    index("auto_play_opp_status_idx").on(table.status),
+    index("auto_play_opp_created_idx").on(table.createdAt),
+  ],
+);

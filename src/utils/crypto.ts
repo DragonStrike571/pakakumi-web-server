@@ -11,6 +11,11 @@ function getKey(): Buffer {
       "ENCRYPTION_KEY env var is required (64 hex chars = 32 bytes)",
     );
   }
+  if (key.length !== 64) {
+    throw new Error(
+      `ENCRYPTION_KEY must be exactly 64 hex chars (got ${key.length}). Generate with: openssl rand -hex 32`,
+    );
+  }
   return Buffer.from(key, "hex");
 }
 

@@ -36,6 +36,8 @@ export class GameScraper extends EventEmitter {
   private stalenessTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly STALENESS_TIMEOUT_MS = 300_000; // 5 minutes without a DOM change = stale
   private lastActivity: number = Date.now();
+  private observerSetupFailures: number = 0;
+  private readonly MAX_OBSERVER_FAILURES = 3;
 
   constructor() {
     super();
@@ -149,12 +151,20 @@ export class GameScraper extends EventEmitter {
       console.log("✅ Scraper re-initialized after staleness.");
     } catch (err) {
       console.error("❌ Failed to recover from staleness:", err);
-      // Full restart
-      this.isRunning = false;
-      this.clearStalenessTimer();
-      this.restartCount++;
-      if (this.restartCount <= this.MAX_RESTARTS) {
-        setTimeout(() => this.start(), 5000);
+      // Full restart only if observer keeps failing
+      this.observerSetupFailures++;
+      if (this.observerSetupFailures >= this.MAX_OBSERVER_FAILURES) {
+        console.error("🛑 Observer setup failed too many times. Full browser restart...");
+        this.isRunning = false;
+        this.clearStalenessTimer();
+        this.observerSetupFailures = 0;
+        this.restartCount++;
+        if (this.restartCount <= this.MAX_RESTARTS) {
+          setTimeout(() => this.start(), 5000);
+        }
+      } else {
+        // Retry after a short delay instead of full restart
+        this.resetStalenessTimer();
       }
     }
   }
@@ -260,6 +270,9 @@ export class GameScraper extends EventEmitter {
       observer.observe(targetNode, { childList: true, subtree: true });
       console.log("📡 DOM change observer attached.");
     });
+
+    // Reset observer failure counter on successful attach
+    this.observerSetupFailures = 0;
   }
 
   /**

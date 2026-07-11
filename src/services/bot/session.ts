@@ -1,3 +1,5 @@
+// SYNCED WITH: pakakumi-local-bot/src/bot/session.ts
+// Keep changes in sync between both copies.
 import { Browser, BrowserContext, Page } from "playwright";
 import { EventEmitter } from "events";
 import { db } from "../../db/index.js";
@@ -33,6 +35,7 @@ export class BotSession extends EventEmitter {
   private profit = 0;
   private logs: string[] = [];
   private consecutiveErrors = 0;
+  private processing = false; // Serialization guard for processRoundEnd
 
   constructor(
     private browser: Browser,
@@ -229,6 +232,11 @@ export class BotSession extends EventEmitter {
   private lastBet: { amount: number; cashout: number } | null = null;
 
   private async processRoundEnd(bustStr: string) {
+    // Serialization guard: prevent concurrent execution from rapid MutationObserver fires
+    if (this.processing) return;
+    this.processing = true;
+
+    try {
     const bustVal = parseFloat(bustStr.replace("x", "").replace(",", ""));
 
     if (this.lastBet) {
@@ -294,6 +302,9 @@ export class BotSession extends EventEmitter {
       this.lastBet = null;
       this.log("Skipping round (Strategy decision).");
     }
+    } finally {
+      this.processing = false;
+    }
   }
 
   private async placeBet(amount: number, cashout: number) {
@@ -334,8 +345,15 @@ export class BotSession extends EventEmitter {
     } catch (error: any) {
       this.log(`❌ Error placing bet: ${error.message}`);
 
-      const pageText = await this.page.evaluate(() => document.body.innerText);
-      this.log(`🔍 WHAT THE BOT SEES: \n ${pageText.substring(0, 500)}`);
+      // Capture page text for diagnostics, guarding against closed pages
+      if (this.page && !this.page.isClosed()) {
+        try {
+          const pageText = await this.page.evaluate(() => document.body.innerText);
+          this.log(`🔍 WHAT THE BOT SEES: \n ${pageText.substring(0, 500)}`);
+        } catch {
+          this.log("🔍 Could not capture page state (page may be closed).");
+        }
+      }
 
       this.lastBet = null;
       this.consecutiveErrors++;
