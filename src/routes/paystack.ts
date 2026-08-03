@@ -1,17 +1,27 @@
 import { Router } from "express";
+import rateLimit from "express-rate-limit";
 import { verifyPayment, handleSuccessfulPayment } from "../services/paystack/paystack.js";
 
 const router = Router();
+const callbackLimiter = rateLimit({
+  windowMs: 15 * 60 * 1_000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // Paystack redirects here after a user attempts payment
-router.get("/callback", async (req, res) => {
+router.get("/callback", callbackLimiter, async (req, res) => {
   const reference = req.query.reference as string;
-  if (!reference || typeof reference !== "string" || reference.length > 200) {
+  if (
+    !reference ||
+    typeof reference !== "string" ||
+    !/^[A-Za-z0-9._=-]{1,200}$/.test(reference)
+  ) {
     return res.status(400).send("Invalid or missing reference");
   }
 
-  // Sanitize the reference for use in Paystack API
-  const sanitizedRef = encodeURIComponent(reference.trim());
+  const sanitizedRef = reference.trim();
 
   try {
     const data = await verifyPayment(sanitizedRef);

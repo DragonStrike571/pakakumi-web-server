@@ -11,9 +11,9 @@ function getKey(): Buffer {
       "ENCRYPTION_KEY env var is required (64 hex chars = 32 bytes)",
     );
   }
-  if (key.length !== 64) {
+  if (!/^[0-9a-fA-F]{64}$/.test(key)) {
     throw new Error(
-      `ENCRYPTION_KEY must be exactly 64 hex chars (got ${key.length}). Generate with: openssl rand -hex 32`,
+      "ENCRYPTION_KEY must be exactly 64 hexadecimal characters (32 bytes)",
     );
   }
   return Buffer.from(key, "hex");
@@ -41,6 +41,10 @@ export function encrypt(plaintext: string): string {
  */
 export function decrypt(ciphertext: string): string {
   const key = getKey();
+
+  if (!/^[0-9a-fA-F]+$/.test(ciphertext) || ciphertext.length < 64) {
+    throw new Error("Encrypted credential has an invalid format");
+  }
 
   const iv = Buffer.from(ciphertext.slice(0, IV_LENGTH * 2), "hex");
   const authTag = Buffer.from(

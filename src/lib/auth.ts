@@ -5,6 +5,11 @@ import { users, sessions, accounts, verifications } from "../db/schema.js";
 
 import { CORS_ORIGINS } from "../config/cors.js";
 
+const isProduction = process.env.NODE_ENV === "production";
+const cookieAttributes = isProduction
+  ? { sameSite: "none" as const, secure: true, partitioned: true }
+  : { sameSite: "lax" as const, secure: false };
+
 export const auth = betterAuth({
   database: drizzleAdapter(db, {
     provider: "pg",
@@ -32,28 +37,16 @@ export const auth = betterAuth({
   },
   trustedOrigins: CORS_ORIGINS,
   advanced: {
-    useSecureCookies: true,
-    defaultCookieAttributes: {
-      sameSite: "none",
-      secure: true,
-      partitioned: true,
-    },
+    useSecureCookies: isProduction,
+    defaultCookieAttributes: cookieAttributes,
     cookies: {
       session_token: {
         name: "better-auth.session_token",
-        attributes: {
-          sameSite: "none",
-          secure: true,
-          partitioned: true,
-        },
+        attributes: cookieAttributes,
       },
       session_data: {
         name: "better-auth.session_data",
-        attributes: {
-          sameSite: "none",
-          secure: true,
-          partitioned: true,
-        },
+        attributes: cookieAttributes,
       },
     },
   },

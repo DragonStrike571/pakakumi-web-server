@@ -26,7 +26,9 @@ const ADMIN_STATUSES = new Set(["creator", "administrator"]);
 
 export function startExpiryKicker() {
   const PRIVATE_CHANNEL_ID = process.env.PRIVATE_CHANNEL_ID;
-  if (!PRIVATE_CHANNEL_ID || !bot) return;
+  if (!PRIVATE_CHANNEL_ID || !bot) return () => undefined;
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
 
   const runKicker = async () => {
     try {
@@ -111,10 +113,15 @@ export function startExpiryKicker() {
       console.error("Error in Expiry Kicker loop:", err);
     } finally {
       // Schedule the next execution only AFTER this one is completely done
-      setTimeout(runKicker, 60 * 60 * 1000);
+      if (!stopped) timer = setTimeout(runKicker, 60 * 60 * 1000);
     }
   };
 
   // Run immediately on first startup, not after 1 hour delay
-  setTimeout(runKicker, 5000);
+  timer = setTimeout(runKicker, 5000);
+  return () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
 }

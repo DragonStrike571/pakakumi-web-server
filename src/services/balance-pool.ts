@@ -2,6 +2,9 @@ import { chromium, Browser, BrowserContext, Page } from "playwright";
 import { trycatch } from "../utils/try-catch.js";
 
 const MAX_BROWSERS = 2;
+const chromiumArgs = process.env.PLAYWRIGHT_DISABLE_SANDBOX === "true"
+  ? ["--no-sandbox", "--disable-setuid-sandbox"]
+  : [];
 
 class BalancePool {
   private browsers: Browser[] = [];
@@ -22,7 +25,7 @@ class BalancePool {
       const { data: browser, error } = await trycatch(async () => {
         return await chromium.launch({
           headless: process.env.HEADLESS !== "false",
-          args: ["--no-sandbox", "--disable-setuid-sandbox"],
+          args: chromiumArgs,
         });
       });
       if (error || !browser) {

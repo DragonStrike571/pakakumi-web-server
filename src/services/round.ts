@@ -1,19 +1,19 @@
 import { db } from "../db/index.js";
 import { rounds } from "../db/schema.js";
 import { desc } from "drizzle-orm";
-import { InsertRound, Round } from "../validation/rounds.js";
 import { trycatch } from "../utils/try-catch.js";
 
 export interface ScrapedRoundData {
   bust: number;
   bustId: string;
-  playersOnline: number;
-  playersPlaying: number;
-  totalAmountPlayed: number;
-  totalAmountWon: number;
-  totalAmountLost: number;
-  averageAmountPlayed: number;
-  maxAmountPlayed: number;
+  playersOnline: number | null;
+  playersPlaying: number | null;
+  totalAmountPlayed: number | null;
+  totalAmountWon: number | null;
+  totalAmountLost: number | null;
+  averageAmountPlayed: number | null;
+  maxAmountPlayed: number | null;
+  metricsComplete: boolean;
 }
 
 // How many consecutive non-overlapping bustIds before we declare a gap.
@@ -24,7 +24,7 @@ const OVERLAP_GAP_THRESHOLD = 4;
 
 class RoundService {
   private lastRoundState: {
-    totalReserveFunds: number;
+    totalReserveFunds: number | null;
     roundsSinceLast3000: number | null;
     lastBustId: string | null;
     consecutiveNonOverlapping: number;
@@ -60,7 +60,9 @@ class RoundService {
 
     if (lastRound) {
       this.lastRoundState = {
-        totalReserveFunds: Number(lastRound.totalReserveFunds) || 0,
+        totalReserveFunds: lastRound.totalReserveFunds === null
+          ? null
+          : Number(lastRound.totalReserveFunds),
         roundsSinceLast3000: lastRound.roundsSinceLast3000,
         lastBustId: lastRound.bustId,
         consecutiveNonOverlapping: 0,
@@ -147,7 +149,7 @@ class RoundService {
           console.warn(
             `⚠️ Data gap detected: ${this.lastRoundState.consecutiveNonOverlapping} consecutive non-overlapping bustIds. Resetting reserve funds.`,
           );
-          this.lastRoundState.totalReserveFunds = 0;
+          this.lastRoundState.totalReserveFunds = null;
           this.lastRoundState.roundsSinceLast3000 = null;
           gapDetected = true;
           // Reset counter after declaring gap
@@ -159,16 +161,26 @@ class RoundService {
       }
     }
 
-    let newTotalReserveFunds = this.lastRoundState.totalReserveFunds;
+    let newTotalReserveFunds: number | null = this.lastRoundState.totalReserveFunds;
     let newRoundsSinceLast3000 = this.lastRoundState.roundsSinceLast3000;
 
     if (data.bust >= 3000) {
       newTotalReserveFunds = 0;
       newRoundsSinceLast3000 = 0;
     } else {
-      // Net revenue for this round = Loss - Won
-      const roundNetRevenue = data.totalAmountLost - data.totalAmountWon;
-      newTotalReserveFunds += roundNetRevenue;
+      if (
+        !data.metricsComplete ||
+        data.totalAmountLost === null ||
+        data.totalAmountWon === null
+      ) {
+        // Once financial continuity is lost it stays unknown until the next
+        // 3000x reset; treating missing values as zero would fabricate reserve.
+        newTotalReserveFunds = null;
+        gapDetected = true;
+      } else if (newTotalReserveFunds !== null) {
+        const roundNetRevenue = data.totalAmountLost - data.totalAmountWon;
+        newTotalReserveFunds += roundNetRevenue;
+      }
 
       if (newRoundsSinceLast3000 !== null) {
         newRoundsSinceLast3000 += 1;
@@ -188,6 +200,7 @@ class RoundService {
       totalReserveFunds: newTotalReserveFunds,
       roundsSinceLast3000: newRoundsSinceLast3000,
       gapDetected,
+      metricsComplete: data.metricsComplete,
     };
 
     const { data: savedRound, error } = await trycatch(async () => {

@@ -1,4 +1,4 @@
-import express, { Request, Response } from "express";
+import express, { type NextFunction, Request, Response } from "express";
 import http from "http";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -16,6 +16,7 @@ import cors from "cors";
 import { pool } from "./db/index.js";
 import paystackRouter from "./routes/paystack.js";
 import analysisRouter from "./routes/analysis.js";
+import backtestsRouter from "./routes/backtests.js";
 
 // Core Daemons
 import { bot } from "./services/telegram/bot.js";
@@ -28,8 +29,6 @@ const requiredEnvVars = [
   "DATABASE_URL",
   "BETTER_AUTH_SECRET",
   "ENCRYPTION_KEY",
-  "PAYSTACK_SECRET_KEY",
-  "TELEGRAM_BOT_TOKEN",
 ];
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
@@ -38,22 +37,35 @@ for (const envVar of requiredEnvVars) {
   }
 }
 
+if (!/^[0-9a-fA-F]{64}$/.test(process.env.ENCRYPTION_KEY!)) {
+  throw new Error("ENCRYPTION_KEY must be exactly 64 hexadecimal characters");
+}
+if (process.env.BETTER_AUTH_SECRET!.length < 32) {
+  throw new Error("BETTER_AUTH_SECRET must contain at least 32 characters");
+}
+
 const PORT = Number(process.env.PORT || 8000);
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65_535) {
+  throw new Error("PORT must be an integer between 1 and 65535");
+}
 const HOST = process.env.HOST || "0.0.0.0";
+const TRUST_PROXY_HOPS = process.env.TRUST_PROXY_HOPS
+  ? Number(process.env.TRUST_PROXY_HOPS)
+  : 0;
+if (!Number.isInteger(TRUST_PROXY_HOPS) || TRUST_PROXY_HOPS < 0 || TRUST_PROXY_HOPS > 5) {
+  throw new Error("TRUST_PROXY_HOPS must be an integer between 0 and 5");
+}
 import { CORS_ORIGINS } from "./config/cors.js";
 
 const app = express();
 const server = http.createServer(app);
+const toNullableNumber = (value: number | string | null) =>
+  value === null ? null : Number(value);
 
-app.set("trust proxy", 1);
+app.set("trust proxy", TRUST_PROXY_HOPS || false);
 
 // Security middleware
-app.use(
-  helmet({
-    crossOriginOpenerPolicy: { policy: "unsafe-none" },
-    crossOriginResourcePolicy: { policy: "cross-origin" },
-  }),
-);
+app.use(helmet());
 
 // Configure CORS
 app.use(
@@ -68,10 +80,18 @@ app.use(
 app.use((req, res, next) => {
   // Filter noisy health check and WebSocket upgrade logs
   if (req.url !== "/health" && req.url !== "/ws") {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   }
   next();
 });
+
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  limit: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === "/health",
+}));
 
 // Rate limiter for Auth endpoints
 const authLimiter = rateLimit({
@@ -79,7 +99,6 @@ const authLimiter = rateLimit({
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
-  validate: { xForwardedForHeader: false },
 });
 
 app.use("/api/auth", authLimiter, toNodeHandler(auth));
@@ -91,8 +110,9 @@ app.get("/", (req: Request, res: Response) => {
 
 app.get("/health", (req: Request, res: Response) => {
   res.json({
-    status: "ok",
+    status: gameScraper.getStatus().running ? "ok" : "degraded",
     uptime: process.uptime(),
+    scraper: gameScraper.getStatus(),
     scraperState: roundService.getState(),
   });
 });
@@ -103,10 +123,25 @@ app.use("/bot", botRouter);
 app.use("/account", accountRouter);
 app.use("/paystack", paystackRouter);
 app.use("/analysis", analysisRouter);
+app.use("/backtests", backtestsRouter);
+
+app.use((req: Request, res: Response) => {
+  res.status(404).json({ error: "Endpoint not found" });
+});
+
+app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
+  console.error(`Unhandled request error for ${req.method} ${req.path}:`, error);
+  if (res.headersSent) return;
+  res.status(500).json({ error: "Internal server error" });
+});
 
 // WEBHOOK REMOVED: Telegram now operates entirely via background polling
 
-const { broadcastRoundUpdate, broadcastAnalysisUpdate } = attachWebSocketServer(server);
+const {
+  broadcastRoundUpdate,
+  broadcastAnalysisUpdate,
+  closeWebSocketServer,
+} = attachWebSocketServer(server);
 app.locals.broadcastRoundUpdate = broadcastRoundUpdate;
 
 // Initialize Scraper
@@ -124,12 +159,12 @@ gameScraper.on("roundEnded", async (data) => {
     broadcastRoundUpdate({
       ...savedRound,
       bust: Number(savedRound.bust),
-      totalAmountPlayed: Number(savedRound.totalAmountPlayed),
-      totalAmountWon: Number(savedRound.totalAmountWon),
-      totalAmountLost: Number(savedRound.totalAmountLost),
-      averageAmountPlayed: Number(savedRound.averageAmountPlayed),
-      maxAmountPlayed: Number(savedRound.maxAmountPlayed),
-      totalReserveFunds: Number(savedRound.totalReserveFunds),
+      totalAmountPlayed: toNullableNumber(savedRound.totalAmountPlayed),
+      totalAmountWon: toNullableNumber(savedRound.totalAmountWon),
+      totalAmountLost: toNullableNumber(savedRound.totalAmountLost),
+      averageAmountPlayed: toNullableNumber(savedRound.averageAmountPlayed),
+      maxAmountPlayed: toNullableNumber(savedRound.maxAmountPlayed),
+      totalReserveFunds: toNullableNumber(savedRound.totalReserveFunds),
     });
 
     runAnalysis({
@@ -169,43 +204,48 @@ gameScraper.on("roundEnded", async (data) => {
   }
 });
 
-gameScraper
-  .start()
-  .catch((err) => console.error("❌ Failed to start scraper:", err));
+let stopPaystackPolling: () => void = () => undefined;
+let stopExpiryKicker: () => void = () => undefined;
 
-// Initialize Services & Background Daemons
-Promise.all([roundService.initialize()])
-  .then(() => {
-    console.log("✅ Core services initialized");
+async function initializeServices() {
+  await roundService.initialize();
+  await gameScraper.start();
 
-    // Start Background Pollers
-    startPaystackPolling();
-    console.log("✅ Paystack verification polling started");
+  if (process.env.PAYSTACK_SECRET_KEY) {
+    stopPaystackPolling = startPaystackPolling();
+  } else {
+    console.warn("Paystack polling disabled: PAYSTACK_SECRET_KEY is not configured");
+  }
 
-    startExpiryKicker();
-    console.log("✅ Expiry kicker daemon started");
-
-    // Start Telegram Long-Polling
-    if (bot) {
-      bot
-        .start({ drop_pending_updates: true })
-        .catch((err) => console.error("❌ Failed to start bot polling:", err));
-      console.log("✅ Telegram Daemon active (Long-Polling)");
-    }
-  })
-  .catch((err) => console.error("❌ Failed to initialize services:", err));
+  if (bot) {
+    stopExpiryKicker = startExpiryKicker();
+    void bot.start({ drop_pending_updates: true }).catch((error) => {
+      console.error("Telegram polling stopped unexpectedly:", error);
+    });
+  } else {
+    console.warn("Telegram services disabled: TELEGRAM_BOT_TOKEN is not configured");
+  }
+}
 
 // Catch unhandled promises that bypass the Express/Grammy error handlers
+let shuttingDown = false;
 process.on("unhandledRejection", (reason, promise) => {
   console.error("🚨 Unhandled Rejection at:", promise, "reason:", reason);
-  // Do not exit the process here; log it and let it recover
+  void shutdown("unhandled rejection", 1);
 });
 
 process.on("uncaughtException", (error) => {
   console.error("🚨 Uncaught Exception thrown:", error);
-  // If it's a critical core crash, log and allow PM2/Docker to restart it safely
-  process.exit(1);
+  void shutdown("uncaught exception", 1);
 });
+
+try {
+  await initializeServices();
+} catch (error) {
+  console.error("Core service initialization failed:", error);
+  await pool.end().catch(() => undefined);
+  process.exit(1);
+}
 
 server.listen(PORT, HOST, () => {
   const baseUrl =
@@ -217,10 +257,26 @@ server.listen(PORT, HOST, () => {
 });
 
 // Graceful shutdown
-async function shutdown(signal: string) {
+async function shutdown(signal: string, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log(`\n🛑 ${signal} received. Shutting down gracefully...`);
 
-  server.close(() => console.log("✅ HTTP server closed"));
+  stopPaystackPolling();
+  stopExpiryKicker();
+
+  const httpClosed = new Promise<void>((resolve) => {
+    server.close((error) => {
+      if (error) console.error("HTTP server close error:", error);
+      else console.log("✅ HTTP server closed");
+      resolve();
+    });
+  });
+
+  await trycatch(async () => {
+    await closeWebSocketServer();
+    console.log("✅ WebSocket server closed");
+  });
 
   await trycatch(async () => {
     await gameScraper.stop();
@@ -235,12 +291,17 @@ async function shutdown(signal: string) {
     });
   }
 
+  await Promise.race([
+    httpClosed,
+    new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
+  ]);
+
   await trycatch(async () => {
     await pool.end();
     console.log("✅ Database pool drained");
   });
 
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));

@@ -9,6 +9,7 @@ import {
 
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || "";
 const PAYSTACK_BASE_URL = "https://api.paystack.co";
+const PAYSTACK_TIMEOUT_MS = 15_000;
 
 interface PaystackTransactionData {
   amount: number;
@@ -47,9 +48,11 @@ export async function initializePayment(
       callback_url: callbackUrl,
       metadata: { chatId, durationPaidFor },
     }),
+    signal: AbortSignal.timeout(PAYSTACK_TIMEOUT_MS),
   });
 
   const data = await response.json();
+  if (!response.ok) throw new Error(`Paystack initialization failed (${response.status})`);
 
   if (data.status) {
     await db.insert(payments).values({
@@ -75,10 +78,12 @@ export async function verifyPayment(reference: string) {
     {
       method: "GET",
       headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` },
+      signal: AbortSignal.timeout(PAYSTACK_TIMEOUT_MS),
     },
   );
 
   const data = await response.json();
+  if (!response.ok) throw new Error(`Paystack verification failed (${response.status})`);
 
   if (!data || typeof data !== "object") {
     throw new Error(`Paystack verify returned invalid data for ${reference}`);
@@ -94,41 +99,62 @@ export async function handleSuccessfulPayment(
   reference: string,
   paystackData: PaystackTransactionData,
 ) {
-  const paymentRecord = await db
-    .select()
-    .from(payments)
-    .where(eq(payments.reference, reference))
-    .then((res) => res[0]);
-
-  if (!paymentRecord || paymentRecord.status === "success") return;
-
-  const actualPaidKES = paystackData.amount / 100;
-  if (actualPaidKES < paymentRecord.amount) {
-    console.error(
-      `🚨 Underpayment detected for ${reference}. Expected ${paymentRecord.amount}, got ${actualPaidKES}`,
-    );
-    await db
-      .update(payments)
-      .set({ status: "failed" })
-      .where(eq(payments.reference, reference));
-    return;
+  if (
+    paystackData.status !== "success" ||
+    paystackData.reference !== reference ||
+    !Number.isFinite(paystackData.amount)
+  ) {
+    throw new Error("Paystack response does not match the payment being fulfilled");
   }
 
-  await db
-    .update(payments)
-    .set({ status: "success" })
-    .where(eq(payments.reference, reference));
+  const fulfillment = await db.transaction(async (tx) => {
+    const [paymentRecord] = await tx
+      .select()
+      .from(payments)
+      .where(eq(payments.reference, reference))
+      .limit(1);
+    if (!paymentRecord || paymentRecord.status === "success") return null;
+    if (paymentRecord.status !== "pending") return null;
 
-  const chatId = paymentRecord.chatId;
-  const duration = paymentRecord.durationPaidFor;
+    const expectedAmount = Number(paymentRecord.amount);
+    const actualPaidKES = paystackData.amount / 100;
+    if (!Number.isFinite(expectedAmount) || actualPaidKES < expectedAmount) {
+      console.error(
+        `🚨 Underpayment detected for ${reference}. Expected ${expectedAmount}, got ${actualPaidKES}`,
+      );
+      await tx
+        .update(payments)
+        .set({ status: "failed" })
+        .where(and(
+          eq(payments.reference, reference),
+          eq(payments.status, "pending"),
+        ));
+      return null;
+    }
 
-  const user = await db
-    .select()
-    .from(telegramUsers)
-    .where(eq(telegramUsers.chatId, chatId))
-    .then((res) => res[0]);
+    // Claim the pending payment. A concurrent callback/poller can no longer
+    // fulfill the same payment after this conditional update succeeds.
+    const [claimed] = await tx
+      .update(payments)
+      .set({ status: "success" })
+      .where(and(
+        eq(payments.reference, reference),
+        eq(payments.status, "pending"),
+      ))
+      .returning({ chatId: payments.chatId });
+    if (!claimed) return null;
 
-  if (user) {
+    const [user] = await tx
+      .select()
+      .from(telegramUsers)
+      .where(eq(telegramUsers.chatId, claimed.chatId))
+      .limit(1);
+    if (!user) throw new Error("Payment owner no longer exists");
+
+    const duration = Number(paymentRecord.durationPaidFor);
+    if (!Number.isFinite(duration) || duration <= 0) {
+      throw new Error("Stored payment duration is invalid");
+    }
     const now = new Date();
     const currentExpiry =
       user.expiryTimestamp && user.expiryTimestamp > now
@@ -138,12 +164,15 @@ export async function handleSuccessfulPayment(
       currentExpiry.getTime() + duration * 24 * 60 * 60 * 1000,
     );
 
-    await db
+    await tx
       .update(telegramUsers)
       .set({ expiryTimestamp: newExpiry })
-      .where(eq(telegramUsers.chatId, chatId));
+      .where(eq(telegramUsers.chatId, claimed.chatId));
+    return { chatId: claimed.chatId, newExpiry };
+  });
 
-    if (bot) {
+  if (fulfillment && bot) {
+      const { chatId, newExpiry } = fulfillment;
       const privateChannelId = process.env.PRIVATE_CHANNEL_ID;
       if (privateChannelId) {
         try {
@@ -166,7 +195,6 @@ export async function handleSuccessfulPayment(
           console.error("Failed to generate/send invite link:", err);
         }
       }
-    }
   }
 }
 
@@ -184,6 +212,8 @@ export function startPaystackPolling() {
   const FRESH_PAYMENT_GRACE_MS = 2 * 60 * 1000; // Skip payments younger than 2 minutes
   const ABANDONED_GRACE_MS = 30 * 60 * 1000; // Only fail "abandoned" after 30 minutes
   const MAX_PENDING_AGE_MS = 24 * 60 * 60 * 1000; // Auto-expire after 24 hours
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
 
   const runPoller = async () => {
     try {
@@ -282,13 +312,18 @@ export function startPaystackPolling() {
     } catch (err) {
       console.error("[Paystack Poller] Fatal error in polling loop:", err);
     } finally {
-      setTimeout(runPoller, POLLING_INTERVAL);
+      if (!stopped) timer = setTimeout(runPoller, POLLING_INTERVAL);
     }
   };
 
   // Start the first poll cycle
   console.log("[Paystack Poller] Started — polling every 30s");
-  setTimeout(runPoller, POLLING_INTERVAL);
+  timer = setTimeout(runPoller, POLLING_INTERVAL);
+  return () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
 }
 
 /**

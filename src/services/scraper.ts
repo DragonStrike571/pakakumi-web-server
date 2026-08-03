@@ -6,17 +6,21 @@ import { trycatch } from "../utils/try-catch.js";
 config();
 
 const PAKAKUMI_URL = process.env.PAKAKUMI_URL || "https://play.pakakumi.com";
+const chromiumArgs = process.env.PLAYWRIGHT_DISABLE_SANDBOX === "true"
+  ? ["--no-sandbox", "--disable-setuid-sandbox"]
+  : [];
 
 export interface RoundData {
   bust: number;
   bustId: string;
-  playersOnline: number;
-  playersPlaying: number;
-  totalAmountPlayed: number;
-  totalAmountWon: number;
-  totalAmountLost: number;
-  averageAmountPlayed: number;
-  maxAmountPlayed: number;
+  playersOnline: number | null;
+  playersPlaying: number | null;
+  totalAmountPlayed: number | null;
+  totalAmountWon: number | null;
+  totalAmountLost: number | null;
+  averageAmountPlayed: number | null;
+  maxAmountPlayed: number | null;
+  metricsComplete: boolean;
 }
 
 export class GameScraper extends EventEmitter {
@@ -26,11 +30,16 @@ export class GameScraper extends EventEmitter {
   private previousBustIDs = new Set<string>();
   private restartCount: number = 0;
   private readonly MAX_RESTARTS = 10;
+  private desiredRunning = false;
+  private starting = false;
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  private stableTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Debounce: the observer can fire many times for one round change.
   // We collapse rapid signals into a single scrape after 100ms of quiet.
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private scraping: boolean = false;
+  private scrapeQueued = false;
 
   // Staleness detection: if no DOM changes arrive for this long, re-initialize the observer
   private stalenessTimer: ReturnType<typeof setTimeout> | null = null;
@@ -43,19 +52,33 @@ export class GameScraper extends EventEmitter {
     super();
   }
 
+  public getStatus() {
+    return {
+      running: this.isRunning,
+      starting: this.starting,
+      recovering: Boolean(this.restartTimer),
+      restartCount: this.restartCount,
+      lastActivityAt: new Date(this.lastActivity).toISOString(),
+    };
+  }
+
   public async start() {
-    if (this.isRunning) {
+    this.desiredRunning = true;
+    if (this.isRunning || this.starting) {
       console.log("⚠️ Scraper is already running.");
       return;
     }
 
+    this.starting = true;
+    this.clearRestartTimer();
     console.log("🚀 Starting Game Scraper...");
     const { error } = await trycatch(async () => {
-      this.browser = await chromium.launch({
+      const browser = await chromium.launch({
         headless: process.env.HEADLESS !== "false",
-        args: ["--no-sandbox", "--disable-setuid-sandbox"],
+        args: chromiumArgs,
       });
-      this.page = await this.browser.newPage();
+      this.browser = browser;
+      this.page = await browser.newPage();
 
       // Expose a lightweight signal function — NO data is sent from the browser,
       // this just tells Node that the DOM changed. Scraping happens Node-side.
@@ -64,7 +87,11 @@ export class GameScraper extends EventEmitter {
       });
 
       console.log("🌐 Navigating to game...");
-      await this.page.goto(PAKAKUMI_URL, { waitUntil: "load" });
+      await this.page.goto(PAKAKUMI_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 45_000,
+      });
+      if (!this.desiredRunning) throw new Error("Scraper start was cancelled");
 
       // SKIPPED: // Configure settings to show more players
       // await this.configureGameSettings();
@@ -72,53 +99,88 @@ export class GameScraper extends EventEmitter {
       // Attach MutationObserver that calls our signal function
       await this.setupObserver();
 
-      // Initial scrape to populate previousBustIDs (no events emitted)
-      await this.initialScrape();
+      // Retain IDs across restarts so rounds that occurred during downtime can
+      // be recovered instead of being silently accepted as a new baseline.
+      if (this.previousBustIDs.size === 0) await this.initialScrape();
+      else await this.checkForChanges();
 
-      this.browser.on("disconnected", () => {
-        console.error("❌ Browser disconnected! Attempting restart in 5s...");
+      browser.on("disconnected", () => {
+        if (this.browser === browser) {
+          this.browser = null;
+          this.page = null;
+        }
         this.isRunning = false;
         this.clearDebounce();
         this.clearStalenessTimer();
-        this.restartCount++;
-        if (this.restartCount > this.MAX_RESTARTS) {
-          console.error(
-            "🛑 Scraper exceeded max restarts. Halting permanently.",
-          );
-          return;
-        }
-        setTimeout(() => this.start(), 5000);
+        if (!this.desiredRunning) return;
+        console.error("❌ Browser disconnected! Attempting restart in 5s...");
+        this.scheduleRestart(5_000);
       });
 
       this.isRunning = true;
-      this.restartCount = 0; // Reset on successful start
+      this.clearStableTimer();
+      this.stableTimer = setTimeout(() => {
+        this.restartCount = 0;
+        this.stableTimer = null;
+      }, 10 * 60_000);
       this.lastActivity = Date.now();
       this.resetStalenessTimer();
       console.log("✅ Scraper started and listening for rounds.");
     });
+    this.starting = false;
 
     if (error) {
       console.error("❌ Error starting scraper:", error);
-      this.stop();
-      this.restartCount++;
-      if (this.restartCount > this.MAX_RESTARTS) {
-        console.error("🛑 Scraper exceeded max restarts. Halting permanently.");
-        return;
-      }
-      setTimeout(() => this.start(), 10000);
+      await this.closeBrowser();
+      this.scheduleRestart(10_000);
     }
   }
 
   public async stop() {
+    this.desiredRunning = false;
+    this.isRunning = false;
+    this.clearRestartTimer();
+    this.clearStableTimer();
     this.clearDebounce();
     this.clearStalenessTimer();
-    if (this.browser) {
-      await this.browser.close();
-      this.browser = null;
-      this.page = null;
-    }
-    this.isRunning = false;
+    await this.closeBrowser();
     console.log("🛑 Scraper stopped.");
+  }
+
+  private async closeBrowser() {
+    const browser = this.browser;
+    this.browser = null;
+    this.page = null;
+    this.isRunning = false;
+    if (!browser) return;
+    browser.removeAllListeners("disconnected");
+    await browser.close().catch((error) => {
+      console.warn("Failed to close scraper browser cleanly:", error);
+    });
+  }
+
+  private scheduleRestart(delayMs: number) {
+    if (!this.desiredRunning || this.restartTimer) return;
+    this.restartCount++;
+    if (this.restartCount > this.MAX_RESTARTS) {
+      this.desiredRunning = false;
+      console.error("🛑 Scraper exceeded max restarts. Halting permanently.");
+      return;
+    }
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      void this.start();
+    }, delayMs);
+  }
+
+  private clearRestartTimer() {
+    if (this.restartTimer) clearTimeout(this.restartTimer);
+    this.restartTimer = null;
+  }
+
+  private clearStableTimer() {
+    if (this.stableTimer) clearTimeout(this.stableTimer);
+    this.stableTimer = null;
   }
 
   private clearStalenessTimer() {
@@ -155,13 +217,10 @@ export class GameScraper extends EventEmitter {
       this.observerSetupFailures++;
       if (this.observerSetupFailures >= this.MAX_OBSERVER_FAILURES) {
         console.error("🛑 Observer setup failed too many times. Full browser restart...");
-        this.isRunning = false;
         this.clearStalenessTimer();
         this.observerSetupFailures = 0;
-        this.restartCount++;
-        if (this.restartCount <= this.MAX_RESTARTS) {
-          setTimeout(() => this.start(), 5000);
-        }
+        await this.closeBrowser();
+        this.scheduleRestart(5_000);
       } else {
         // Retry after a short delay instead of full restart
         this.resetStalenessTimer();
@@ -178,9 +237,11 @@ export class GameScraper extends EventEmitter {
    * Debounces rapid-fire mutations into a single scrape after 100ms of quiet.
    */
   private scheduleScrape() {
-    // If we're already mid-scrape, just mark that another change came in
-    // (the current scrape will pick it up since it reads the latest DOM state)
-    if (this.scraping) return;
+    if (!this.desiredRunning) return;
+    if (this.scraping) {
+      this.scrapeQueued = true;
+      return;
+    }
 
     // Reset staleness timer on any activity
     this.lastActivity = Date.now();
@@ -214,6 +275,10 @@ export class GameScraper extends EventEmitter {
       console.error("❌ Error during scrape:", err);
     } finally {
       this.scraping = false;
+      if (this.scrapeQueued) {
+        this.scrapeQueued = false;
+        this.scheduleScrape();
+      }
     }
   }
 
@@ -256,20 +321,24 @@ export class GameScraper extends EventEmitter {
   private async setupObserver() {
     if (!this.page) return;
 
-    await this.page.evaluate(() => {
+    await this.page
+      .locator("table.css-1a87jyo tbody")
+      .first()
+      .waitFor({ state: "attached", timeout: 30_000 });
+    const attached = await this.page.evaluate(() => {
       const targetNode = document.querySelector("table.css-1a87jyo tbody");
-      if (!targetNode) {
-        console.error("❌ Target Node not found!");
-        setTimeout(() => window.location.reload(), 5000);
-        return;
-      }
+      if (!targetNode) return false;
 
+      (window as any).__pakakumiObserver?.disconnect();
       const observer = new MutationObserver(() => {
         (window as any).__onDomChanged();
       });
       observer.observe(targetNode, { childList: true, subtree: true });
+      (window as any).__pakakumiObserver = observer;
       console.log("📡 DOM change observer attached.");
+      return true;
     });
+    if (!attached) throw new Error("Pakakumi round-history table was not found");
 
     // Reset observer failure counter on successful attach
     this.observerSetupFailures = 0;
@@ -355,7 +424,10 @@ export class GameScraper extends EventEmitter {
         maxSpending,
       };
     } catch (error) {
-      console.error("❌ Error scraping data:", (error as any).message);
+      console.error(
+        "❌ Error scraping data:",
+        error instanceof Error ? error.message : "Unknown scraper error",
+      );
       return null;
     }
   }
@@ -364,12 +436,12 @@ export class GameScraper extends EventEmitter {
     const data = await this.scrapeGameData();
     if (!data || data.busts.length === 0) return;
 
-    const newBusts: { bust: number; id: string }[] = [];
+    const newBusts: { bust: number; id: string; sourceIndex: number }[] = [];
 
     for (let i = 0; i < Math.min(data.busts.length, 30); i++) {
       const bustID = this.generateBustID(data.busts, i);
       if (!this.previousBustIDs.has(bustID)) {
-        newBusts.push({ bust: data.busts[i], id: bustID });
+        newBusts.push({ bust: data.busts[i], id: bustID, sourceIndex: i });
         this.previousBustIDs.add(bustID);
       }
     }
@@ -377,16 +449,21 @@ export class GameScraper extends EventEmitter {
     if (newBusts.length === 0) return;
 
     for (const item of newBusts.reverse()) {
+      // Player/financial values on the page belong only to the newest round.
+      // Preserve recovered bust history without fabricating metrics for older
+      // rounds that appeared while the scraper was disconnected or busy.
+      const metricsComplete = item.sourceIndex === 0;
       const roundData: RoundData = {
         bust: item.bust,
         bustId: item.id,
-        playersOnline: data.onlineCount,
-        playersPlaying: data.playingCount,
-        totalAmountPlayed: data.totalCashPlayed,
-        totalAmountWon: data.totalWinAmount,
-        totalAmountLost: data.totalLossAmount,
-        averageAmountPlayed: data.averageSpending,
-        maxAmountPlayed: data.maxSpending,
+        playersOnline: metricsComplete ? data.onlineCount : null,
+        playersPlaying: metricsComplete ? data.playingCount : null,
+        totalAmountPlayed: metricsComplete ? data.totalCashPlayed : null,
+        totalAmountWon: metricsComplete ? data.totalWinAmount : null,
+        totalAmountLost: metricsComplete ? data.totalLossAmount : null,
+        averageAmountPlayed: metricsComplete ? data.averageSpending : null,
+        maxAmountPlayed: metricsComplete ? data.maxSpending : null,
+        metricsComplete,
       };
 
       this.emit("roundEnded", roundData);

@@ -9,7 +9,9 @@ import {
   jsonb,
   boolean,
   real,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 export const users = pgTable(
   "users",
@@ -123,6 +125,7 @@ export const rounds = pgTable(
     totalReserveFunds: numeric("total_reserve_funds", { mode: "number" }),
     roundsSinceLast3000: integer("rounds_since_last_3000"),
     gapDetected: boolean("gap_detected").default(false).notNull(),
+    metricsComplete: boolean("metrics_complete").default(true).notNull(),
   },
   (table) => [
     index("created_at_idx").on(table.createdAt),
@@ -165,6 +168,10 @@ export const strategyAccess = pgTable(
   (table) => [
     index("strategy_access_strategy_idx").on(table.strategyId),
     index("strategy_access_user_idx").on(table.userId),
+    uniqueIndex("strategy_access_strategy_user_unique").on(
+      table.strategyId,
+      table.userId,
+    ),
   ],
 );
 
@@ -178,7 +185,15 @@ export const botSessions = pgTable(
     strategyId: uuid("strategy_id")
       .notNull()
       .references(() => strategies.id),
-    status: text("status").notNull(), // 'active', 'stopped', 'completed', 'failed'
+    credentialId: uuid("credential_id").references(
+      () => pakakumiCredentials.id,
+      { onDelete: "set null" },
+    ),
+    // One-time credentials are encrypted by the server and erased as soon as
+    // the local worker claims the session.
+    encryptedPhone: text("encrypted_phone"),
+    encryptedPassword: text("encrypted_password"),
+    status: text("status").notNull(), // 'pending', 'starting', 'active', 'stopped', 'completed', 'failed'
     initialCapital: numeric("initial_capital", { mode: "number" }).notNull(),
     currentCapital: numeric("current_capital", { mode: "number" }).notNull(),
     totalProfit: numeric("total_profit", { mode: "number" }).notNull(),
@@ -186,10 +201,14 @@ export const botSessions = pgTable(
     currentStep: integer("current_step").default(0), // Track progress in sequence
     startedAt: timestamp("started_at", { mode: "date" }).defaultNow().notNull(),
     endedAt: timestamp("ended_at", { mode: "date" }),
+    heartbeatAt: timestamp("heartbeat_at", { mode: "date" }),
   },
   (table) => [
     index("bot_sessions_user_idx").on(table.userId),
     index("bot_sessions_status_idx").on(table.status),
+    uniqueIndex("bot_sessions_one_live_per_user_idx")
+      .on(table.userId)
+      .where(sql`${table.status} in ('pending', 'starting', 'active')`),
   ],
 );
 

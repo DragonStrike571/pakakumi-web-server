@@ -10,10 +10,12 @@ import { trycatch } from "../utils/try-catch.js";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth.js";
 import { AuthenticatedRequest } from "../types/express.js";
+import { requireActiveAccess } from "../middleware/access.js";
 
 const router = Router();
 
 router.use(requireAuth);
+router.use(requireActiveAccess());
 
 const strategyIdSchema = z.object({
   id: z.uuid(),
@@ -137,7 +139,7 @@ router.post("/", async (req: Request, res: Response) => {
         userId,
         name,
         type: config.type,
-        config: config as any,
+        config,
         visibility: validation.data.visibility,
       })
       .returning();
@@ -180,7 +182,7 @@ router.put("/:id", async (req: Request, res: Response) => {
         ...(validation.data.name && { name: validation.data.name }),
         ...(validation.data.config && {
           type: validation.data.config.type,
-          config: validation.data.config as any,
+          config: validation.data.config,
         }),
         ...(validation.data.visibility && {
           visibility: validation.data.visibility,
@@ -385,6 +387,9 @@ router.post("/:id/share", async (req: Request, res: Response) => {
         strategyId,
         userId: targetUser.id,
       })
+      .onConflictDoNothing({
+        target: [strategyAccess.strategyId, strategyAccess.userId],
+      })
       .returning();
     return result[0];
   });
@@ -394,12 +399,17 @@ router.post("/:id/share", async (req: Request, res: Response) => {
     return res.status(500).json({ error: "Failed to share strategy" });
   }
 
+  if (!access) {
+    res.status(409).json({ error: "Already shared with this user" });
+    return;
+  }
+
   res.status(201).json({
-    id: access!.id,
+    id: access.id,
     userId: targetUser.id,
     userName: targetUser.name,
     userEmail: targetUser.email,
-    createdAt: access!.createdAt,
+    createdAt: access.createdAt,
   });
 });
 

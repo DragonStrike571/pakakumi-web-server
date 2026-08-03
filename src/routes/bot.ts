@@ -6,15 +6,15 @@ import {
   strategyAccess,
   pakakumiCredentials,
 } from "../db/schema.js";
-import { eq, and, or, exists, desc } from "drizzle-orm";
+import { eq, and, desc, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { trycatch } from "../utils/try-catch.js";
 import { requireAuth } from "../middleware/auth.js";
 import { AuthenticatedRequest } from "../types/express.js";
 import { requireActiveAccess } from "../middleware/access.js";
 import rateLimit from "express-rate-limit";
-import { decrypt } from "../utils/crypto.js";
-import { botManager } from "../services/bot/manager.js";
+import { encrypt } from "../utils/crypto.js";
+import { strategyConfigSchema } from "../validation/strategies.js";
 
 const router = Router();
 
@@ -31,18 +31,18 @@ const botLimiter = rateLimit({
 const startBotSchema = z
   .object({
     strategyId: z.uuid(),
-    initialCapital: z.number().positive(),
+    initialCapital: z.number().positive().finite().max(1_000_000_000),
     credentialId: z.string().uuid().optional(),
     auth: z
       .object({
-        phone: z.string().min(1),
-        pass: z.string().min(1),
+        phone: z.string().trim().min(1).max(50),
+        pass: z.string().min(1).max(256),
       })
       .optional(),
   })
-  .refine((data) => data.credentialId || data.auth, {
-    message: "Either credentialId or auth must be provided",
-    path: ["credentialId"],
+  .refine((data) => Boolean(data.credentialId) !== Boolean(data.auth), {
+    message: "Provide exactly one of credentialId or auth",
+    path: ["auth"],
   });
 
 router.post("/start", botLimiter, async (req: Request, res: Response) => {
@@ -60,8 +60,9 @@ router.post("/start", botLimiter, async (req: Request, res: Response) => {
   } = validation.data;
   const userId = (req as AuthenticatedRequest).user.id;
 
-  let auth = rawAuth;
-
+  // Validate a saved credential without decrypting it on the web server. The
+  // local worker owns execution and resolves the credential after claiming the
+  // session.
   if (credentialId) {
     const { data: cred, error } = await trycatch(async () => {
       return await db.query.pakakumiCredentials.findFirst({
@@ -77,21 +78,19 @@ router.post("/start", botLimiter, async (req: Request, res: Response) => {
       return;
     }
 
-    auth = {
-      phone: decrypt(cred.phone),
-      pass: decrypt(cred.password),
-    };
   }
 
-  if (!auth) {
-    res.status(400).json({ error: "Authentication details missing" });
-    return;
-  }
-
-  // Check concurrency limit
-  const activeSessions = botManager.getActiveSessionsForUser(userId);
-  if (activeSessions.length >= 1) {
-    res.status(429).json({ error: "User already has an active bot session." });
+  const liveSession = await db.query.botSessions.findFirst({
+    where: and(
+      eq(botSessions.userId, userId),
+      inArray(botSessions.status, ["pending", "starting", "active"]),
+    ),
+  });
+  if (liveSession) {
+    res.status(409).json({
+      error: "You already have a pending or active bot session.",
+      sessionId: liveSession.id,
+    });
     return;
   }
 
@@ -143,9 +142,8 @@ router.post("/start", botLimiter, async (req: Request, res: Response) => {
     if (!hasAccess) {
       throw new Error("Strategy access denied");
     }
-
-    if (!auth) {
-      throw new Error("Auth info missing");
+    if (!strategyConfigSchema.safeParse(strategy.config).success) {
+      throw new Error("Strategy configuration is invalid");
     }
 
     // 2. Only insert session AFTER all validation passes
@@ -154,6 +152,9 @@ router.post("/start", botLimiter, async (req: Request, res: Response) => {
       .values({
         userId,
         strategyId,
+        credentialId: credentialId ?? null,
+        encryptedPhone: rawAuth ? encrypt(rawAuth.phone) : null,
+        encryptedPassword: rawAuth ? encrypt(rawAuth.pass) : null,
         status: "pending",
         initialCapital,
         currentCapital: initialCapital,
@@ -175,6 +176,10 @@ router.post("/start", botLimiter, async (req: Request, res: Response) => {
       res
         .status(403)
         .json({ error: "You do not have access to this strategy" });
+    } else if (err.message === "Strategy configuration is invalid") {
+      res.status(422).json({ error: err.message });
+    } else if ((err as { code?: string }).code === "23505") {
+      res.status(409).json({ error: "You already have a live bot session" });
     } else {
       res.status(500).json({ error: err.message || "Failed to start bot" });
     }
@@ -186,7 +191,12 @@ router.post("/start", botLimiter, async (req: Request, res: Response) => {
 
 // POST /:sessionId/stop — with ownership check
 router.post("/:sessionId/stop", async (req: Request, res: Response) => {
-  const sessionId = req.params.sessionId as string;
+  const parsedSessionId = z.uuid().safeParse(req.params.sessionId);
+  if (!parsedSessionId.success) {
+    res.status(400).json({ error: "Invalid session ID" });
+    return;
+  }
+  const sessionId = parsedSessionId.data;
   const userId = (req as AuthenticatedRequest).user.id;
 
   // Verify ownership
@@ -198,11 +208,20 @@ router.post("/:sessionId/stop", async (req: Request, res: Response) => {
     res.status(404).json({ error: "Session not found or you do not own it" });
     return;
   }
+  if (!["pending", "starting", "active"].includes(session.status)) {
+    res.json({ status: session.status });
+    return;
+  }
 
   const { error } = await trycatch(async () => {
     return await db
       .update(botSessions)
-      .set({ status: "stopped", endedAt: new Date() })
+      .set({
+        status: "stopped",
+        endedAt: new Date(),
+        encryptedPhone: null,
+        encryptedPassword: null,
+      })
       .where(eq(botSessions.id, sessionId));
   });
 
@@ -222,7 +241,8 @@ router.get("/status", async (req: Request, res: Response) => {
       .select()
       .from(botSessions)
       .where(eq(botSessions.userId, userId))
-      .orderBy(desc(botSessions.startedAt));
+      .orderBy(desc(botSessions.startedAt))
+      .limit(100);
   });
 
   if (error) {

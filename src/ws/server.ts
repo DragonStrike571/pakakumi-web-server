@@ -2,6 +2,8 @@ import { Server } from "http";
 import { WebSocket, WebSocketServer } from "ws";
 import { Round } from "../validation/rounds.js";
 import { CORS_ORIGINS } from "../config/cors.js";
+import { auth } from "../lib/auth.js";
+import { fromNodeHeaders } from "better-auth/node";
 
 // ─── Typed WS Payload Interfaces ────────────────────────────────────────────
 
@@ -72,7 +74,7 @@ export function attachWebSocketServer(httpServer: Server) {
     server: httpServer,
     path: "/ws",
     maxPayload: 1024 * 1024,
-    verifyClient: (info, cb) => {
+    verifyClient: async (info, cb) => {
       const origin = info.origin;
       // Remove trailing slash from origin if present
       const cleanOrigin = origin.endsWith("/") ? origin.slice(0, -1) : origin;
@@ -82,10 +84,30 @@ export function attachWebSocketServer(httpServer: Server) {
         cb(false, 401, "Unauthorized");
         return;
       }
-      if (CORS_ORIGINS.includes(cleanOrigin)) {
-        cb(true);
-      } else {
+      if (!CORS_ORIGINS.includes(cleanOrigin)) {
         cb(false, 403, `Forbidden: ${cleanOrigin}`);
+        return;
+      }
+
+      try {
+        const session = await auth.api.getSession({
+          headers: fromNodeHeaders(info.req.headers),
+        });
+        const user = session?.user as
+          | (NonNullable<typeof session>["user"] & {
+              role?: string;
+              accessStatus?: string;
+            })
+          | undefined;
+        const allowed = Boolean(
+          user &&
+          (user.role === "admin" ||
+            user.accessStatus === "active" ||
+            user.accessStatus === "telegram_premium"),
+        );
+        cb(allowed, allowed ? undefined : 401, allowed ? undefined : "Unauthorized");
+      } catch {
+        cb(false, 503, "Authentication unavailable");
       }
     },
   });
@@ -135,5 +157,17 @@ export function attachWebSocketServer(httpServer: Server) {
     broadcastPreSerialized(wss, JSON.stringify(payload));
   }
 
-  return { broadcastRoundUpdate, broadcastAnalysisUpdate };
+  async function closeWebSocketServer() {
+    clearInterval(interval);
+    for (const client of wss.clients) client.terminate();
+    await new Promise<void>((resolve) => {
+      wss.close(() => resolve());
+    });
+  }
+
+  return {
+    broadcastRoundUpdate,
+    broadcastAnalysisUpdate,
+    closeWebSocketServer,
+  };
 }

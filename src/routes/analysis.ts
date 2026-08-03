@@ -19,11 +19,13 @@ import {
   getSystemStats,
 } from "../services/analysis/engine.js";
 import { z } from "zod";
+import { requireActiveAccess } from "../middleware/access.js";
 
 const router = Router();
 
 // All analysis endpoints require authentication
 router.use(requireAuth);
+router.use(requireActiveAccess());
 
 /**
  * GET /analysis/current

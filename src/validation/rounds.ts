@@ -17,6 +17,7 @@ export const roundSchema = z.object({
   totalReserveFunds: z.number().nullable().optional(),
   roundsSinceLast3000: z.number().int().nullable().optional(),
   gapDetected: z.boolean().optional(),
+  metricsComplete: z.boolean().optional(),
 });
 
 // Schema for creating a new round (omitting system managed fields)
@@ -33,6 +34,7 @@ export const insertRoundSchema = z.object({
   totalReserveFunds: z.coerce.number().nonnegative().optional(),
   roundsSinceLast3000: z.number().int().nonnegative().optional(),
   gapDetected: z.boolean().optional(),
+  metricsComplete: z.boolean().optional(),
 });
 
 // Schema for updating a round
@@ -46,8 +48,36 @@ export const getRoundsQuerySchema = z.object({
   endDate: z.iso.datetime().optional(),
   minBust: z.coerce.number().nonnegative().optional(),
   maxBust: z.coerce.number().nonnegative().optional(),
-  bustId: z.string().optional(),
+  bustId: z.string().trim().min(1).max(500).optional(),
+  minPlayersOnline: z.coerce.number().int().nonnegative().optional(),
+  maxPlayersOnline: z.coerce.number().int().nonnegative().optional(),
+  minPlayersPlaying: z.coerce.number().int().nonnegative().optional(),
+  maxPlayersPlaying: z.coerce.number().int().nonnegative().optional(),
+  minReserveFunds: z.coerce.number().optional(),
+  maxReserveFunds: z.coerce.number().optional(),
+  minRoundsSince3000: z.coerce.number().int().nonnegative().optional(),
+  maxRoundsSince3000: z.coerce.number().int().nonnegative().optional(),
+  gapDetected: z.enum(["true", "false"]).transform((value) => value === "true").optional(),
+  metricsComplete: z.enum(["true", "false"]).transform((value) => value === "true").optional(),
   sort: z.enum(["asc", "desc"]).default("desc"),
+}).superRefine((value, context) => {
+  const ranges: Array<[keyof typeof value, keyof typeof value]> = [
+    ["minBust", "maxBust"],
+    ["minPlayersOnline", "maxPlayersOnline"],
+    ["minPlayersPlaying", "maxPlayersPlaying"],
+    ["minReserveFunds", "maxReserveFunds"],
+    ["minRoundsSince3000", "maxRoundsSince3000"],
+  ];
+  for (const [minKey, maxKey] of ranges) {
+    const min = value[minKey] as number | undefined;
+    const max = value[maxKey] as number | undefined;
+    if (min !== undefined && max !== undefined && min > max) {
+      context.addIssue({ code: "custom", path: [maxKey], message: `${String(maxKey)} must be at least ${String(minKey)}` });
+    }
+  }
+  if (value.startDate && value.endDate && value.startDate > value.endDate) {
+    context.addIssue({ code: "custom", path: ["endDate"], message: "endDate must be after startDate" });
+  }
 });
 
 // Schema for validating round ID in params

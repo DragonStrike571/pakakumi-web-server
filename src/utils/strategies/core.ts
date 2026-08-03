@@ -1,9 +1,41 @@
 export type StrategyType = "sequence" | "algorithm";
+export type ExecutionOutcome = "win" | "loss";
+export type ExecutionAction = "strategy" | "continue" | "reset" | "pause" | "stop";
+export type ExecutionRuleMetric =
+  | "bust" | "capital" | "profit" | "drawdown"
+  | "consecutiveWins" | "consecutiveLosses"
+  | "roundsSinceWin" | "roundsSinceLoss"
+  | "roundsSinceLast3000" | "totalReserveFunds" | "roundIndex";
+export interface ExecutionRule {
+  id: string;
+  event?: "any" | ExecutionOutcome;
+  match?: "all" | "any";
+  conditions: Array<{
+    metric: ExecutionRuleMetric;
+    operator: "eq" | "neq" | "gt" | "gte" | "lt" | "lte";
+    value: number;
+  }>;
+  action: {
+    type: "stop" | "pause" | "reset" | "continue" | "jump";
+    rounds?: number;
+    step?: number;
+  };
+  once?: boolean;
+}
+export interface ExecutionConfig {
+  afterWin?: { action: ExecutionAction; pauseRounds?: number };
+  afterLoss?: { action: ExecutionAction; pauseRounds?: number };
+  rules?: ExecutionRule[];
+  maxBets?: number;
+  stopLoss?: number;
+  takeProfit?: number;
+}
 
 export interface StrategyConfig {
   type: StrategyType;
   stopAfterWin?: boolean;
   autoCashout?: number;
+  execution?: ExecutionConfig;
 
   algorithm?: {
     capital: number;
@@ -122,7 +154,7 @@ export function executeStrategy(
   config: StrategyConfig,
   currentStep: number,
   lastRoundResult?: { bust: number; betPlaced: number; cashout: number },
-): { action: BetAction; nextStep: number } {
+): { action: BetAction; nextStep: number; retryStep: number } {
   const bets =
     config.type === "algorithm" && config.algorithm
       ? generateAlgorithmBets(
@@ -140,6 +172,7 @@ export function executeStrategy(
     return {
       action: { shouldBet: false, amount: 0, cashout: 0, stop: true },
       nextStep: 0,
+      retryStep: 0,
     };
   }
 
@@ -152,12 +185,13 @@ export function executeStrategy(
       return {
         action: { shouldBet: false, amount: 0, cashout: 0, stop: true },
         nextStep: currentStep,
+        retryStep: currentStep,
       };
     }
 
     // Reset to beginning on win
     if (won) {
-      const firstBet = bets[0];
+      const firstBet = bets[0]!;
       const finalCashout = config.autoCashout || firstBet.cashout;
       return {
         action: {
@@ -167,6 +201,7 @@ export function executeStrategy(
           stop: false,
         },
         nextStep: 1,
+        retryStep: 0,
       };
     }
 
@@ -175,7 +210,7 @@ export function executeStrategy(
 
   // Wrap around if strategy exhausted (restart from beginning)
   if (currentStep >= bets.length) {
-    const firstBet = bets[0];
+    const firstBet = bets[0]!;
     const finalCashout = config.autoCashout || firstBet.cashout;
     return {
       action: {
@@ -185,10 +220,11 @@ export function executeStrategy(
         stop: false,
       },
       nextStep: 1,
+      retryStep: 0,
     };
   }
 
-  const bet = bets[currentStep];
+  const bet = bets[currentStep]!;
   const finalCashout = config.autoCashout || bet.cashout;
 
   return {
@@ -199,5 +235,6 @@ export function executeStrategy(
       stop: false,
     },
     nextStep: currentStep + 1,
+    retryStep: currentStep,
   };
 }

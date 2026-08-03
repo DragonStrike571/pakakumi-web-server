@@ -34,9 +34,9 @@ const balanceLimiter = rateLimit({
 // ────────────────────── Credential CRUD ──────────────────────
 
 const saveCredentialSchema = z.object({
-  label: z.string().min(1, "Label is required"),
-  phone: z.string().min(1, "Phone is required"),
-  password: z.string().min(1, "Password is required"),
+  label: z.string().trim().min(1, "Label is required").max(80),
+  phone: z.string().trim().min(5, "Phone is required").max(32),
+  password: z.string().min(1, "Password is required").max(256),
 });
 
 /**
@@ -140,9 +140,12 @@ router.delete("/credentials/:id", async (req: Request, res: Response) => {
 
 const balanceCheckSchema = z.object({
   credentialId: z.uuid().optional(),
-  phone: z.string().min(1).optional(),
-  pass: z.string().min(1).optional(),
-});
+  phone: z.string().trim().min(5).max(32).optional(),
+  pass: z.string().min(1).max(256).optional(),
+}).refine(
+  (value) => Boolean(value.credentialId) !== Boolean(value.phone && value.pass),
+  { message: "Provide either credentialId or phone+pass, not both" },
+);
 
 /**
  * POST /account/balance — Check Pakakumi balance via headless browser
@@ -260,8 +263,6 @@ router.post("/balance", balanceLimiter, async (req: Request, res: Response) => {
         return null;
       });
 
-      console.log("[Balance] Raw balance text:", balanceText);
-
       if (balanceText) {
         const numStr = balanceText.replace(/[^0-9.,]/g, "").replace(/,/g, "");
         const parsed = parseFloat(numStr);
@@ -293,7 +294,6 @@ router.post("/balance", balanceLimiter, async (req: Request, res: Response) => {
     return;
   }
 
-  console.log("[Balance] Returning balance:", balance);
   res.json({ balance: balance ?? null });
 });
 
