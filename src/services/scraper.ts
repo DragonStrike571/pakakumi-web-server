@@ -2,6 +2,7 @@ import { chromium, Page, Browser } from "playwright";
 import { EventEmitter } from "events";
 import { config } from "dotenv";
 import { trycatch } from "../utils/try-catch.js";
+import { runBackgroundTask } from "../utils/background-task.js";
 
 config();
 
@@ -21,17 +22,19 @@ export interface RoundData {
   averageAmountPlayed: number | null;
   maxAmountPlayed: number | null;
   metricsComplete: boolean;
+  sourceGap?: boolean;
 }
 
 export class GameScraper extends EventEmitter {
   private browser: Browser | null = null;
   private page: Page | null = null;
   private isRunning: boolean = false;
-  private previousBustIDs = new Set<string>();
+  private checkpoint: string | null = null;
+  private capture: ((batch: RoundData[], checkpoint: string) => Promise<void>) | null = null;
   private restartCount: number = 0;
-  private readonly MAX_RESTARTS = 10;
   private desiredRunning = false;
   private starting = false;
+  private captureError: string | null = null;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private stableTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -52,12 +55,18 @@ export class GameScraper extends EventEmitter {
     super();
   }
 
+  public setCaptureHandler(checkpoint: string | null, capture: (batch: RoundData[], checkpoint: string) => Promise<void>) {
+    this.checkpoint = checkpoint;
+    this.capture = capture;
+  }
+
   public getStatus() {
     return {
       running: this.isRunning,
       starting: this.starting,
       recovering: Boolean(this.restartTimer),
       restartCount: this.restartCount,
+      captureError: this.captureError,
       lastActivityAt: new Date(this.lastActivity).toISOString(),
     };
   }
@@ -101,8 +110,7 @@ export class GameScraper extends EventEmitter {
 
       // Retain IDs across restarts so rounds that occurred during downtime can
       // be recovered instead of being silently accepted as a new baseline.
-      if (this.previousBustIDs.size === 0) await this.initialScrape();
-      else await this.checkForChanges();
+      await this.checkForChanges();
 
       browser.on("disconnected", () => {
         if (this.browser === browser) {
@@ -162,14 +170,10 @@ export class GameScraper extends EventEmitter {
   private scheduleRestart(delayMs: number) {
     if (!this.desiredRunning || this.restartTimer) return;
     this.restartCount++;
-    if (this.restartCount > this.MAX_RESTARTS) {
-      this.desiredRunning = false;
-      console.error("🛑 Scraper exceeded max restarts. Halting permanently.");
-      return;
-    }
+    delayMs = Math.min(60_000, delayMs * 2 ** Math.min(this.restartCount - 1, 4));
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
-      void this.start();
+      runBackgroundTask("Scraper restart", () => this.start());
     }, delayMs);
   }
 
@@ -193,7 +197,7 @@ export class GameScraper extends EventEmitter {
   private resetStalenessTimer() {
     this.clearStalenessTimer();
     this.stalenessTimer = setTimeout(() => {
-      this.handleStaleness();
+      runBackgroundTask("Scraper staleness recovery", () => this.handleStaleness());
     }, this.STALENESS_TIMEOUT_MS);
   }
 
@@ -250,7 +254,7 @@ export class GameScraper extends EventEmitter {
     this.clearDebounce();
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
-      this.performScrape();
+      runBackgroundTask("Scraper polling", () => this.performScrape());
     }, 100);
   }
 
@@ -272,6 +276,7 @@ export class GameScraper extends EventEmitter {
     try {
       await this.checkForChanges();
     } catch (err) {
+      this.captureError = err instanceof Error ? err.message : String(err);
       console.error("❌ Error during scrape:", err);
     } finally {
       this.scraping = false;
@@ -348,20 +353,7 @@ export class GameScraper extends EventEmitter {
    * Initial scrape to populate previousBustIDs without emitting events.
    */
   private async initialScrape() {
-    if (!this.page) return;
-
-    console.log("🔍 Initial scrape...");
-    const data = await this.scrapeGameData();
-    if (!data) return;
-
-    for (let i = 0; i < Math.min(data.busts.length, 40); i++) {
-      const bustID = this.generateBustID(data.busts, i);
-      this.previousBustIDs.add(bustID);
-    }
-
-    console.log(
-      `✅ Initial scrape complete. Tracking ${this.previousBustIDs.size} bust IDs.`,
-    );
+    await this.checkForChanges();
   }
 
   // ---------------------------------------------------------------------------
@@ -372,26 +364,27 @@ export class GameScraper extends EventEmitter {
     if (!this.page) return null;
 
     try {
-      const bustElements = await this.page
-        .locator("table.css-1a87jyo tbody tr.css-15iar3s td span.css-hwpcld")
-        .allInnerTexts();
+      // One browser task reads a coherent DOM snapshot, including financial rows.
+      const snapshot = await this.page.evaluate(() => {
+        const texts = (selector: string) => Array.from(document.querySelectorAll(selector)).map(el => el.textContent || "");
+        return {
+          busts: texts("table.css-1a87jyo tbody tr.css-15iar3s td span.css-hwpcld"),
+          counts: texts("div.css-eb3kfa strong"),
+          amounts: texts("div.css-afms4i table.css-1a87jyo tbody tr td:nth-child(3)"),
+          profits: texts("div.css-afms4i table.css-1a87jyo tbody tr td:nth-child(4)"),
+        };
+      });
+      const bustElements = snapshot.busts;
       const busts = bustElements
-        .map((text) => parseFloat(text.replace("x", "").replace(",", "")))
+        .map((text) => Number(text.trim().replace(/x$/i, "").replace(/,/g, "")))
         .slice(0, 40);
+      if (busts.some(b => !Number.isFinite(b) || b < 1)) throw new Error("Invalid bust history");
 
-      const onlineCountStr = await this.page
-        .locator("(//div[contains(@class, 'css-eb3kfa')]//strong)[1]")
-        .innerText();
-      const playingCountStr = await this.page
-        .locator("(//div[contains(@class, 'css-eb3kfa')]//strong)[2]")
-        .innerText();
+      const onlineCountStr = snapshot.counts[0] || "";
+      const playingCountStr = snapshot.counts[1] || "";
 
-      const amountElements = await this.page
-        .locator("div.css-afms4i table.css-1a87jyo tbody tr td:nth-child(3)")
-        .allInnerTexts();
-      const profitElements = await this.page
-        .locator("div.css-afms4i table.css-1a87jyo tbody tr td:nth-child(4)")
-        .allInnerTexts();
+      const amountElements = snapshot.amounts;
+      const profitElements = snapshot.profits;
 
       const amounts = amountElements.map((text) =>
         parseFloat(text.replace(/,/g, "")),
@@ -408,20 +401,26 @@ export class GameScraper extends EventEmitter {
         .filter((val) => val < 0)
         .reduce((sum, val) => sum + Math.abs(val), 0);
 
-      const playingCount = parseInt(playingCountStr.replace(/,/g, ""));
+      const playingCount = Number(playingCountStr.replace(/,/g, ""));
       const averageSpending =
         playingCount > 0 ? totalCashPlayed / playingCount : 0;
       const maxSpending = amounts.length > 0 ? Math.max(...amounts) : 0;
+      const onlineCount = Number(onlineCountStr.replace(/,/g, ""));
+      const metricsComplete = amountElements.length > 0 && amounts.length === profits.length &&
+        amounts.length === playingCount && playingCountStr.trim() !== "" && Number.isSafeInteger(playingCount) && playingCount >= 0 &&
+        onlineCountStr.trim() !== "" && Number.isSafeInteger(onlineCount) && onlineCount >= playingCount &&
+        amounts.every(n => Number.isFinite(n) && n >= 0) && profits.every(Number.isFinite);
 
       return {
         busts,
-        onlineCount: parseInt(onlineCountStr.replace(/,/g, "")),
+        onlineCount,
         playingCount,
         totalCashPlayed,
         totalWinAmount,
         totalLossAmount,
         averageSpending,
         maxSpending,
+        metricsComplete,
       };
     } catch (error) {
       console.error(
@@ -434,25 +433,26 @@ export class GameScraper extends EventEmitter {
 
   private async checkForChanges() {
     const data = await this.scrapeGameData();
-    if (!data || data.busts.length === 0) return;
+    if (!data || data.busts.length < 10) throw new Error("Round history is unavailable or incomplete");
 
     const newBusts: { bust: number; id: string; sourceIndex: number }[] = [];
 
-    for (let i = 0; i < Math.min(data.busts.length, 30); i++) {
+    const available = Math.min(Math.max(0, data.busts.length - 9), 31);
+    const anchor = this.checkpoint === null ? -1 : Array.from({ length: available }, (_, i) => this.generateBustID(data.busts, i)).indexOf(this.checkpoint);
+    const count = anchor >= 0 ? anchor : available;
+    for (let i = 0; i < count; i++) {
       const bustID = this.generateBustID(data.busts, i);
-      if (!this.previousBustIDs.has(bustID)) {
-        newBusts.push({ bust: data.busts[i], id: bustID, sourceIndex: i });
-        this.previousBustIDs.add(bustID);
-      }
+      newBusts.push({ bust: data.busts[i], id: bustID, sourceIndex: i });
     }
 
-    if (newBusts.length === 0) return;
+    if (newBusts.length === 0) { this.captureError = null; return; }
 
+    const batch: RoundData[] = [];
     for (const item of newBusts.reverse()) {
       // Player/financial values on the page belong only to the newest round.
       // Preserve recovered bust history without fabricating metrics for older
       // rounds that appeared while the scraper was disconnected or busy.
-      const metricsComplete = item.sourceIndex === 0;
+      const metricsComplete = item.sourceIndex === 0 && data.metricsComplete;
       const roundData: RoundData = {
         bust: item.bust,
         bustId: item.id,
@@ -464,23 +464,16 @@ export class GameScraper extends EventEmitter {
         averageAmountPlayed: metricsComplete ? data.averageSpending : null,
         maxAmountPlayed: metricsComplete ? data.maxSpending : null,
         metricsComplete,
+        sourceGap: anchor < 0 && this.checkpoint !== null && batch.length === 0,
       };
-
-      this.emit("roundEnded", roundData);
-      console.log(
-        `📡 Emitted roundEnded: ${item.bust}x (ID: ${item.id.substring(0, 10)}...)`,
-      );
+      batch.push(roundData);
     }
 
-    // Prune Set to prevent memory leak
-    if (this.previousBustIDs.size > 1000) {
-      this.previousBustIDs.clear();
-      for (let i = 0; i < Math.min(data.busts.length, 40); i++) {
-        const id = this.generateBustID(data.busts, i);
-        this.previousBustIDs.add(id);
-      }
-      console.log("🧹 Pruned previousBustIDs cache.");
-    }
+    if (!this.capture) throw new Error("Durable collection handler is not configured");
+    const checkpoint = this.generateBustID(data.busts, 0);
+    await this.capture(batch, checkpoint);
+    this.checkpoint = checkpoint;
+    this.captureError = null;
   }
 
   private generateBustID(busts: number[], index: number): string {

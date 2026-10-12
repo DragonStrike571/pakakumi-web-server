@@ -1,127 +1,60 @@
-/**
- * Expiry Kicker — Removes expired premium users from the private channel.
- *
- * Runs immediately on start, then hourly. Processes in batches.
- * Features:
- * - Admin guard: Never attempts to ban admins or channel creators
- * - Rate-limited: All Telegram API calls go through the global rate limiter
- * - Batch processing with configurable size
- */
-
 import { db } from "../../db/index.js";
-import { telegramUsers } from "../../db/schema.js";
-import { lt } from "drizzle-orm";
+import { telegramDeliveries, telegramUsers } from "../../db/schema.js";
+import { and, eq, gt, isNull, lt, or } from "drizzle-orm";
 import { bot, invalidateSessionCache } from "./bot.js";
-import {
-  rateLimitedSend,
-  rateLimitedBan,
-  rateLimitedUnban,
-  rateLimitedGetChatMember,
-} from "./rate-limiter.js";
+import type { Api } from "grammy";
 
-const BATCH_SIZE = 20; // Process at most 20 users per cycle to avoid overloading
+const apiSignal = () => AbortSignal.timeout(5000) as unknown as NonNullable<Parameters<Api["getChatMember"]>[2]>;
 
-// Set of admin-level statuses that should never be kicked
-const ADMIN_STATUSES = new Set(["creator", "administrator"]);
+export async function expireSubscriptions(shouldStop = () => false, database: typeof db = db, api: Api | undefined = bot?.api, channel = process.env.PRIVATE_CHANNEL_ID) {
+  if (!channel || !api) return;
+  const cutoff = new Date();
+  let cursor: string | undefined;
+  while (!shouldStop()) {
+    const batch = await database.select().from(telegramUsers).where(and(
+      lt(telegramUsers.expiryTimestamp, cutoff),
+      or(isNull(telegramUsers.revokedAt), lt(telegramUsers.revokedAt, telegramUsers.expiryTimestamp)),
+      cursor ? gt(telegramUsers.chatId, cursor) : undefined,
+    )).orderBy(telegramUsers.chatId).limit(20);
+    if (!batch.length) return;
+    for (const candidate of batch) {
+      cursor = candidate.chatId;
+      if (shouldStop()) return;
+      try {
+        await database.transaction(async tx => {
+          const [user] = await tx.select().from(telegramUsers).where(eq(telegramUsers.chatId, candidate.chatId)).for("update");
+          if (!user?.expiryTimestamp || user.expiryTimestamp >= new Date() ||
+              (user.revokedAt && user.revokedAt >= user.expiryTimestamp)) return;
+          let status: string;
+          try {
+            status = (await api.getChatMember(channel, Number(user.chatId), apiSignal())).status;
+          } catch (error) {
+            if (!/not found|PARTICIPANT_NOT_FOUND/i.test(String(error))) throw error;
+            status = "left";
+          }
+          if (status === "administrator" || status === "creator") return;
+          // Bounded calls keep the shared entitlement row lock valid throughout removal.
+          if (status !== "left" && status !== "kicked") await api.banChatMember(channel, Number(user.chatId), {}, apiSignal());
+          await api.unbanChatMember(channel, Number(user.chatId), { only_if_banned: true }, apiSignal());
+          await tx.update(telegramUsers).set({ revokedAt: new Date() }).where(eq(telegramUsers.chatId, user.chatId));
+          await tx.insert(telegramDeliveries).values({ chatId: user.chatId, kind: "expiry_notice",
+            dedupeKey: `expired:${user.chatId}:${user.expiryTimestamp.toISOString()}` }).onConflictDoNothing();
+          invalidateSessionCache(user.chatId);
+        });
+      } catch (error) { console.error(`Expiry processing failed for ${candidate.chatId}; will retry:`, error); }
+    }
+  }
+}
 
 export function startExpiryKicker() {
-  const PRIVATE_CHANNEL_ID = process.env.PRIVATE_CHANNEL_ID;
-  if (!PRIVATE_CHANNEL_ID || !bot) return () => undefined;
   let stopped = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-
-  const runKicker = async () => {
-    try {
-      const now = new Date();
-
-      const expiredUsers = await db
-        .select()
-        .from(telegramUsers)
-        .where(lt(telegramUsers.expiryTimestamp, now))
-        .limit(BATCH_SIZE);
-
-      for (const user of expiredUsers) {
-        try {
-          // ─── Admin Guard ────────────────────────────────────────────
-          // Check if the user is a channel admin before attempting to kick.
-          // This prevents dangerous operations on admin accounts.
-          const userId = Number(user.chatId);
-          let isAdmin = false;
-
-          try {
-            const member = await rateLimitedGetChatMember(
-              PRIVATE_CHANNEL_ID,
-              userId,
-              "low",
-            );
-            isAdmin = ADMIN_STATUSES.has(member.status);
-          } catch (memberErr: unknown) {
-            // If we can't check membership, the user may not be in the channel.
-            // Treat as safe to skip (not kick blindly).
-            const errMsg = memberErr instanceof Error ? memberErr.message : String(memberErr);
-
-            // "user not found" or "member not found" means they're already out
-            if (errMsg.includes("not found") || errMsg.includes("PARTICIPANT_NOT_FOUND")) {
-              // User already left — just notify them
-              await rateLimitedSend(
-                user.chatId,
-                `⏳ <b>Subscription Expired</b>\n\n` +
-                  `Your premium access has ended.\n\n` +
-                  `Type /start to renew.`,
-                { parse_mode: "HTML" },
-                "low",
-              ).catch(console.error);
-              continue;
-            }
-
-            console.warn(
-              `⚠️ Could not check admin status for ${user.chatId}:`,
-              errMsg,
-            );
-            continue; // Skip this user and retry next cycle
-          }
-
-          if (isAdmin) {
-            // Admins keep channel access — skip silently, no nagging messages
-            continue;
-          }
-
-          // ─── Safe to kick ───────────────────────────────────────────
-          await rateLimitedBan(PRIVATE_CHANNEL_ID, userId, "low");
-          await rateLimitedUnban(PRIVATE_CHANNEL_ID, userId, "low");
-
-          // Invalidate the session cache so the next message doesn't use stale state
-          invalidateSessionCache(user.chatId);
-
-          await rateLimitedSend(
-            user.chatId,
-            `⏳ <b>Subscription Expired</b>\n\n` +
-              `Your premium access has ended. You have been removed from the live channel.\n\n` +
-              `Type /start to renew.`,
-            { parse_mode: "HTML" },
-            "low",
-          ).catch(console.error);
-        } catch (err) {
-          console.error(`Failed to kick user ${user.chatId}:`, err);
-        }
-      }
-
-      if (expiredUsers.length > 0) {
-        console.log(`🔄 Expiry kicker processed ${expiredUsers.length} users.`);
-      }
-    } catch (err) {
-      console.error("Error in Expiry Kicker loop:", err);
-    } finally {
-      // Schedule the next execution only AFTER this one is completely done
-      if (!stopped) timer = setTimeout(runKicker, 60 * 60 * 1000);
-    }
+  let running: Promise<void> = Promise.resolve();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const tick = () => {
+    running = expireSubscriptions(() => stopped).catch(error => console.error("Expiry job failed:", error)).finally(() => {
+      if (!stopped) timer = setTimeout(tick, 60 * 60_000);
+    });
   };
-
-  // Run immediately on first startup, not after 1 hour delay
-  timer = setTimeout(runKicker, 5000);
-  return () => {
-    stopped = true;
-    if (timer) clearTimeout(timer);
-    timer = null;
-  };
+  timer = setTimeout(tick, 5000);
+  return async () => { stopped = true; clearTimeout(timer); await running; };
 }

@@ -3,6 +3,13 @@ import http from "http";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { trycatch } from "./utils/try-catch.js";
+import { CollectionInbox, type CapturedRound } from "./services/collection-inbox.js";
+import { resolve } from "node:path";
+import { drainAnalysis } from "./services/analysis/engine.js";
+import { balancePool } from "./services/balance-pool.js";
+import { backtestRunner } from "./services/backtest/runner.js";
+import { shutdownWithDeadline } from "./utils/shutdown.js";
+import { startDeliveryWorker } from "./services/telegram/outbox.js";
 import roundsRouter from "./routes/rounds.js";
 import { attachWebSocketServer } from "./ws/server.js";
 import { gameScraper } from "./services/scraper.js";
@@ -109,8 +116,11 @@ app.get("/", (req: Request, res: Response) => {
 });
 
 app.get("/health", (req: Request, res: Response) => {
-  res.json({
-    status: gameScraper.getStatus().running ? "ok" : "degraded",
+  const scraper = gameScraper.getStatus();
+  const healthy = scraper.running && scraper.captureError === null && collectionInbox.getStatus().saveFailures === 0;
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? "ok" : "degraded",
+    collection: collectionInbox.getStatus(),
     uptime: process.uptime(),
     scraper: gameScraper.getStatus(),
     scraperState: roundService.getState(),
@@ -145,15 +155,8 @@ const {
 app.locals.broadcastRoundUpdate = broadcastRoundUpdate;
 
 // Initialize Scraper
-gameScraper.on("roundEnded", async (data) => {
-  const { data: savedRound, error } = await trycatch(async () => {
-    return await roundService.processRound(data);
-  });
-
-  if (error) {
-    console.error("❌ Error processing round:", error);
-    return;
-  }
+async function handleRoundEnded(data: CapturedRound) {
+  const savedRound = await roundService.processRound(data);
 
   if (savedRound) {
     broadcastRoundUpdate({
@@ -167,7 +170,8 @@ gameScraper.on("roundEnded", async (data) => {
       totalReserveFunds: toNullableNumber(savedRound.totalReserveFunds),
     });
 
-    runAnalysis({
+    await runAnalysis({
+      id: savedRound.id,
       bust: Number(savedRound.bust),
       createdAt: savedRound.createdAt,
     })
@@ -200,15 +204,20 @@ gameScraper.on("roundEnded", async (data) => {
           });
         }
       })
-      .catch((err) => console.error("❌ Analyzer error:", err));
+      .catch((err) => { console.error("❌ Analyzer error; durable observation will retry:", err); throw err; });
   }
-});
+}
 
-let stopPaystackPolling: () => void = () => undefined;
-let stopExpiryKicker: () => void = () => undefined;
+const collectionInbox = new CollectionInbox(resolve(process.env.COLLECTION_DATA_DIR || "data", "round-inbox.json"), handleRoundEnded);
+
+let stopPaystackPolling: () => Promise<void> = async () => undefined;
+let stopExpiryKicker: () => Promise<void> = async () => undefined;
+let stopDeliveryWorker: () => Promise<void> = async () => undefined;
 
 async function initializeServices() {
   await roundService.initialize();
+  const checkpoint = await collectionInbox.initialize(roundService.getState().lastBustId);
+  gameScraper.setCaptureHandler(checkpoint, (batch, checkpoint) => collectionInbox.capture(batch, checkpoint));
   await gameScraper.start();
 
   if (process.env.PAYSTACK_SECRET_KEY) {
@@ -218,6 +227,7 @@ async function initializeServices() {
   }
 
   if (bot) {
+    stopDeliveryWorker = startDeliveryWorker();
     stopExpiryKicker = startExpiryKicker();
     void bot.start({ drop_pending_updates: true }).catch((error) => {
       console.error("Telegram polling stopped unexpectedly:", error);
@@ -227,10 +237,11 @@ async function initializeServices() {
   }
 }
 
-// Catch unhandled promises that bypass the Express/Grammy error handlers
+// Last-resort restart for failures that escaped their task-specific handlers.
+// Recoverable client and background task errors must be handled at their source.
 let shuttingDown = false;
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("🚨 Unhandled Rejection at:", promise, "reason:", reason);
+process.on("unhandledRejection", (reason) => {
+  console.error("🚨 Unhandled promise rejection; restarting server:", reason);
   void shutdown("unhandled rejection", 1);
 });
 
@@ -243,8 +254,7 @@ try {
   await initializeServices();
 } catch (error) {
   console.error("Core service initialization failed:", error);
-  await pool.end().catch(() => undefined);
-  process.exit(1);
+  await shutdown("initialization failure", 1);
 }
 
 server.listen(PORT, HOST, () => {
@@ -262,46 +272,27 @@ async function shutdown(signal: string, exitCode = 0) {
   shuttingDown = true;
   console.log(`\n🛑 ${signal} received. Shutting down gracefully...`);
 
-  stopPaystackPolling();
-  stopExpiryKicker();
-
-  const httpClosed = new Promise<void>((resolve) => {
-    server.close((error) => {
-      if (error) console.error("HTTP server close error:", error);
-      else console.log("✅ HTTP server closed");
-      resolve();
-    });
-  });
-
-  await trycatch(async () => {
-    await closeWebSocketServer();
-    console.log("✅ WebSocket server closed");
-  });
-
-  await trycatch(async () => {
-    await gameScraper.stop();
-    console.log("✅ Scraper stopped");
-  });
-
-  // Safely terminate Telegram polling connections
-  if (bot) {
-    await trycatch(async () => {
-      await bot!.stop();
-      console.log("✅ Telegram polling stopped");
-    });
-  }
-
-  await Promise.race([
-    httpClosed,
-    new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
-  ]);
-
-  await trycatch(async () => {
-    await pool.end();
-    console.log("✅ Database pool drained");
-  });
-
-  process.exit(exitCode);
+  await shutdownWithDeadline(async () => {
+    const clean = async (name: string, task: () => Promise<unknown>) => {
+      try { await task(); }
+      catch (error) { exitCode = 1; console.error(`Shutdown of ${name} failed:`, error); }
+    };
+    const daemonsStopped = Promise.all([
+      clean("Paystack", stopPaystackPolling), clean("expiry", stopExpiryKicker), clean("outbox", stopDeliveryWorker),
+    ]);
+    const httpClosed = new Promise<void>(resolve => server.close(() => resolve()));
+    server.closeIdleConnections();
+    await Promise.all([
+      clean("WebSocket", closeWebSocketServer), clean("scraper", () => gameScraper.stop()),
+      clean("balance pool", () => balancePool.shutdown()), clean("backtests", () => backtestRunner.shutdown()),
+      clean("Telegram polling", async () => { if (bot?.isRunning()) await bot.stop(); }),
+    ]);
+    await clean("collection inbox", () => collectionInbox.drain());
+    await clean("analysis", drainAnalysis);
+    await daemonsStopped;
+    await httpClosed;
+    await clean("database", () => pool.end());
+  }, code => process.exit(Math.max(code, exitCode)), exitCode);
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));

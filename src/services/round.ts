@@ -1,6 +1,6 @@
 import { db } from "../db/index.js";
 import { rounds } from "../db/schema.js";
-import { desc } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import { trycatch } from "../utils/try-catch.js";
 
 export interface ScrapedRoundData {
@@ -14,6 +14,8 @@ export interface ScrapedRoundData {
   averageAmountPlayed: number | null;
   maxAmountPlayed: number | null;
   metricsComplete: boolean;
+  ingestionId?: string;
+  sourceGap?: boolean;
 }
 
 // How many consecutive non-overlapping bustIds before we declare a gap.
@@ -22,7 +24,7 @@ export interface ScrapedRoundData {
 // If 4+ rounds show zero overlap → the scraper was down and we missed rounds.
 const OVERLAP_GAP_THRESHOLD = 4;
 
-class RoundService {
+export class RoundService {
   private lastRoundState: {
     totalReserveFunds: number | null;
     roundsSinceLast3000: number | null;
@@ -36,11 +38,12 @@ class RoundService {
   };
 
   private isInitialized = false;
+  private lastSavedTime = 0;
 
   // Concurrency guard: serializes processRound calls
   private processingQueue: Promise<void> = Promise.resolve();
 
-  constructor() {}
+  constructor(private database: typeof db = db) {}
 
   /**
    * Initialize the service by fetching the latest round state from the DB.
@@ -48,7 +51,7 @@ class RoundService {
    */
   async initialize() {
     const { data: lastRound, error } = await trycatch(async () => {
-      return await db.query.rounds.findFirst({
+      return await this.database.query.rounds.findFirst({
         orderBy: [desc(rounds.createdAt)],
       });
     });
@@ -59,6 +62,7 @@ class RoundService {
     }
 
     if (lastRound) {
+      this.lastSavedTime = lastRound.createdAt.getTime();
       this.lastRoundState = {
         totalReserveFunds: lastRound.totalReserveFunds === null
           ? null
@@ -127,8 +131,21 @@ class RoundService {
       await this.initialize();
     }
 
-    const now = new Date();
-    let gapDetected = false;
+    if (data.ingestionId) {
+      const existing = await this.database.query.rounds.findFirst({ where: eq(rounds.id, data.ingestionId) });
+      if (existing) {
+        if (existing.createdAt.getTime() > this.lastSavedTime) {
+          this.lastSavedTime = existing.createdAt.getTime();
+          this.lastRoundState = { totalReserveFunds: existing.totalReserveFunds, roundsSinceLast3000: existing.roundsSinceLast3000,
+            lastBustId: existing.bustId, consecutiveNonOverlapping: 0 };
+        }
+        return existing;
+      }
+    }
+    const previous = this.lastRoundState;
+    const nextState = { ...previous };
+    let gapDetected = data.sourceGap === true;
+    if (gapDetected) { nextState.totalReserveFunds = null; nextState.roundsSinceLast3000 = null; }
 
     // ── Gap detection via bustId overlap ─────────────────────────────
     // Compare the suffix of the last bustId with the prefix of the new bustId.
@@ -141,28 +158,28 @@ class RoundService {
       );
 
       if (!overlaps) {
-        this.lastRoundState.consecutiveNonOverlapping += 1;
+        nextState.consecutiveNonOverlapping += 1;
 
         if (
-          this.lastRoundState.consecutiveNonOverlapping >= OVERLAP_GAP_THRESHOLD
+          nextState.consecutiveNonOverlapping >= OVERLAP_GAP_THRESHOLD
         ) {
           console.warn(
             `⚠️ Data gap detected: ${this.lastRoundState.consecutiveNonOverlapping} consecutive non-overlapping bustIds. Resetting reserve funds.`,
           );
-          this.lastRoundState.totalReserveFunds = null;
-          this.lastRoundState.roundsSinceLast3000 = null;
+          nextState.totalReserveFunds = null;
+          nextState.roundsSinceLast3000 = null;
           gapDetected = true;
           // Reset counter after declaring gap
-          this.lastRoundState.consecutiveNonOverlapping = 0;
+          nextState.consecutiveNonOverlapping = 0;
         }
       } else {
         // Overlap found — reset counter
-        this.lastRoundState.consecutiveNonOverlapping = 0;
+        nextState.consecutiveNonOverlapping = 0;
       }
     }
 
-    let newTotalReserveFunds: number | null = this.lastRoundState.totalReserveFunds;
-    let newRoundsSinceLast3000 = this.lastRoundState.roundsSinceLast3000;
+    let newTotalReserveFunds: number | null = nextState.totalReserveFunds;
+    let newRoundsSinceLast3000 = nextState.roundsSinceLast3000;
 
     if (data.bust >= 3000) {
       newTotalReserveFunds = 0;
@@ -188,6 +205,8 @@ class RoundService {
     }
 
     const roundPayload: typeof rounds.$inferInsert = {
+      id: data.ingestionId,
+      createdAt: new Date(Math.max(Date.now(), this.lastSavedTime + 1)),
       bust: data.bust,
       bustId: data.bustId,
       playersOnline: data.playersOnline,
@@ -204,13 +223,13 @@ class RoundService {
     };
 
     const { data: savedRound, error } = await trycatch(async () => {
-      const result = await db.insert(rounds).values(roundPayload).returning();
+      const result = await this.database.insert(rounds).values(roundPayload).returning();
       return result[0];
     });
 
     if (error || !savedRound) {
       console.error("❌ Error saving round to DB:", error);
-      throw error;
+      throw error || new Error("Round insert returned no record");
     }
 
     const gapLabel = gapDetected ? " [GAP]" : "";
@@ -223,8 +242,9 @@ class RoundService {
       totalReserveFunds: newTotalReserveFunds,
       roundsSinceLast3000: newRoundsSinceLast3000,
       lastBustId: data.bustId,
-      consecutiveNonOverlapping: this.lastRoundState.consecutiveNonOverlapping,
+      consecutiveNonOverlapping: nextState.consecutiveNonOverlapping,
     };
+    this.lastSavedTime = savedRound.createdAt.getTime();
 
     return savedRound;
   }
@@ -233,7 +253,7 @@ class RoundService {
    * Get the current state (for health checks or internal use)
    */
   getState() {
-    return this.lastRoundState;
+    return { ...this.lastRoundState };
   }
 }
 

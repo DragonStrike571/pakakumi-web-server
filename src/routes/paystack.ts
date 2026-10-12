@@ -26,10 +26,11 @@ router.get("/callback", callbackLimiter, async (req, res) => {
   try {
     const data = await verifyPayment(sanitizedRef);
     
-    if (data.status && data.data.status === "success") {
+    if (data.status && data.data?.status === "success") {
       // Process successful payment
-      await handleSuccessfulPayment(sanitizedRef, data.data);
-      res.send("Payment successful! You can close this window and return to Telegram.");
+      const fulfilled = await handleSuccessfulPayment(sanitizedRef, data.data);
+      if (!fulfilled) return res.status(422).send("The verified payment could not be matched to a valid order. Contact support with your reference.");
+      res.send("Payment successful! Your access is active and the invite is queued for Telegram delivery. Use /status to request another invite.");
     } else {
       res.send("Payment verification is pending or failed. Please check your Telegram bot for updates.");
     }

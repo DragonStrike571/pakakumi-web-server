@@ -4,6 +4,7 @@ import { db } from "../db/index.js";
 import { users, sessions, accounts, verifications } from "../db/schema.js";
 
 import { CORS_ORIGINS } from "../config/cors.js";
+import { authorizationFields } from "../config/access.js";
 
 const isProduction = process.env.NODE_ENV === "production";
 const cookieAttributes = isProduction
@@ -21,16 +22,7 @@ export const auth = betterAuth({
     },
   }),
   user: {
-    additionalFields: {
-      role: {
-        type: "string",
-        defaultValue: "user"
-      },
-      accessStatus: {
-        type: "string",
-        defaultValue: "pending"
-      }
-    }
+    additionalFields: authorizationFields,
   },
   emailAndPassword: {
     enabled: true,

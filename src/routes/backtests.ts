@@ -6,7 +6,7 @@ import { rounds, strategies, strategyAccess } from "../db/schema.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireActiveAccess } from "../middleware/access.js";
 import type { AuthenticatedRequest } from "../types/express.js";
-import { runBacktest } from "../services/backtest/engine.js";
+import { backtestRunner } from "../services/backtest/runner.js";
 import { runBacktestSchema } from "../validation/backtests.js";
 import type { StrategyConfig } from "../utils/strategies/core.js";
 import { strategyConfigSchema } from "../validation/strategies.js";
@@ -95,13 +95,18 @@ router.post("/run", async (req: Request, res: Response) => {
       return;
     }
 
-    const result = runBacktest({
+    const controller = new AbortController();
+    const cancel = () => { if (!res.writableEnded) controller.abort(); };
+    res.once("close", cancel);
+    let result;
+    try { result = await backtestRunner.run({
       rounds: history,
       strategy,
       initialCapital: parsed.data.initialCapital,
       scenario: parsed.data.scenario,
       includeLedger: parsed.data.includeLedger,
-    });
+    }, controller.signal); }
+    finally { res.removeListener("close", cancel); }
 
     if (history.length === parsed.data.range.limit) {
       result.warnings.push(

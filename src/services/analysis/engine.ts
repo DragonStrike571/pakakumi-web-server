@@ -11,7 +11,8 @@
  * 7. Calculate ideal planning rounds for budget safety
  */
 
-import { db } from "../../db/index.js";
+import { db as rootDb } from "../../db/index.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   rounds,
   systemStats,
@@ -19,8 +20,16 @@ import {
   signalHistory,
   analysisSnapshots,
   dailyStats,
+  analysisCheckpoints,
 } from "../../db/schema.js";
 import { desc, eq, inArray, sql, lt } from "drizzle-orm";
+
+const databaseContext = new AsyncLocalStorage<typeof rootDb>();
+const db = new Proxy(rootDb, { get(_target, key) {
+  const database = databaseContext.getStore() || rootDb;
+  const value = Reflect.get(database, key);
+  return typeof value === "function" ? value.bind(database) : value;
+} });
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -75,6 +84,7 @@ export interface AlertCluster {
 }
 
 export interface AnalysisResult {
+  replayed?: boolean;
   alerts: RawAlert[];
   clusters: AlertCluster[];
   upcomingOpportunities: RawAlert[];
@@ -128,7 +138,54 @@ export interface CustomAnalysisResult {
 
 // ─── State ──────────────────────────────────────────────────────────────────
 
-let cachedRounds: { bust: number; createdAt: Date }[] = [];
+let cachedRounds: { id?: string; bust: number; createdAt: Date }[] = [];
+let analysisQueue: Promise<unknown> = Promise.resolve();
+let lastAnalysisResult: AnalysisResult | null = null;
+
+export function runAnalysisEngine(newRound?: { id?: string; bust: number; createdAt: Date }): Promise<AnalysisResult> {
+  const task = analysisQueue.then(async () => {
+    const before = captureEngineState();
+    try {
+      const result = await rootDb.transaction(tx => databaseContext.run(tx as unknown as typeof rootDb, async () => {
+        const [checkpoint] = await db.select().from(analysisCheckpoints).where(eq(analysisCheckpoints.id, 1)).for("update");
+        const replayed = Boolean(newRound?.id && checkpoint && newRound.createdAt <= checkpoint.roundAt);
+        const result = replayed && lastAnalysisResult ? structuredClone(lastAnalysisResult) : await analyzeRound(replayed ? undefined : newRound);
+        await flushDailyStats();
+        if (newRound?.id && !replayed) await db.insert(analysisCheckpoints).values({ id: 1, roundId: newRound.id, roundAt: newRound.createdAt })
+          .onConflictDoUpdate({ target: analysisCheckpoints.id, set: { roundId: newRound.id, roundAt: newRound.createdAt } });
+        return { ...result, replayed };
+      }));
+      lastAnalysisResult = result;
+      return result;
+    } catch (error) { restoreEngineState(before); throw error; }
+  });
+  analysisQueue = task.catch(error => { console.error("Analysis task failed:", error); });
+  return task;
+}
+
+function captureEngineState() {
+  return structuredClone({ cachedRounds, currentRoundIndex, cooldownMap, cachedSystemStats, systemStatsDirty,
+    cachedDailyStats, dailyStatsDirty, cachedPendingSignals, roundsSinceLastSnapshotWrite, roundsSinceLastDailyFlush,
+    roundsSinceLastHistoryPrune, lastSnapshotData });
+}
+function restoreEngineState(state: ReturnType<typeof captureEngineState>) {
+  cachedRounds = state.cachedRounds; currentRoundIndex = state.currentRoundIndex;
+  cooldownMap.clear(); for (const [key, value] of state.cooldownMap) cooldownMap.set(key, value);
+  cachedSystemStats = state.cachedSystemStats; systemStatsDirty = state.systemStatsDirty;
+  cachedDailyStats = state.cachedDailyStats; dailyStatsDirty = state.dailyStatsDirty;
+  cachedPendingSignals = state.cachedPendingSignals; roundsSinceLastSnapshotWrite = state.roundsSinceLastSnapshotWrite;
+  roundsSinceLastDailyFlush = state.roundsSinceLastDailyFlush; roundsSinceLastHistoryPrune = state.roundsSinceLastHistoryPrune;
+  lastSnapshotData = state.lastSnapshotData;
+}
+
+export async function drainAnalysis() {
+  await analysisQueue;
+  await flushSystemStats();
+  await flushDailyStats();
+  if (lastSnapshotData) await db.insert(analysisSnapshots).values({ id: 1, ...lastSnapshotData })
+    .onConflictDoUpdate({ target: analysisSnapshots.id, set: lastSnapshotData });
+  if (systemStatsDirty || dailyStatsDirty) throw new Error("Analysis statistics have not been flushed");
+}
 let currentRoundIndex = 0;
 
 // Cooldown map with TTL: target → { setAtRound, expiresAtRound }
@@ -234,6 +291,7 @@ async function ensureDailyStatsLoaded(): Promise<void> {
   // Day rollover or first load — flush any pending data for the old day first
   if (cachedDailyStats && cachedDailyStats.date !== today && dailyStatsDirty) {
     await flushDailyStats();
+    if (dailyStatsDirty) throw new Error("Previous day's statistics could not be saved");
   }
 
   try {
@@ -296,6 +354,7 @@ async function flushDailyStats(): Promise<void> {
     dailyStatsDirty = false;
   } catch (err) {
     console.error("❌ Error flushing daily stats:", err);
+    throw err;
   }
 }
 
@@ -411,6 +470,7 @@ async function flushSystemStats(): Promise<void> {
     systemStatsDirty = false;
   } catch (err) {
     console.error("❌ Error flushing system stats:", err);
+    throw err;
   }
 }
 
@@ -453,7 +513,8 @@ async function pruneSignalHistory(): Promise<void> {
  * Run the full analysis pipeline. This is the main entry point.
  * Returns raw analysis results that any consumer (Telegram, Frontend, etc.) can use.
  */
-export async function runAnalysisEngine(newRound?: {
+async function analyzeRound(newRound?: {
+  id?: string;
   bust: number;
   createdAt: Date;
 }): Promise<AnalysisResult> {
@@ -469,14 +530,16 @@ export async function runAnalysisEngine(newRound?: {
   // ─── Load round cache ─────────────────────────────────────────────────
   if (cachedRounds.length === 0) {
     const latestRounds = await db.query.rounds.findMany({
+      where: newRound ? lt(rounds.createdAt, newRound.createdAt) : undefined,
       orderBy: [desc(rounds.createdAt)],
       limit: 10000,
-      columns: { bust: true, createdAt: true },
+      columns: { id: true, bust: true, createdAt: true },
     });
     cachedRounds = latestRounds.reverse();
     currentRoundIndex = cachedRounds.length;
   }
 
+  if (newRound?.id && cachedRounds.some(r => r.id === newRound!.id)) newRound = undefined;
   if (newRound) {
     cachedRounds.push(newRound);
     if (cachedRounds.length > 11000) {
@@ -524,14 +587,14 @@ export async function runAnalysisEngine(newRound?: {
 
     if (hitSignals.length > 0) {
       hitTargetsList = hitSignals.map((s) => Number(s.target));
-      stats.hits += hitSignals.length;
-      systemStatsDirty = true;
 
       // Clear from cooldown
       hitTargetsList.forEach((t) => cooldownMap.delete(t));
       await db
         .delete(pendingSignals)
         .where(inArray(pendingSignals.target, hitTargetsList));
+      stats.hits += hitSignals.length;
+      systemStatsDirty = true;
 
       // Remove from in-memory cache
       cachedPendingSignals = cachedPendingSignals!.filter(
@@ -545,14 +608,14 @@ export async function runAnalysisEngine(newRound?: {
           .set({
             outcome: "hit",
             bustValue: newRound.bust,
-            actualRoundsToHit: sig.roundsElapsed,
+            actualRoundsToHit: sig.roundsElapsed + 1,
             resolvedAt: new Date(),
           })
           .where(
             sql`${signalHistory.target} = ${Number(sig.target)} AND ${signalHistory.outcome} = 'pending'`,
           );
 
-        recordDailyHit(Number(sig.target), sig.roundsElapsed);
+        recordDailyHit(Number(sig.target), sig.roundsElapsed + 1);
       }
     }
 
@@ -582,7 +645,7 @@ export async function runAnalysisEngine(newRound?: {
           .set({
             outcome: "missed",
             resolvedAt: new Date(),
-            actualRoundsToHit: sig.roundsElapsed,
+            actualRoundsToHit: sig.roundsElapsed + 1,
           })
           .where(
             sql`${signalHistory.target} = ${Number(sig.target)} AND ${signalHistory.outcome} = 'pending'`,
@@ -766,10 +829,12 @@ export async function runAnalysisEngine(newRound?: {
             reason: alert.reason,
           };
 
-          await db
+          const inserted = await db
             .insert(pendingSignals)
             .values(newPendingRow)
-            .onConflictDoNothing();
+            .onConflictDoNothing().returning();
+          if (!inserted.length) continue;
+          pendingTargetSet.add(alert.target);
 
           // Add to in-memory cache
           cachedPendingSignals!.push({
@@ -1191,6 +1256,7 @@ export async function getSignalHistory(limit = 50, offset = 0) {
  * Returns from in-memory cache if available.
  */
 export async function getSystemStats() {
+  await analysisQueue;
   if (cachedSystemStats) {
     return cachedSystemStats;
   }
@@ -1239,6 +1305,7 @@ export async function getTodayStats(): Promise<{
   accuracy: number;
   targets?: typeof dailyStats.$inferSelect.targets;
 }> {
+  await analysisQueue;
   // If in-memory cache is loaded, return from it
   if (cachedDailyStats && cachedDailyStats.date === getTodayEAT()) {
     const resolved = cachedDailyStats.totalHits + cachedDailyStats.totalMisses;

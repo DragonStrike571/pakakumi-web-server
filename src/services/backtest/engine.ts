@@ -337,13 +337,13 @@ export function runBacktest(input: {
     }
     equityCurve.push({ roundIndex, capital });
 
-    if (scenario.stopLoss !== undefined && initialCapital - capital >= scenario.stopLoss) {
+    if (scenario.stopLoss !== undefined && scenario.stopLoss > 0 && initialCapital - capital >= scenario.stopLoss) {
       stopReason = "Stop-loss reached";
     }
-    if (scenario.takeProfit !== undefined && capital - initialCapital >= scenario.takeProfit) {
+    if (scenario.takeProfit !== undefined && scenario.takeProfit > 0 && capital - initialCapital >= scenario.takeProfit) {
       stopReason = "Take-profit reached";
     }
-    if (scenario.maxBets !== undefined && totalBets >= scenario.maxBets) {
+    if (scenario.maxBets !== undefined && scenario.maxBets > 0 && totalBets >= scenario.maxBets) {
       stopReason = "Maximum bet count reached";
     }
     if (stopReason) break;

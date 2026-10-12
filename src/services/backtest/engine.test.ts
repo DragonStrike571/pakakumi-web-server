@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { runBacktest } from "./engine.js";
+import { runBacktestSchema } from "../../validation/backtests.js";
 
 const strategy = {
   type: "sequence" as const,
@@ -11,6 +12,13 @@ const strategy = {
     ],
   },
 };
+
+test("explicit zero risk overrides disable saved limits in custom backtests", () => {
+  const scenario = { stopLoss: 0, takeProfit: 0, maxBets: 0 };
+  assert.equal(runBacktestSchema.safeParse({ strategy, initialCapital: 100, scenario }).success, true);
+  const result = runBacktest({ rounds: rounds(1.1, 1.1, 2), strategy: { ...strategy, execution: { stopLoss: 1, maxBets: 1, takeProfit: 1 } }, initialCapital: 100, scenario });
+  assert.equal(result.summary.totalBets, 3);
+});
 
 function rounds(...busts: number[]) {
   return busts.map((bust, index) => ({

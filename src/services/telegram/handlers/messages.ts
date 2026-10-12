@@ -11,7 +11,8 @@
  */
 
 import { Bot, InlineKeyboard } from "grammy";
-import { MyContext } from "../bot.js";
+import { type MyContext, setSessionState } from "../bot.js";
+import { escapeHtml, truncateHtml } from "../../../utils/html.js";
 import { db } from "../../../db/index.js";
 import { telegramUsers, supportTickets } from "../../../db/schema.js";
 import { eq } from "drizzle-orm";
@@ -27,11 +28,10 @@ const MAX_TELEGRAM_MSG_LENGTH = 4096;
  * Truncate a message to Telegram's max length, preserving HTML tags.
  */
 function truncateMessage(text: string, maxLen: number = MAX_TELEGRAM_MSG_LENGTH): string {
-  if (text.length <= maxLen) return text;
-  return text.substring(0, maxLen - 20) + "\n\n<i>[truncated]</i>";
+  return truncateHtml(text, maxLen);
 }
 
-export function setupMessages(bot: Bot<MyContext>) {
+export function setupMessages(bot: Bot<MyContext>, send = rateLimitedSend) {
   // Listen for both direct messages/groups AND channel posts
   bot.on(["message:text", "channel_post:text"], async (ctx) => {
     const text = ctx.message?.text || ctx.channelPost?.text;
@@ -58,9 +58,9 @@ export function setupMessages(bot: Bot<MyContext>) {
         if (match && match[1]) {
           const targetUserId = match[1];
           try {
-            await rateLimitedSend(
+            await send(
               targetUserId,
-              truncateMessage(`📩 <b>Support Reply:</b>\n\n${text}`),
+              truncateMessage(`📩 <b>Support Reply:</b>\n\n${escapeHtml(text)}`),
               { parse_mode: "HTML" },
               "high",
             );
@@ -82,11 +82,7 @@ export function setupMessages(bot: Bot<MyContext>) {
 
     // 2. CLOSE SUPPORT OVERRIDE
     if (text === "❌ Close Support") {
-      await db
-        .update(telegramUsers)
-        .set({ sessionState: "command" })
-        .where(eq(telegramUsers.chatId, chatId));
-      ctx.dbState = "command";
+      await setSessionState(ctx, "command");
 
       const botUsername = ctx.me?.username || "pk_oracle_bot";
       const menuKb = buildMainMenuKeyboard(botUsername);
@@ -116,14 +112,21 @@ export function setupMessages(bot: Bot<MyContext>) {
 
       if (ADMIN_CHANNEL_ID) {
         const ticketMsg = truncateMessage(
-          `🎫 <b>Support Ticket (#${ticket.id})</b>\n[User ID: ${chatId}]\nUsername: @${username}\n\nMessage:\n${sanitizedMessage}\n\n<i>Reply to this message to answer the user.</i>`,
+          `🎫 <b>Support Ticket (#${ticket.id})</b>\n[User ID: ${chatId}]\nUsername: @${escapeHtml(username)}\n\nMessage:\n${escapeHtml(sanitizedMessage)}\n\n<i>Reply to this message to answer the user.</i>`,
         );
-        await rateLimitedSend(
+        try { await send(
           ADMIN_CHANNEL_ID,
           ticketMsg,
           { parse_mode: "HTML" },
           "normal",
-        ).catch(console.error);
+        ); } catch (error) {
+          console.error(`Support ticket ${ticket.id} delivery failed:`, error);
+          await ctx.reply("Your message was saved, but delivery to support failed. Please try again later.");
+          return;
+        }
+      } else {
+        await ctx.reply("Your message was saved. Support delivery is currently unavailable; please try again later.");
+        return;
       }
 
       await ctx.reply(

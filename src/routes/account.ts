@@ -196,10 +196,15 @@ router.post("/balance", balanceLimiter, async (req: Request, res: Response) => {
   console.log("[Balance] Starting balance check...");
 
   const BALANCE_TIMEOUT_MS = 30_000; // Hard timeout for the entire balance check
+  const controller = new AbortController();
+  const cancel = () => controller.abort(new Error("Balance request cancelled"));
+  const onClosed = () => { if (!res.writableEnded) cancel(); };
+  req.once("aborted", cancel);
+  res.once("close", onClosed);
 
   const { data: balance, error: scrapeError } = await trycatch(async () => {
     const balancePromise = (async () => {
-    const { context } = await balancePool.getContext();
+    const { context } = await balancePool.getContext(controller.signal);
 
     try {
       const page = await context.newPage();
@@ -279,11 +284,15 @@ router.post("/balance", balanceLimiter, async (req: Request, res: Response) => {
     })();
 
     // Hard timeout to prevent indefinite hangs
-    const timeout = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("Balance check timed out after 30s")), BALANCE_TIMEOUT_MS),
-    );
-
-    return await Promise.race([balancePromise, timeout]);
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort(new Error("Balance check timed out after 30s"));
+        reject(controller.signal.reason);
+      }, BALANCE_TIMEOUT_MS);
+    });
+    try { return await Promise.race([balancePromise, timeout]); }
+    finally { clearTimeout(timer!); req.removeListener("aborted", cancel); res.removeListener("close", onClosed); }
   });
 
   if (scrapeError) {

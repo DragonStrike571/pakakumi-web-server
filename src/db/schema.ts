@@ -237,6 +237,7 @@ export const telegramUsers = pgTable(
     chatId: text("chat_id").primaryKey(),
     username: text("username"),
     expiryTimestamp: timestamp("expiry_timestamp", { mode: "date" }),
+    revokedAt: timestamp("revoked_at", { mode: "date" }),
     sessionState: text("session_state").notNull().default("command"), // 'command' | 'support'
     language: text("language").notNull().default("en"), // 'en' | 'sw' — for Swahili toggle
     createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
@@ -259,6 +260,7 @@ export const payments = pgTable(
     status: text("status").default("pending").notNull(), // 'pending', 'success', 'failed'
     durationPaidFor: numeric("duration_paid_for", { mode: "number" }).notNull(), // in days
     reference: text("reference").notNull().unique(), // Paystack reference
+    nextVerificationAt: timestamp("next_verification_at", { mode: "date" }).defaultNow().notNull(),
     createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { mode: "date" })
       .defaultNow()
@@ -270,6 +272,19 @@ export const payments = pgTable(
     index("payments_reference_idx").on(table.reference),
   ],
 );
+
+export const telegramDeliveries = pgTable("telegram_deliveries", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  dedupeKey: text("dedupe_key").notNull().unique(),
+  chatId: text("chat_id").notNull().references(() => telegramUsers.chatId),
+  kind: text("kind").notNull(),
+  status: text("status").notNull().default("pending"),
+  attempts: integer("attempts").notNull().default(0),
+  nextAttemptAt: timestamp("next_attempt_at", { mode: "date" }).defaultNow().notNull(),
+  lockedAt: timestamp("locked_at", { mode: "date" }),
+  lastError: text("last_error"),
+  createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
+}, t => [index("telegram_delivery_due_idx").on(t.status, t.nextAttemptAt)]);
 
 export const supportTickets = pgTable(
   "support_tickets",
@@ -297,6 +312,12 @@ export const systemStats = pgTable("system_stats", {
   hits: integer("hits").notNull().default(0),
   signals: integer("signals").notNull().default(0),
   lastAlertRound: integer("last_alert_round").notNull().default(0),
+});
+
+export const analysisCheckpoints = pgTable("analysis_checkpoints", {
+  id: integer("id").primaryKey().default(1),
+  roundId: uuid("round_id").notNull().references(() => rounds.id),
+  roundAt: timestamp("round_at", { mode: "date" }).notNull(),
 });
 
 export const pendingSignals = pgTable("pending_signals", {

@@ -50,6 +50,20 @@
       "when": 1785725669939,
       "tag": "0006_flimsy_moira_mactaggert",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1791799239454,
+      "tag": "0007_funny_pandemic",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1791800611355,
+      "tag": "0008_talented_victor_mancha",
+      "breakpoints": true
     }
   ]
 }

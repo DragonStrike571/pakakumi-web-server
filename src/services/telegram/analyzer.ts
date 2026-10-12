@@ -12,6 +12,7 @@
  */
 
 import { bot } from "./bot.js";
+import { getBotUsername } from "./bot-identity.js";
 import { InlineKeyboard } from "grammy";
 import {
   runAnalysisEngine,
@@ -20,6 +21,7 @@ import {
   type AnalysisResult,
 } from "../analysis/engine.js";
 import { rateLimitedSend } from "./rate-limiter.js";
+import { runBackgroundTask } from "../../utils/background-task.js";
 import {
   processAutoPlayOpportunities,
   clearResolvedCluster,
@@ -44,14 +46,25 @@ function getVagueTimingPhrase(planRounds: number): string {
  * Main entry point — called on every new round from index.ts
  */
 export async function runAnalysis(newRound?: {
+  id?: string;
   bust: number;
   createdAt: Date;
 }): Promise<AnalysisResult | null> {
   const result = await runAnalysisEngine(newRound);
+  if (result.replayed) return result;
+
+  // Auto-play decisions and WebSocket updates must not wait for Telegram delivery.
+  if (result.correlationClusters.length > 0) await processAutoPlayOpportunities(result);
+  if (result.hitTargets.length > 0) clearResolvedCluster(result.hitTargets);
+  runBackgroundTask("Telegram analysis delivery", () => deliverAnalysis(result, newRound));
+  return result;
+}
+
+async function deliverAnalysis(result: AnalysisResult, newRound?: { bust: number; createdAt: Date }) {
 
   const publicChannelId = process.env.PUBLIC_CHANNEL_ID;
   const privateChannelId = process.env.PRIVATE_CHANNEL_ID;
-  const botUsername = bot?.botInfo?.username || "pk_oracle_bot";
+  const botUsername = getBotUsername(bot);
 
   // ─── Dispatch hit proof messages ──────────────────────────────────────
   if (newRound && result.hitTargets.length > 0) {
@@ -223,14 +236,9 @@ export async function runAnalysis(newRound?: {
 
   // ─── Process Auto-Play Opportunities ───────────────────────────────────
   // Write opportunities to DB for the local bot to pick up
-  if (result.correlationClusters.length > 0) {
-    processAutoPlayOpportunities(result).catch(console.error);
-  }
+  // Auto-play was processed before scheduling delivery.
 
   // Clear resolved clusters when targets are hit
-  if (result.hitTargets.length > 0) {
-    clearResolvedCluster(result.hitTargets);
-  }
 
   return result;
 }

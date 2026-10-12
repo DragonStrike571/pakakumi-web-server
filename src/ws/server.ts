@@ -4,6 +4,9 @@ import { Round } from "../validation/rounds.js";
 import { CORS_ORIGINS } from "../config/cors.js";
 import { auth } from "../lib/auth.js";
 import { fromNodeHeaders } from "better-auth/node";
+import { createClientVerifier } from "./verify-client.js";
+import { pingClient, sendText } from "./transport.js";
+import { SocketAccessGuard } from "./access-guard.js";
 
 // ─── Typed WS Payload Interfaces ────────────────────────────────────────────
 
@@ -49,81 +52,34 @@ type WsPayload =
     };
 
 function sendJson(socket: WebSocket, payload: WsPayload) {
-  if (socket.readyState !== socket.OPEN) {
-    return;
-  }
-
-  socket.send(JSON.stringify(payload));
-}
-
-/**
- * Broadcast a pre-serialized JSON string to all connected clients.
- * Serializes once instead of per-client for better performance at scale.
- */
-function broadcastPreSerialized(wss: WebSocketServer, serialized: string) {
-  for (const client of wss.clients) {
-    if (client.readyState !== client.OPEN) {
-      continue;
-    }
-    client.send(serialized);
-  }
+  sendText(socket, JSON.stringify(payload));
 }
 
 export function attachWebSocketServer(httpServer: Server) {
+  const guards = new Map<WebSocket, SocketAccessGuard>();
   const wss = new WebSocketServer({
     server: httpServer,
     path: "/ws",
     maxPayload: 1024 * 1024,
-    verifyClient: async (info, cb) => {
-      const origin = info.origin;
-      // Remove trailing slash from origin if present
-      const cleanOrigin = origin.endsWith("/") ? origin.slice(0, -1) : origin;
-
-      if (!cleanOrigin) {
-        // Require origin header
-        cb(false, 401, "Unauthorized");
-        return;
-      }
-      if (!CORS_ORIGINS.includes(cleanOrigin)) {
-        cb(false, 403, `Forbidden: ${cleanOrigin}`);
-        return;
-      }
-
-      try {
-        const session = await auth.api.getSession({
-          headers: fromNodeHeaders(info.req.headers),
-        });
-        const user = session?.user as
-          | (NonNullable<typeof session>["user"] & {
-              role?: string;
-              accessStatus?: string;
-            })
-          | undefined;
-        const allowed = Boolean(
-          user &&
-          (user.role === "admin" ||
-            user.accessStatus === "active" ||
-            user.accessStatus === "telegram_premium"),
-        );
-        cb(allowed, allowed ? undefined : 401, allowed ? undefined : "Unauthorized");
-      } catch {
-        cb(false, 503, "Authentication unavailable");
-      }
-    },
+    verifyClient: createClientVerifier(CORS_ORIGINS, (headers) =>
+      auth.api.getSession({ headers: fromNodeHeaders(headers) }),
+    ),
   });
 
-  wss.on("connection", function (ws: WebSocket & { isAlive?: boolean }) {
+  wss.on("connection", function (ws: WebSocket & { isAlive?: boolean }, req) {
+    ws.on("error", console.error);
     ws.isAlive = true;
     ws.on("pong", function () {
       ws.isAlive = true;
     });
 
-    sendJson(ws, {
+    const guard = new SocketAccessGuard(() => auth.api.getSession({ headers: fromNodeHeaders(req.headers), query: { disableCookieCache: true } }), () => ws.terminate());
+    guards.set(ws, guard);
+    ws.once("close", () => { guard.dispose(); guards.delete(ws); });
+    void guard.send(() => sendJson(ws, {
       type: "welcome",
       message: "Welcome to the Pakakumi Round Analyzer!",
-    });
-
-    ws.on("error", console.error);
+    }));
   });
 
   const interval = setInterval(() => {
@@ -133,7 +89,7 @@ export function attachWebSocketServer(httpServer: Server) {
       }
 
       ws.isAlive = false;
-      ws.ping();
+      void guards.get(ws)?.send(() => pingClient(ws));
     });
   }, 30000);
 
@@ -143,7 +99,7 @@ export function attachWebSocketServer(httpServer: Server) {
 
   function broadcastRoundUpdate(round: Round) {
     const payload: WsPayload = { type: "roundUpdate", data: round };
-    broadcastPreSerialized(wss, JSON.stringify(payload));
+    broadcastAuthorized(JSON.stringify(payload));
   }
 
   function broadcastAnalysisUpdate(data: {
@@ -154,7 +110,11 @@ export function attachWebSocketServer(httpServer: Server) {
     correlationStreaks: number[][];
   }) {
     const payload: WsPayload = { type: "analysisUpdate", data };
-    broadcastPreSerialized(wss, JSON.stringify(payload));
+    broadcastAuthorized(JSON.stringify(payload));
+  }
+
+  function broadcastAuthorized(serialized: string) {
+    for (const [ws, guard] of guards) void guard.send(() => sendText(ws, serialized));
   }
 
   async function closeWebSocketServer() {

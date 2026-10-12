@@ -13,7 +13,9 @@
  */
 
 import { Bot, InlineKeyboard } from "grammy";
-import { MyContext } from "../bot.js";
+import { type MyContext, setSessionState } from "../bot.js";
+import { requestPremiumInvite } from "../outbox.js";
+import { escapeHtml, truncateHtml } from "../../../utils/html.js";
 import { initializePayment } from "../../paystack/paystack.js";
 import { db } from "../../../db/index.js";
 import { telegramUsers, rounds } from "../../../db/schema.js";
@@ -64,8 +66,7 @@ async function isUserPremium(chatId: string): Promise<boolean> {
  * Truncate a message to Telegram's max length.
  */
 function truncateMessage(text: string): string {
-  if (text.length <= MAX_MSG_LENGTH) return text;
-  return text.substring(0, MAX_MSG_LENGTH - 20) + "\n\n<i>[truncated]</i>";
+  return truncateHtml(text, MAX_MSG_LENGTH);
 }
 
 /**
@@ -167,15 +168,11 @@ async function sendMainMenu(ctx: MyContext) {
 export function setupCommands(bot: Bot<MyContext>) {
   bot.command("start", async (ctx) => {
     const chatId = ctx.chat!.id.toString();
-    await db
-      .update(telegramUsers)
-      .set({ sessionState: "command" })
-      .where(eq(telegramUsers.chatId, chatId));
-    ctx.dbState = "command";
+    await setSessionState(ctx, "command");
 
     const payload = ctx.match;
     if (payload.startsWith("plan_")) {
-      const target = payload.replace("plan_", "");
+      const target = escapeHtml(payload.replace("plan_", ""));
       const msg =
         `🎯 <b>Target: ${target}x</b>\n\n` +
         `Let's plan your bets properly so you don't go broke.\n\n` +
@@ -185,7 +182,7 @@ export function setupCommands(bot: Bot<MyContext>) {
     }
 
     if (payload.startsWith("strat_")) {
-      const target = payload.split("_")[1];
+      const target = escapeHtml(payload.split("_")[1] ?? "");
       return ctx.reply(
         `⚙️ <b>Plan Your Bets</b>\n\n` +
           `You want to hit ${target}x.\n\n` +
@@ -336,11 +333,12 @@ export function setupCommands(bot: Bot<MyContext>) {
       const timeLeft = user.expiryTimestamp
         ? formatTimeRemaining(user.expiryTimestamp)
         : "Unknown";
+      await requestPremiumInvite(chatId);
 
       await ctx.reply(
         `✅ <b>Status:</b> Active\n\n` +
           `📅 <b>Expires:</b> ${user.expiryTimestamp?.toDateString()}\n` +
-          `⏳ <b>Time Left:</b> ${timeLeft}`,
+          `⏳ <b>Time Left:</b> ${timeLeft}\n\nA fresh Premium Room invite is queued for delivery.`,
         { parse_mode: "HTML" },
       );
     }
@@ -390,11 +388,7 @@ export function setupCommands(bot: Bot<MyContext>) {
 
   async function triggerSupport(ctx: MyContext) {
     const chatId = ctx.chat!.id.toString();
-    await db
-      .update(telegramUsers)
-      .set({ sessionState: "support" })
-      .where(eq(telegramUsers.chatId, chatId));
-    ctx.dbState = "support";
+    await setSessionState(ctx, "support");
 
     await ctx.reply(
       "🔒 <b>Support Open</b>\n\nType your message below. An admin will reply here.",

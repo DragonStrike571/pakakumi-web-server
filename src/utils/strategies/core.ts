@@ -113,6 +113,7 @@ export function generateAlgorithmBets(
       bet = Math.round(bet * 100) / 100;
     }
 
+    if (!Number.isFinite(bet) || bet <= 0) break;
     if (maxPlayable && bet > maxPlayable) break;
     if (totalSum + bet > capital) break;
 

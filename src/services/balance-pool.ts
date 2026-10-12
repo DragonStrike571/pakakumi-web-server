@@ -1,61 +1,85 @@
-import { chromium, Browser, BrowserContext, Page } from "playwright";
-import { trycatch } from "../utils/try-catch.js";
+import { chromium, type Browser, type BrowserContext } from "playwright";
 
-const MAX_BROWSERS = 2;
-const chromiumArgs = process.env.PLAYWRIGHT_DISABLE_SANDBOX === "true"
-  ? ["--no-sandbox", "--disable-setuid-sandbox"]
-  : [];
+export class BalancePool {
+  private browser: Browser | null = null;
+  private launching: Promise<Browser> | null = null;
+  private active = 0;
+  private contexts = new Set<BrowserContext>();
+  private stopped = false;
+  private waiters: { resolve: () => void; reject: (error: Error) => void; signal?: AbortSignal; abort: () => void }[] = [];
+  constructor(private launch: () => Promise<Browser> = () => chromium.launch({
+    headless: process.env.HEADLESS !== "false", args: process.env.PLAYWRIGHT_DISABLE_SANDBOX === "true" ? ["--no-sandbox", "--disable-setuid-sandbox"] : [],
+  })) {}
 
-class BalancePool {
-  private browsers: Browser[] = [];
-  private activeContexts: number = 0;
+  private async reserve(signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    if (this.stopped) throw new Error("Balance pool is closed");
+    if (this.active < 4) { this.active++; return; }
+    if (this.waiters.length >= 10) throw new Error("Balance service is busy; retry later");
+    await new Promise<void>((resolve, reject) => {
+      const waiter = { resolve, reject, signal, abort: () => {
+        this.waiters = this.waiters.filter(w => w !== waiter);
+        reject(new Error("Balance request cancelled"));
+      } };
+      this.waiters.push(waiter);
+      signal?.addEventListener("abort", waiter.abort, { once: true });
+    });
+  }
 
-  async getContext(): Promise<{ browser: Browser; context: BrowserContext }> {
-    let browserToUse: Browser | null = null;
+  private free() {
+    this.active = Math.max(0, this.active - 1);
+    const waiter = this.waiters.shift();
+    if (waiter) { waiter.signal?.removeEventListener("abort", waiter.abort); this.active++; waiter.resolve(); }
+  }
 
-    // First try to find an existing browser that we can reuse
-    if (this.browsers.length > 0) {
-      // Pick the browser with the least number of contexts (simplistic load balancing)
-      // Actually, Playwright handles multiple contexts on one browser very well.
-      // We will just use the first browser if it's available, or round-robin it.
-      browserToUse = this.browsers[this.activeContexts % this.browsers.length];
-    } else if (this.browsers.length < MAX_BROWSERS) {
-      // Launch a new browser if we haven't hit the limit
-      console.log("[BalancePool] Launching new browser instance...");
-      const { data: browser, error } = await trycatch(async () => {
-        return await chromium.launch({
-          headless: process.env.HEADLESS !== "false",
-          args: chromiumArgs,
-        });
-      });
-      if (error || !browser) {
-        throw error || new Error("Failed to launch balance pool browser");
+  async getContext(signal?: AbortSignal): Promise<{ browser: Browser; context: BrowserContext }> {
+    await this.reserve(signal);
+    let assigned = false;
+    try {
+      if (!this.browser?.isConnected()) {
+        if (!this.launching) this.launching = this.launch().then(browser => {
+          this.browser = browser;
+          browser.on("disconnected", () => { if (this.browser === browser) this.browser = null; });
+          return browser;
+        }).finally(() => { this.launching = null; });
+        await this.launching;
       }
-      this.browsers.push(browser);
-      browserToUse = browser;
-    } else {
-      // Wait or just use the first one if we hit the limit
-      // Since contexts are lightweight, we can share the existing browsers.
-      browserToUse = this.browsers[this.activeContexts % this.browsers.length];
-    }
-
-    this.activeContexts++;
-    const context = await browserToUse.newContext();
-    return { browser: browserToUse, context };
+      signal?.throwIfAborted();
+      if (this.stopped) throw new Error("Balance pool is closed");
+      const browser = this.browser!;
+      const context = await browser.newContext();
+      this.contexts.add(context);
+      assigned = true;
+      const abort = () => { void this.releaseContext(context); };
+      signal?.addEventListener("abort", abort, { once: true });
+      context.once("close", () => {
+        signal?.removeEventListener("abort", abort);
+        if (this.contexts.delete(context)) this.free();
+      });
+      if (this.stopped || signal?.aborted) {
+        await this.releaseContext(context);
+        throw signal?.reason || new Error("Balance pool is closed");
+      }
+      return { browser, context };
+    } catch (error) { if (!assigned) this.free(); throw error; }
   }
 
   async releaseContext(context: BrowserContext) {
-    await trycatch(async () => await context.close());
-    this.activeContexts = Math.max(0, this.activeContexts - 1);
+    if (!this.contexts.has(context)) return;
+    try { await context.close(); } catch (error) { console.error("Balance context close failed:", error); }
+    finally { if (this.contexts.delete(context)) this.free(); }
   }
 
   async shutdown() {
-    for (const browser of this.browsers) {
-      await trycatch(async () => await browser.close());
+    this.stopped = true;
+    for (const waiter of this.waiters.splice(0)) {
+      waiter.signal?.removeEventListener("abort", waiter.abort);
+      waiter.reject(new Error("Balance pool is closed"));
     }
-    this.browsers = [];
-    this.activeContexts = 0;
+    await this.launching?.catch(() => undefined);
+    await Promise.allSettled([...this.contexts].map(context => this.releaseContext(context)));
+    await this.browser?.close();
+    this.browser = null;
   }
 }
-
 export const balancePool = new BalancePool();

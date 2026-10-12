@@ -20,12 +20,23 @@ import {
 } from "../services/analysis/engine.js";
 import { z } from "zod";
 import { requireActiveAccess } from "../middleware/access.js";
+import { getGapAnalysis } from "../services/analysis-gaps.js";
+import rateLimit from "express-rate-limit";
+import type { AuthenticatedRequest } from "../types/express.js";
 
 const router = Router();
 
 // All analysis endpoints require authentication
 router.use(requireAuth);
 router.use(requireActiveAccess());
+
+const gapQuery = z.object({ target: z.coerce.number().gt(1).finite().max(1_000_000).default(100), pointLimit: z.coerce.number().int().min(2).max(50).default(25) });
+router.get("/gaps", rateLimit({ windowMs: 60_000, limit: 30, keyGenerator: req => (req as AuthenticatedRequest).user.id }), async (req, res) => {
+  const parsed = gapQuery.safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.format() });
+  try { res.json(await getGapAnalysis(parsed.data.target, parsed.data.pointLimit)); }
+  catch (error) { console.error("Target gap query failed:", error); res.status(503).json({ error: "Target gap analysis is temporarily unavailable. Please retry." }); }
+});
 
 /**
  * GET /analysis/current

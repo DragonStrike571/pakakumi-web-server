@@ -14,6 +14,7 @@
  */
 
 import { bot } from "./bot.js";
+import { runQueueWorker } from "./queue-worker.js";
 
 // Grammy doesn't re-export its internal 'Other' type from the main module.
 // Since we're just passing options through to bot.api methods, we use 'any'
@@ -68,7 +69,7 @@ setInterval(() => {
       }
     }
   }
-}, PER_CHAT_CLEANUP_INTERVAL);
+}, PER_CHAT_CLEANUP_INTERVAL).unref();
 
 // ─── Queue Processing ───────────────────────────────────────────────────────
 
@@ -77,6 +78,12 @@ function enqueue<T>(
   priority: MessagePriority,
   execute: () => Promise<T>,
 ): Promise<T> {
+  if (
+    !((typeof chatId === "string" && chatId.trim()) ||
+      (typeof chatId === "number" && Number.isSafeInteger(chatId)))
+  ) {
+    return Promise.reject(new Error("Invalid Telegram chat ID"));
+  }
   if (!bot) {
     return Promise.reject(new Error("Bot is not initialized"));
   }
@@ -117,7 +124,15 @@ function enqueue<T>(
 function scheduleProcessing() {
   if (isProcessing) return;
   isProcessing = true;
-  processNext();
+  runWorker();
+}
+
+function runWorker() {
+  runQueueWorker(processNext, () => {
+    isProcessing = false;
+    // Restore queue processing after an error outside the per-message handler.
+    if (queue.length > 0) setTimeout(scheduleProcessing, GLOBAL_INTERVAL_MS);
+  });
 }
 
 async function processNext() {
@@ -165,7 +180,7 @@ async function processNext() {
 
   if (selectedIndex === -1) {
     // Queue has items but all are chat-throttled — wait for the shortest
-    setTimeout(processNext, Math.min(minPerChatWait, PER_CHAT_INTERVAL_MS));
+    setTimeout(runWorker, Math.min(minPerChatWait, PER_CHAT_INTERVAL_MS));
     return;
   }
 
@@ -176,7 +191,7 @@ async function processNext() {
   const totalWait = Math.max(globalWait, chatWait);
 
   if (totalWait > 0) {
-    setTimeout(processNext, totalWait);
+    setTimeout(runWorker, totalWait);
     return;
   }
 
@@ -193,7 +208,7 @@ async function processNext() {
   }
 
   // Schedule next item with minimal delay
-  setTimeout(processNext, GLOBAL_INTERVAL_MS);
+  setTimeout(runWorker, GLOBAL_INTERVAL_MS);
 }
 
 // ─── Retry Logic (handles 429) ──────────────────────────────────────────────
@@ -281,7 +296,7 @@ export function rateLimitedUnban(
   priority: MessagePriority = "low",
 ) {
   return enqueue(chatId, priority, () =>
-    bot!.api.unbanChatMember(chatId, userId),
+    bot!.api.unbanChatMember(chatId, userId, { only_if_banned: true }),
   );
 }
 
