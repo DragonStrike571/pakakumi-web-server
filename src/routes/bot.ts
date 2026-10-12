@@ -15,6 +15,7 @@ import { requireActiveAccess } from "../middleware/access.js";
 import rateLimit from "express-rate-limit";
 import { encrypt } from "../utils/crypto.js";
 import { strategyConfigSchema } from "../validation/strategies.js";
+import { requireHealthySource } from "../middleware/source.js";
 
 const router = Router();
 
@@ -45,7 +46,7 @@ const startBotSchema = z
     path: ["auth"],
   });
 
-router.post("/start", botLimiter, async (req: Request, res: Response) => {
+router.post("/start", botLimiter, requireHealthySource(), async (req: Request, res: Response) => {
   const validation = startBotSchema.safeParse(req.body);
   if (!validation.success) {
     res.status(400).json({ error: validation.error.format() });
@@ -238,7 +239,10 @@ router.get("/status", async (req: Request, res: Response) => {
 
   const { data: dbSessions, error } = await trycatch(async () => {
     return await db
-      .select()
+      .select({ id: botSessions.id, userId: botSessions.userId, strategyId: botSessions.strategyId,
+        status: botSessions.status, initialCapital: botSessions.initialCapital, currentCapital: botSessions.currentCapital,
+        totalProfit: botSessions.totalProfit, currentStep: botSessions.currentStep,
+        startedAt: botSessions.startedAt, endedAt: botSessions.endedAt })
       .from(botSessions)
       .where(eq(botSessions.userId, userId))
       .orderBy(desc(botSessions.startedAt))

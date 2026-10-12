@@ -23,6 +23,7 @@ import {
   analysisCheckpoints,
 } from "../../db/schema.js";
 import { desc, eq, inArray, sql, lt } from "drizzle-orm";
+import { dailyTargetPatch } from "./daily-target-patch.js";
 
 const databaseContext = new AsyncLocalStorage<typeof rootDb>();
 const db = new Proxy(rootDb, { get(_target, key) {
@@ -50,10 +51,10 @@ const K_OCCURRENCES = 5; // how many past occurrences to use for gap calculation
 const EAT_TIMEZONE = "Africa/Nairobi";
 
 // ─── Bandwidth Optimization Constants ───────────────────────────────────────
-// These control how often we write to the DB to reduce bandwidth from ~1.5GB/day
+// Keep snapshots throttled and signal history bounded; daily updates use small deltas.
 
 const SNAPSHOT_WRITE_INTERVAL = 5; // Write analysisSnapshots every N rounds (was every round)
-const DAILY_STATS_FLUSH_INTERVAL = 10; // Flush dailyStats to DB every N rounds (was every event)
+// Daily counters and small target deltas commit with the checkpoint for crash safety.
 const HISTORY_PRUNE_INTERVAL = 500; // Prune old signal_history every N rounds
 const HISTORY_RETENTION_DAYS = 30; // Keep signal_history entries for N days
 
@@ -165,7 +166,7 @@ export function runAnalysisEngine(newRound?: { id?: string; bust: number; create
 
 function captureEngineState() {
   return structuredClone({ cachedRounds, currentRoundIndex, cooldownMap, cachedSystemStats, systemStatsDirty,
-    cachedDailyStats, dailyStatsDirty, cachedPendingSignals, roundsSinceLastSnapshotWrite, roundsSinceLastDailyFlush,
+    cachedDailyStats, persistedDailyTargets, dailyStatsDirty, cachedPendingSignals, roundsSinceLastSnapshotWrite,
     roundsSinceLastHistoryPrune, lastSnapshotData });
 }
 function restoreEngineState(state: ReturnType<typeof captureEngineState>) {
@@ -173,8 +174,9 @@ function restoreEngineState(state: ReturnType<typeof captureEngineState>) {
   cooldownMap.clear(); for (const [key, value] of state.cooldownMap) cooldownMap.set(key, value);
   cachedSystemStats = state.cachedSystemStats; systemStatsDirty = state.systemStatsDirty;
   cachedDailyStats = state.cachedDailyStats; dailyStatsDirty = state.dailyStatsDirty;
+  persistedDailyTargets = state.persistedDailyTargets;
   cachedPendingSignals = state.cachedPendingSignals; roundsSinceLastSnapshotWrite = state.roundsSinceLastSnapshotWrite;
-  roundsSinceLastDailyFlush = state.roundsSinceLastDailyFlush; roundsSinceLastHistoryPrune = state.roundsSinceLastHistoryPrune;
+  roundsSinceLastHistoryPrune = state.roundsSinceLastHistoryPrune;
   lastSnapshotData = state.lastSnapshotData;
 }
 
@@ -200,7 +202,7 @@ const cooldownMap = new Map<
 let cachedSystemStats: { id: number; hits: number; signals: number; lastAlertRound: number } | null = null;
 let systemStatsDirty = false;
 
-// Cached daily stats — accumulated in memory, flushed periodically
+// Cached daily stats — dirty deltas commit with the round checkpoint
 let cachedDailyStats: {
   date: string;
   totalPredictions: number;
@@ -216,13 +218,13 @@ let cachedDailyStats: {
   }[];
 } | null = null;
 let dailyStatsDirty = false;
+let persistedDailyTargets: typeof dailyStats.$inferSelect.targets = [];
 
 // In-memory pending signals — avoids duplicate SELECTs
 let cachedPendingSignals: typeof pendingSignals.$inferSelect[] | null = null;
 
 // Throttle counters
 let roundsSinceLastSnapshotWrite = 0;
-let roundsSinceLastDailyFlush = 0;
 let roundsSinceLastHistoryPrune = 0;
 
 // Last snapshot data for the public accessor to use between DB writes
@@ -275,7 +277,7 @@ function calculateIdealPlanRounds(
   return expectedRoundsRemaining + buffer;
 }
 
-// ─── Daily Stats Helpers (In-Memory with Periodic Flush) ────────────────────
+// ─── Daily Stats Helpers (In-Memory with Durable Delta Writes) ──────────────
 
 /**
  * Ensure the in-memory daily stats cache is loaded and current.
@@ -326,6 +328,7 @@ async function ensureDailyStatsLoaded(): Promise<void> {
         targets: [],
       });
     }
+    persistedDailyTargets = structuredClone(cachedDailyStats!.targets);
     dailyStatsDirty = false;
   } catch (err) {
     console.error("❌ Error loading daily stats:", err);
@@ -334,7 +337,7 @@ async function ensureDailyStatsLoaded(): Promise<void> {
 
 /**
  * Flush the in-memory daily stats to the database.
- * Called periodically (every DAILY_STATS_FLUSH_INTERVAL rounds) instead of per-event.
+ * Only changed target entries cross the network; counters commit with the checkpoint.
  */
 async function flushDailyStats(): Promise<void> {
   if (!cachedDailyStats || !dailyStatsDirty) return;
@@ -346,11 +349,12 @@ async function flushDailyStats(): Promise<void> {
         totalPredictions: cachedDailyStats.totalPredictions,
         totalHits: cachedDailyStats.totalHits,
         totalMisses: cachedDailyStats.totalMisses,
-        targets: cachedDailyStats.targets,
+        targets: dailyTargetPatch(sql`${dailyStats.targets}`, persistedDailyTargets, cachedDailyStats.targets),
         updatedAt: new Date(),
       })
       .where(eq(dailyStats.date, cachedDailyStats.date));
 
+    persistedDailyTargets = structuredClone(cachedDailyStats.targets);
     dailyStatsDirty = false;
   } catch (err) {
     console.error("❌ Error flushing daily stats:", err);
@@ -371,6 +375,8 @@ function recordDailyPrediction(target: number): void {
     resolved: false,
     createdAt: new Date().toISOString(),
   });
+  // Match the existing recent-target limit on predictions as well as outcomes.
+  if (cachedDailyStats.targets.length > 50) cachedDailyStats.targets.splice(0, cachedDailyStats.targets.length - 50);
   dailyStatsDirty = true;
 }
 
@@ -873,12 +879,7 @@ async function analyzeRound(newRound?: {
     await flushSystemStats();
   }
 
-  // Flush daily stats periodically (not every event)
-  roundsSinceLastDailyFlush++;
-  if (dailyStatsDirty && roundsSinceLastDailyFlush >= DAILY_STATS_FLUSH_INTERVAL) {
-    await flushDailyStats();
-    roundsSinceLastDailyFlush = 0;
-  }
+  // Daily changes flush once, alongside the durable checkpoint in runAnalysisEngine.
 
   // ─── Step 6: Update analysis snapshot (throttled) ─────────────────────
   // Build snapshot from in-memory pending signals (no duplicate DB read)

@@ -1,5 +1,7 @@
 # Web server fixes and validation
 
+13 October storage/bandwidth follow-up: server build and **73 tests** passed; **11 focused database/delta tests** passed after minimizing round INSERT responses. Normal saves avoid the preliminary SELECT, bot status excludes unused logs/credentials, and live session checks fetch only three authorization fields. Daily targets use small transactional SQL deltas while retaining checkpoint/replay safety. No additional migration or raw-round deletion. See [FREE_TIER_REVIEW.md](FREE_TIER_REVIEW.md), [SIMPLE_UPDATE_GUIDE.md](SIMPLE_UPDATE_GUIDE.md), and the read-only [Supabase usage query](SUPABASE_USAGE.sql).
+
 12 October 2026. Addresses all 21 findings in CODEBASE_REVIEW.md, plus the original WebSocket shutdown and Telegram exception failures. Changes are local; the live PM2 process and production database have not been modified.
 
 | Finding | Implemented fix | Regression coverage |
@@ -31,5 +33,7 @@ Validation passed: `npm run build`; all **59 tests** in `npm test` (file concurr
 Deploy with the steps in README.md. Apply migrations before restarting. Preserve COLLECTION_DATA_DIR and run one collector instance. Verify existing access-enabled accounts against trusted grants using `npm run db:audit-access`; legitimate users are not automatically downgraded. Data already lost outside visible game history cannot be reconstructed. Telegram outbox messages use at-least-once delivery, so a crash after send and before acknowledgement can repeat a message.
 
 The old `*-probe.mjs` files preserve pre-fix reproduction evidence and are not current pass/fail tests. Use `npm test` for the corrected behavior.
+
+Outage/proxy follow-up (12 October 2026): server build and **71 regression tests** passed, including a virtual 48-hour outage, one-minute retry cap, stale and hung source history, checkpoint retention, stop safety, local Nginx per-client limits and provider-operation guards. Frontend build/lint, **14 unit tests** and **19 production browser tests** passed. See `review/OUTAGE_AND_PROXY_FIX.md` for operation and same-VPS deployment instructions. This follow-up adds no migration.
 
 Frontend integration follow-up (12 October 2026): the final server build and **63 regression tests** passed after adding the cached `/analysis/gaps` endpoint with a two-query concurrency limit, zero-valued custom backtest risk overrides, the zero-rounded algorithm guard, and resolving-round counts for signal outcomes. Gap tests cover empty/fresh histories, latest-milestone scoping, retained occurrence numbering and capacity recovery. See the frontend's `review/CODEBASE_REVIEW.md` and `review/FIX_VALIDATION.md` for client flows and coordinated deployment steps.

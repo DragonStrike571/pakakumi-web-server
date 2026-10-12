@@ -116,7 +116,11 @@ test("round retry cannot insert twice or mutate counters before a successful ins
     const round = { ingestionId: randomUUID(), bust: 3000, bustId: "3000-2-3-4-5-6-7-8-9-10", metricsComplete: false,
       playersOnline: null, playersPlaying: null, totalAmountPlayed: null, totalAmountWon: null, totalAmountLost: null, averageAmountPlayed: null, maxAmountPlayed: null };
     const service = new RoundService(database);
+    const findFirst = database.query.rounds.findFirst.bind(database.query.rounds);
+    let lookups = 0;
+    database.query.rounds.findFirst = ((...args: any[]) => { lookups++; return (findFirst as any)(...args); }) as typeof findFirst;
     await service.processRound(round); await service.processRound(round);
+    assert.equal(lookups, 2, "one startup lookup and one replay lookup; normal captures do not read first");
     assert.equal((await database.select().from(schema.rounds)).length, 1);
     const before = service.getState();
     const insert = database.insert.bind(database);
@@ -126,6 +130,28 @@ test("round retry cannot insert twice or mutate counters before a successful ins
     database.insert = insert;
     await service.processRound({ ...round, ingestionId: randomUUID(), bust: 1.01, bustId: "1.01-3000-2-3-4-5-6-7-8-9" });
     assert.equal(service.getState().roundsSinceLast3000, 1);
+  } finally { await pg.close(); }
+});
+
+test("compact socket lookup still detects suspension, expiry, token rotation and logout on the next check", async () => {
+  const { pg, database } = await fixture();
+  try {
+    const { createSocketSessionLookup } = await import("../ws/session-lookup.js");
+    await database.insert(schema.users).values({ id: "socket-user", name: "Socket", email: "socket@example.test", accessStatus: "active" });
+    await database.insert(schema.sessions).values({ id: "socket-session", userId: "socket-user", token: "verified-token", expiresAt: new Date(Date.now() + 60_000) });
+    let verifications = 0;
+    const lookup = createSocketSessionLookup(async () => { verifications++; return { user: { id: "socket-user" }, session: { id: "socket-session", token: "verified-token" } }; }, database);
+    assert.equal((await lookup())?.user.accessStatus, "active");
+    await database.update(schema.users).set({ accessStatus: "suspended" }).where(eq(schema.users.id, "socket-user"));
+    assert.equal((await lookup())?.user.accessStatus, "suspended");
+    await database.update(schema.sessions).set({ expiresAt: new Date(0) }).where(eq(schema.sessions.id, "socket-session"));
+    assert.equal((await lookup())?.session.expiresAt.getTime(), 0);
+    await database.update(schema.sessions).set({ token: "rotated-token" }).where(eq(schema.sessions.id, "socket-session"));
+    assert.equal(await lookup(), null);
+    await database.delete(schema.sessions).where(eq(schema.sessions.id, "socket-session"));
+    assert.equal(await lookup(), null);
+    assert.equal(verifications, 1);
+    assert.equal(await createSocketSessionLookup(async () => null, database)(), null);
   } finally { await pg.close(); }
 });
 

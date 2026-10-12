@@ -11,6 +11,7 @@ import { balancePool } from "../services/balance-pool.js";
 import { GAME_SELECTORS } from "../utils/selectors.js";
 import { requireActiveAccess } from "../middleware/access.js";
 import rateLimit from "express-rate-limit";
+import { requireHealthySource } from "../middleware/source.js";
 
 const router = Router();
 
@@ -151,7 +152,7 @@ const balanceCheckSchema = z.object({
  * POST /account/balance — Check Pakakumi balance via headless browser
  * Accepts either { credentialId } or { phone, pass }
  */
-router.post("/balance", balanceLimiter, async (req: Request, res: Response) => {
+router.post("/balance", balanceLimiter, requireHealthySource(), async (req: Request, res: Response) => {
   const validation = balanceCheckSchema.safeParse(req.body);
   if (!validation.success) {
     res

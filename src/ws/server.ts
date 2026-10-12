@@ -7,6 +7,7 @@ import { fromNodeHeaders } from "better-auth/node";
 import { createClientVerifier } from "./verify-client.js";
 import { pingClient, sendText } from "./transport.js";
 import { SocketAccessGuard } from "./access-guard.js";
+import { createSocketSessionLookup } from "./session-lookup.js";
 
 // ─── Typed WS Payload Interfaces ────────────────────────────────────────────
 
@@ -73,7 +74,7 @@ export function attachWebSocketServer(httpServer: Server) {
       ws.isAlive = true;
     });
 
-    const guard = new SocketAccessGuard(() => auth.api.getSession({ headers: fromNodeHeaders(req.headers), query: { disableCookieCache: true } }), () => ws.terminate());
+    const guard = new SocketAccessGuard(createSocketSessionLookup(() => auth.api.getSession({ headers: fromNodeHeaders(req.headers), query: { disableCookieCache: true } })), () => ws.terminate());
     guards.set(ws, guard);
     ws.once("close", () => { guard.dispose(); guards.delete(ws); });
     void guard.send(() => sendJson(ws, {

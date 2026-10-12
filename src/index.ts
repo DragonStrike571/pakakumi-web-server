@@ -9,6 +9,7 @@ import { drainAnalysis } from "./services/analysis/engine.js";
 import { balancePool } from "./services/balance-pool.js";
 import { backtestRunner } from "./services/backtest/runner.js";
 import { shutdownWithDeadline } from "./utils/shutdown.js";
+import { resolveProxyTrust } from "./config/proxy.js";
 import { startDeliveryWorker } from "./services/telegram/outbox.js";
 import roundsRouter from "./routes/rounds.js";
 import { attachWebSocketServer } from "./ws/server.js";
@@ -56,12 +57,7 @@ if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65_535) {
   throw new Error("PORT must be an integer between 1 and 65535");
 }
 const HOST = process.env.HOST || "0.0.0.0";
-const TRUST_PROXY_HOPS = process.env.TRUST_PROXY_HOPS
-  ? Number(process.env.TRUST_PROXY_HOPS)
-  : 0;
-if (!Number.isInteger(TRUST_PROXY_HOPS) || TRUST_PROXY_HOPS < 0 || TRUST_PROXY_HOPS > 5) {
-  throw new Error("TRUST_PROXY_HOPS must be an integer between 0 and 5");
-}
+const PROXY_TRUST = resolveProxyTrust();
 import { CORS_ORIGINS } from "./config/cors.js";
 
 const app = express();
@@ -69,7 +65,8 @@ const server = http.createServer(app);
 const toNullableNumber = (value: number | string | null) =>
   value === null ? null : Number(value);
 
-app.set("trust proxy", TRUST_PROXY_HOPS || false);
+app.set("trust proxy", PROXY_TRUST);
+console.log("Reverse proxy trust:", PROXY_TRUST);
 
 // Security middleware
 app.use(helmet());
@@ -86,7 +83,7 @@ app.use(
 
 app.use((req, res, next) => {
   // Filter noisy health check and WebSocket upgrade logs
-  if (req.url !== "/health" && req.url !== "/ws") {
+  if (req.path !== "/health" && req.path !== "/live" && req.path !== "/ws") {
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   }
   next();
@@ -97,7 +94,7 @@ app.use(rateLimit({
   limit: 600,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => req.path === "/health",
+  skip: (req) => req.path === "/health" || req.path === "/live",
 }));
 
 // Rate limiter for Auth endpoints
@@ -115,9 +112,12 @@ app.get("/", (req: Request, res: Response) => {
   res.send("Pakakumi Web Server is running!");
 });
 
+// Process liveness is separate from upstream collection readiness.
+app.get("/live", (_req, res) => res.json({ status: "ok", uptime: process.uptime() }));
+
 app.get("/health", (req: Request, res: Response) => {
   const scraper = gameScraper.getStatus();
-  const healthy = scraper.running && scraper.captureError === null && collectionInbox.getStatus().saveFailures === 0;
+  const healthy = scraper.healthy && collectionInbox.getStatus().saveFailures === 0;
   res.status(healthy ? 200 : 503).json({
     status: healthy ? "ok" : "degraded",
     collection: collectionInbox.getStatus(),
@@ -217,7 +217,7 @@ let stopDeliveryWorker: () => Promise<void> = async () => undefined;
 async function initializeServices() {
   await roundService.initialize();
   const checkpoint = await collectionInbox.initialize(roundService.getState().lastBustId);
-  gameScraper.setCaptureHandler(checkpoint, (batch, checkpoint) => collectionInbox.capture(batch, checkpoint));
+  gameScraper.setCaptureHandler(checkpoint, (batch, checkpoint) => collectionInbox.capture(batch, checkpoint), roundService.getLastSavedAt());
   await gameScraper.start();
 
   if (process.env.PAYSTACK_SECRET_KEY) {

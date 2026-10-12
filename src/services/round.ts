@@ -53,6 +53,7 @@ export class RoundService {
     const { data: lastRound, error } = await trycatch(async () => {
       return await this.database.query.rounds.findFirst({
         orderBy: [desc(rounds.createdAt)],
+        columns: { createdAt: true, totalReserveFunds: true, roundsSinceLast3000: true, bustId: true },
       });
     });
 
@@ -131,17 +132,6 @@ export class RoundService {
       await this.initialize();
     }
 
-    if (data.ingestionId) {
-      const existing = await this.database.query.rounds.findFirst({ where: eq(rounds.id, data.ingestionId) });
-      if (existing) {
-        if (existing.createdAt.getTime() > this.lastSavedTime) {
-          this.lastSavedTime = existing.createdAt.getTime();
-          this.lastRoundState = { totalReserveFunds: existing.totalReserveFunds, roundsSinceLast3000: existing.roundsSinceLast3000,
-            lastBustId: existing.bustId, consecutiveNonOverlapping: 0 };
-        }
-        return existing;
-      }
-    }
     const previous = this.lastRoundState;
     const nextState = { ...previous };
     let gapDetected = data.sourceGap === true;
@@ -204,7 +194,7 @@ export class RoundService {
       }
     }
 
-    const roundPayload: typeof rounds.$inferInsert = {
+    const roundPayload = {
       id: data.ingestionId,
       createdAt: new Date(Math.max(Date.now(), this.lastSavedTime + 1)),
       bust: data.bust,
@@ -220,12 +210,26 @@ export class RoundService {
       roundsSinceLast3000: newRoundsSinceLast3000,
       gapDetected,
       metricsComplete: data.metricsComplete,
-    };
+    } satisfies typeof rounds.$inferInsert;
 
     const { data: savedRound, error } = await trycatch(async () => {
-      const result = await this.database.insert(rounds).values(roundPayload).returning();
-      return result[0];
+      // Normal captures need one query; only a replay fetches the already committed row.
+      const result = await this.database.insert(rounds).values(roundPayload)
+        .onConflictDoNothing({ target: rounds.id }).returning({ id: rounds.id, updatedAt: rounds.updatedAt });
+      return result[0] ? { ...roundPayload, ...result[0] } : undefined;
     });
+
+    if (!error && !savedRound && data.ingestionId) {
+      const existing = await this.database.query.rounds.findFirst({ where: eq(rounds.id, data.ingestionId) });
+      if (existing) {
+        if (existing.createdAt.getTime() > this.lastSavedTime) {
+          this.lastSavedTime = existing.createdAt.getTime();
+          this.lastRoundState = { totalReserveFunds: existing.totalReserveFunds, roundsSinceLast3000: existing.roundsSinceLast3000,
+            lastBustId: existing.bustId, consecutiveNonOverlapping: 0 };
+        }
+        return existing;
+      }
+    }
 
     if (error || !savedRound) {
       console.error("❌ Error saving round to DB:", error);
@@ -254,6 +258,9 @@ export class RoundService {
    */
   getState() {
     return { ...this.lastRoundState };
+  }
+  getLastSavedAt() {
+    return this.lastSavedTime ? new Date(this.lastSavedTime).toISOString() : null;
   }
 }
 
