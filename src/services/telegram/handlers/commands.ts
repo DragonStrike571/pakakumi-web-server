@@ -36,7 +36,7 @@ const MAX_MSG_LENGTH = 4096;
 /** Input validation caps */
 const MAX_MULTIPLIER = 3000;
 const MAX_CAPITAL = 10_000_000;
-const MIN_BET = 5;
+const MIN_BET = 10;
 const MAX_LAST_COUNT = 10;
 const MAX_ANALYZE_ROUNDS_FREE = 20;
 const MAX_ANALYZE_ROUNDS_PREMIUM = 500;
@@ -614,7 +614,7 @@ export function setupCommands(bot: Bot<MyContext>) {
       `📊 <b>Median:</b> ${result.median}x\n\n`;
 
     // Distribution table
-    msg += `<b>Multiplier Distribution:</b>\n`;
+    msg += `<i>Expected values use an assumed 1% house edge; current Crash RTP is unverified. Each round is independent.</i>\n\n<b>Multiplier Distribution:</b>\n`;
     for (const tier of result.multiplierDistribution) {
       const indicator =
         tier.status === "hot" ? "🔥" : tier.status === "cold" ? "🧊" : "  ";

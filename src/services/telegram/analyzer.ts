@@ -34,12 +34,9 @@ import {
  * No exact numbers are revealed — words scale with the likely duration.
  */
 function getVagueTimingPhrase(planRounds: number): string {
-  if (planRounds <= 5) return "Any moment now";
-  if (planRounds <= 15) return "Very soon";
-  if (planRounds <= 30) return "Coming up shortly";
-  if (planRounds <= 60) return "In the near future";
-  if (planRounds <= 120) return "Building up — keep watching";
-  return "Developing — patience needed";
+  if (planRounds <= 15) return "Short model planning window";
+  if (planRounds <= 60) return "Medium model planning window";
+  return "Long model planning window";
 }
 
 /**
@@ -131,15 +128,15 @@ async function deliverAnalysis(result: AnalysisResult, newRound?: { bust: number
       if (privateChannelId) {
         // Pick the most relevant reason from the cluster
         const mainReason =
-          cluster.alerts[0].reason || "The pattern shows this target is ready.";
+          cluster.alerts[0].reason || "A historical gap threshold was reached.";
 
         // Build the ideal plan line
         let idealLine = "";
         if (cluster.isLate) {
           idealLine =
             `\n⚠️ <b>Caution:</b> Timing is unpredictable right now. ` +
-            `This target is overdue and the exact timing cannot be estimated. ` +
-            `Proceed with smaller bets and extra patience.`;
+            `A longer gap does not make the next round more likely to hit. ` +
+            `The model cannot determine the next hit.`;
         } else if (cluster.idealPlanRounds > 0) {
           idealLine =
             `\n📋 <b>Ideal Plan:</b> Budget for up to <b>${cluster.idealPlanRounds}</b> rounds` +
@@ -150,9 +147,9 @@ async function deliverAnalysis(result: AnalysisResult, newRound?: { bust: number
           `⚠️ <b>NEW TARGET ALERT</b>\n\n` +
           `🎯 <b>Target:</b> &gt;${cluster.targetsStr}\n\n` +
           `📖 <b>Why:</b> ${mainReason}\n\n` +
-          `⏱️ <b>Expected Window:</b> ${cluster.roundsRange} games\n` +
+          `⏱️ <b>Model Window:</b> ${cluster.roundsRange} games\n` +
           `${idealLine}\n` +
-          `📊 <b>How Sure:</b> ${cluster.avgConfidence}%\n` +
+          `📊 <b>Heuristic Score:</b> ${cluster.avgConfidence}%\n` +
           `🔥 <b>Status:</b> ${cluster.status}\n\n` +
           `<i>Use the bot to plan your bets before you start.</i>`;
 
@@ -186,15 +183,15 @@ async function deliverAnalysis(result: AnalysisResult, newRound?: { bust: number
           teaseMsg =
             `🎁 <b>FREE TARGET</b> 🎁\n\n` +
             `🎯 <b>Target:</b> &gt;${cluster.alerts[0].target}x\n\n` +
-            `⏱️ <b>When:</b> ${vaguePhrase}\n\n` +
+            `⏱️ <b>Model Window:</b> ${vaguePhrase}\n\n` +
             `This is a free premium target. Plan your bets properly and don't force it.`;
         } else {
           teaseMsg =
             `🚨 <b>NEW ALERT</b> 🚨\n\n` +
-            `📊 <b>How Sure:</b> ${cluster.avgConfidence}%\n` +
+            `📊 <b>Heuristic Score:</b> ${cluster.avgConfidence}%\n` +
             `🎯 <b>Target:</b> [PREMIUM ONLY]\n\n` +
-            `⏱️ <b>Timing:</b> ${vaguePhrase}\n\n` +
-            `The exact target was just sent to Premium members.`;
+            `⏱️ <b>Model Window:</b> ${vaguePhrase}\n\n` +
+            `The target was just sent to Premium members. The score is not a win probability.`;
         }
 
         const publicKb = new InlineKeyboard()
@@ -223,9 +220,9 @@ async function deliverAnalysis(result: AnalysisResult, newRound?: { bust: number
         const targetsStr = streakTargets.map((t) => `${t}x`).join(", ");
         const correlationMsg =
           `🔗 <b>AGGREGATE CORRELATION DETECTED</b>\n\n` +
-          `Several targets are lining up at the same time. This usually means a big round is coming soon.\n\n` +
+          `Several historical gap thresholds were reached at the same time. This does not predict a big round.\n\n` +
           `🎯 <b>Correlated Targets:</b> &gt;${targetsStr}\n\n` +
-          `💡 <b>What this means:</b> ${streakTargets.length} targets are all waiting to be hit. When this many line up together, the chance of a big round is much higher. Plan your bets carefully.`;
+          `💡 <b>What this means:</b> ${streakTargets.length} targets passed model thresholds. Each round remains independent; the next result is unknown.`;
 
         await rateLimitedSend(privateChannelId, correlationMsg, {
           parse_mode: "HTML",

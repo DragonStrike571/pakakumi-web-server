@@ -3,10 +3,11 @@ import { EventEmitter } from "events";
 import { config } from "dotenv";
 import { trycatch } from "../utils/try-catch.js";
 import { runBackgroundTask } from "../utils/background-task.js";
+import { GAME_SOURCE_READER, type GameSourceSnapshot } from "./game-source-dom.js";
 
 config();
 
-const PAKAKUMI_URL = process.env.PAKAKUMI_URL || "https://play.pakakumi.com";
+const PAKAKUMI_URL = process.env.PAKAKUMI_URL || "https://pakakumi.com/crash";
 const chromiumArgs = process.env.PLAYWRIGHT_DISABLE_SANDBOX === "true"
   ? ["--no-sandbox", "--disable-setuid-sandbox"]
   : [];
@@ -26,6 +27,7 @@ export interface RoundData {
 }
 
 class CaptureFailure extends Error {}
+class SourceUnavailable extends Error {}
 type ScraperOptions = {
   now?: () => number;
   launch?: () => Promise<Browser>;
@@ -148,11 +150,8 @@ export class GameScraper extends EventEmitter {
         waitUntil: "domcontentloaded",
         timeout: 45_000,
       });
-      if (response && response.status() >= 400) throw new Error(`Pakakumi returned HTTP ${response.status()}; collection is waiting for the source to recover`);
+      if (response && response.status() >= 400) throw new SourceUnavailable(`Pakakumi returned HTTP ${response.status()}; collection is waiting for the source to recover`);
       if (!this.desiredRunning) throw new Error("Scraper start was cancelled");
-
-      // SKIPPED: // Configure settings to show more players
-      // await this.configureGameSettings();
 
       // Attach MutationObserver that calls our signal function
       await this.setupObserver();
@@ -171,7 +170,8 @@ export class GameScraper extends EventEmitter {
 
     if (error) {
       if (this.desiredRunning) this.recordFailure(error);
-      console.error("❌ Error starting scraper:", error);
+      if (error instanceof SourceUnavailable) console.warn(`Collection source unavailable: ${error.message}`);
+      else console.error("❌ Error starting scraper:", error);
       await this.closeBrowser();
       this.scheduleRestart(this.retryBaseMs);
     }
@@ -193,7 +193,8 @@ export class GameScraper extends EventEmitter {
     this.page = null;
     this.isRunning = false;
     if (!browser) return;
-    browser.removeAllListeners("disconnected");
+    // The identity guard already ignores our callback for this detached browser.
+    // Playwright's own disconnected listener resolves browser.close(); keep it.
     await browser.close().catch((error) => {
       console.warn("Failed to close scraper browser cleanly:", error);
     });
@@ -312,59 +313,20 @@ export class GameScraper extends EventEmitter {
   // ---------------------------------------------------------------------------
 
   /**
-   * Configure game settings to show up to 3000 people.
-   */
-  private async configureGameSettings() {
-    if (!this.page) return;
-
-    try {
-      console.log("⚙️ Opening settings...");
-      await this.page.locator("div.css-1633bsf a button.css-1t9yabi").click();
-
-      console.log("🛠️ Modifying settings to show up to 3000 people...");
-      await this.page
-        .locator(
-          "div.css-1g3l8kd div.css-1633bsf div.css-1l95nvm input.css-10zyika",
-        )
-        .click();
-      await this.page
-        .locator(
-          "div.css-1g3l8kd div.css-1633bsf div.css-1l95nvm input.css-10zyika",
-        )
-        .fill("3000");
-      await this.page.locator("div.css-16j3z8f").click();
-      console.log("✅ Settings configured.");
-    } catch (err) {
-      console.warn("⚠️ Could not configure settings (may have changed):", err);
-    }
-  }
-
-  /**
    * Attach a MutationObserver in the browser that calls __onDomChanged().
    * The observer does NO scraping — it only signals Node that something changed.
    */
   private async setupObserver() {
     if (!this.page) return;
-
-    await this.page
-      .locator("table.css-1a87jyo tbody")
-      .first()
-      .waitFor({ state: "attached", timeout: 30_000 });
-    const attached = await this.page.evaluate(() => {
-      const targetNode = document.querySelector("table.css-1a87jyo tbody");
-      if (!targetNode) return false;
-
-      (window as any).__pakakumiObserver?.disconnect();
-      const observer = new MutationObserver(() => {
-        (window as any).__onDomChanged();
-      });
-      observer.observe(targetNode, { childList: true, subtree: true });
-      (window as any).__pakakumiObserver = observer;
-      console.log("📡 DOM change observer attached.");
-      return true;
-    });
-    if (!attached) throw new Error("Pakakumi round-history table was not found");
-
+    try {
+      const ready = await this.page.waitForFunction(GAME_SOURCE_READER, undefined, { timeout: 30_000, polling: 1000 });
+      await ready.dispose();
+    } catch (error) {
+      if (error instanceof Error && error.name === "TimeoutError") {
+        throw new SourceUnavailable("Pakakumi crash history is not ready after 30 seconds; the page may be loading, under maintenance, or have a new layout");
+      }
+      throw error;
+    }
   }
 
   /**
@@ -383,22 +345,15 @@ export class GameScraper extends EventEmitter {
 
     try {
       // One browser task reads a coherent DOM snapshot, including financial rows.
-      const observation = this.page.evaluate(() => {
-        const texts = (selector: string) => Array.from(document.querySelectorAll(selector)).map(el => el.textContent || "");
-        return {
-          busts: texts("table.css-1a87jyo tbody tr.css-15iar3s td span.css-hwpcld"),
-          counts: texts("div.css-eb3kfa strong"),
-          amounts: texts("div.css-afms4i table.css-1a87jyo tbody tr td:nth-child(3)"),
-          profits: texts("div.css-afms4i table.css-1a87jyo tbody tr td:nth-child(4)"),
-        };
-      });
+      const observation = this.page.evaluate(GAME_SOURCE_READER) as Promise<GameSourceSnapshot | null>;
       let deadline: ReturnType<typeof setTimeout> | undefined;
       const snapshot = await Promise.race([observation, new Promise<never>((_resolve, reject) => {
         deadline = setTimeout(() => reject(new Error("Pakakumi history read timed out")), this.readTimeoutMs);
       })]).finally(() => clearTimeout(deadline));
+      if (!snapshot) throw new SourceUnavailable("Pakakumi crash history is missing or ambiguous");
       const bustElements = snapshot.busts;
       const busts = bustElements
-        .map((text) => Number(text.trim().replace(/x$/i, "").replace(/,/g, "")))
+        .map((text) => Number(text.trim().replace(/[x×\s,]/gi, "")))
         .slice(0, 40);
       if (busts.some(b => !Number.isFinite(b) || b < 1)) throw new Error("Invalid bust history");
 
@@ -428,6 +383,8 @@ export class GameScraper extends EventEmitter {
         playingCount > 0 ? totalCashPlayed / playingCount : 0;
       const maxSpending = amounts.length > 0 ? Math.max(...amounts) : 0;
       const onlineCount = Number(onlineCountStr.replace(/,/g, ""));
+      const countsComplete = [onlineCountStr, playingCountStr].every(text => /^\d+(?:,\d{3})*$/.test(text.trim())) &&
+        [onlineCount, playingCount].every(number => Number.isSafeInteger(number) && number >= 0) && onlineCount >= playingCount;
       const metricsComplete = amountElements.length > 0 && amounts.length === profits.length &&
         amounts.length === playingCount && playingCountStr.trim() !== "" && Number.isSafeInteger(playingCount) && playingCount >= 0 &&
         onlineCountStr.trim() !== "" && Number.isSafeInteger(onlineCount) && onlineCount >= playingCount &&
@@ -443,6 +400,7 @@ export class GameScraper extends EventEmitter {
         averageSpending,
         maxSpending,
         metricsComplete,
+        countsComplete,
       };
     } catch (error) {
       console.error(
@@ -481,8 +439,8 @@ export class GameScraper extends EventEmitter {
       const roundData: RoundData = {
         bust: item.bust,
         bustId: item.id,
-        playersOnline: metricsComplete ? data.onlineCount : null,
-        playersPlaying: metricsComplete ? data.playingCount : null,
+        playersOnline: item.sourceIndex === 0 && data.countsComplete ? data.onlineCount : null,
+        playersPlaying: item.sourceIndex === 0 && data.countsComplete ? data.playingCount : null,
         totalAmountPlayed: metricsComplete ? data.totalCashPlayed : null,
         totalAmountWon: metricsComplete ? data.totalWinAmount : null,
         totalAmountLost: metricsComplete ? data.totalLossAmount : null,

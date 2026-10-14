@@ -154,7 +154,7 @@ export function generateAlgorithmBets(
 export function executeStrategy(
   config: StrategyConfig,
   currentStep: number,
-  lastRoundResult?: { bust: number; betPlaced: number; cashout: number },
+  lastRoundResult?: { bust: number; betPlaced: number; cashout: number; won?: boolean },
 ): { action: BetAction; nextStep: number; retryStep: number } {
   const bets =
     config.type === "algorithm" && config.algorithm
@@ -180,7 +180,7 @@ export function executeStrategy(
   // Process previous round result
   if (lastRoundResult) {
     const { bust, cashout } = lastRoundResult;
-    const won = bust >= cashout;
+    const won = lastRoundResult.won ?? (bust >= cashout);
 
     if (won && config.stopAfterWin) {
       return {

@@ -1,6 +1,10 @@
 # Pakakumi Web Server
 
+For the crash-page changes and cross-project reliability fixes, follow [the combined deployment guide](review/COMBINED_UPDATE_STEPS.md). [The long-term review](review/LONG_TERM_REVIEW.md) records the fixes, tests and remaining verification boundaries.
+
 Express API, Better Auth, PostgreSQL/Drizzle persistence, round scraper, analytics, Telegram and Paystack services, and authenticated WebSockets.
+
+The collector supports the current crash-history strip at `https://pakakumi.com/crash` and the legacy history table. Set `PAKAKUMI_URL` to the direct crash route. Generated CSS changes alone no longer identify the new history; only complete, unambiguous multiplier history is accepted. Financial fields from the new, potentially partial player table remain unknown. See [the scraper layout fix](review/SCRAPER_LAYOUT_FIX.md).
 
 For copy-and-paste VPS update steps, including saving `.env` in nano, see [the simple update guide](review/SIMPLE_UPDATE_GUIDE.md). The [free-tier review](review/FREE_TIER_REVIEW.md) describes retained storage/bandwidth optimizations and the read-only Supabase usage check.
 
@@ -38,3 +42,5 @@ Pakakumi maintenance/outages do not stop the web API. Upstream HTTP errors, miss
 During an outage `/health` correctly returns 503 and includes source status, last captured round, outage start and next retry. `/live` continues returning 200 while the web process responds; use `/live` for process-restart monitoring so upstream maintenance does not trigger a restart loop. New bot sessions and balance checks return a retryable 503 while collection is not healthy; saved data, account management and session-stop operations remain available. The frontend displays the source pause across authenticated pages and keeps historical data usable.
 
 For deployment, back up the database, stop the old collector gracefully (PM2 `kill_timeout` should exceed 15 seconds), deploy the source and lockfile, run `npm ci`, `npm run db:migrate`, `npm run build`, and `npm run db:audit-access`, then restart the PM2 process with `pm2 restart pakakumi-server --update-env` (substitute the actual process name from `pm2 list`). Confirm `/live` returns 200. `/health` may remain 503 during provider maintenance; it should return 200 after fresh round capture and persistence resume. PM2 must run the updated source or `dist/src/index.js`; rebuilding is necessary when it runs `dist`.
+
+The 14 October page-integration and rules check also updates account login/balances and both local players: see [review/PAGE_AND_RULES_REVIEW.md](review/PAGE_AND_RULES_REVIEW.md) and the beginner [update steps](review/PAGE_UPDATE_STEPS.md).

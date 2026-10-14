@@ -1,5 +1,7 @@
 # Your update steps
 
+**For the three latest updates together, use [COMBINED_UPDATE_STEPS.md](COMBINED_UPDATE_STEPS.md).** Keep this guide's Supabase usage/log instructions as supporting information; its deployment section describes an earlier checkpoint.
+
 This guide uses the commands you already use. The changes must first be committed and pushed to your Git repository; `git pull` cannot download changes that exist only on this computer.
 
 ## Update the server
@@ -30,6 +32,14 @@ Use the same VPS terminal where you normally run PM2. Paste **one line at a time
    TRUST_PROXY_ADDRESSES=loopback
    ```
 
+   For the new Pakakumi crash-page layout, also find `PAKAKUMI_URL` and set it to:
+
+   ```text
+   PAKAKUMI_URL=https://pakakumi.com/crash
+   ```
+
+   If the line is missing, add it at the bottom. The collector fix itself requires no new database migration. The subsequent page-integration follow-up also changes frontend analysis labels and both local players; see `review/PAGE_UPDATE_STEPS.md`.
+
    Keep your database URL, passwords, tokens and existing `COLLECTION_DATA_DIR` value. If you still have `TRUST_PROXY_HOPS=0`, the new line above takes precedence; you do not need to work out what that older setting means.
 
    Save: **Ctrl + O**, then **Enter**. Exit: **Ctrl + X**.
@@ -38,6 +48,12 @@ Use the same VPS terminal where you normally run PM2. Paste **one line at a time
 
    ```bash
    npm ci
+   ```
+
+   Ensure the scraper's browser matches the installed package version:
+
+   ```bash
+   npx playwright install chromium
    ```
 
 5. Build:
@@ -80,7 +96,7 @@ Use the same VPS terminal where you normally run PM2. Paste **one line at a time
    pm2 logs pakakumi-server --lines 30
    ```
 
-   Look for new `Saved round` messages when Pakakumi is operating. If Pakakumi is under maintenance, `Collection will retry` is expected. The web process should remain online. **Ctrl + C** exits the log view; it does not stop the server.
+   Look for `Scraper started and listening for rounds` and new `Saved round` messages when Pakakumi is operating. The old `locator('table.css-1a87jyo tbody')` timeout should no longer appear after deploying this fix. `[GAP]` and null financial values can appear with the new, incomplete player display; the captured multipliers are still saved. If Pakakumi is under maintenance, `Collection will retry` is expected. The web process should remain online. **Ctrl + C** exits the log view; it does not stop the server.
 
 Your existing PM2 entry must launch `dist/src/index.js` or the project's normal `npm start`. If it launches another file, paste the entry details before changing it. Keep one collector instance.
 

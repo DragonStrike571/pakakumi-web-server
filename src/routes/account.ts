@@ -8,7 +8,7 @@ import { encrypt, decrypt } from "../utils/crypto.js";
 import { requireAuth } from "../middleware/auth.js";
 import { AuthenticatedRequest } from "../types/express.js";
 import { balancePool } from "../services/balance-pool.js";
-import { GAME_SELECTORS } from "../utils/selectors.js";
+import { checkPakakumiBalance } from "../utils/pakakumi-page.js";
 import { requireActiveAccess } from "../middleware/access.js";
 import rateLimit from "express-rate-limit";
 import { requireHealthySource } from "../middleware/source.js";
@@ -209,73 +209,7 @@ router.post("/balance", balanceLimiter, requireHealthySource(), async (req: Requ
 
     try {
       const page = await context.newPage();
-      await page.goto("https://play.pakakumi.com/login", {
-        waitUntil: "networkidle",
-        timeout: 15000,
-      });
-
-      console.log("[Balance] Login page loaded, filling form...");
-
-      // Wait for login fields - support both previous and current selectors
-      await page.waitForSelector(GAME_SELECTORS.LOGIN.PHONE_INPUT, {
-        timeout: 10000,
-      });
-
-      // Try multiple possible selectors since game UI updates frequently
-      const phoneInput = await page.$(GAME_SELECTORS.LOGIN.PHONE_INPUT);
-      const passInput = await page.$(GAME_SELECTORS.LOGIN.PASS_INPUT);
-
-      if (!phoneInput || !passInput) {
-        throw new Error("Login fields not found on page");
-      }
-
-      await phoneInput.fill(phone);
-      await passInput.fill(pass);
-
-      const loginBtn = await page.$(GAME_SELECTORS.LOGIN.SUBMIT_BTN);
-      if (!loginBtn) throw new Error("Login button not found");
-      await loginBtn.click();
-
-      console.log("[Balance] Login submitted, waiting for dashboard...");
-
-      // Wait for the balance link to appear after login
-      await page.waitForSelector('a[href="/account"]', {
-        timeout: 20000,
-      });
-
-      console.log(
-        "[Balance] Dashboard loaded, waiting for balance to hydrate...",
-      );
-
-      // Poll for the real balance (page hydrates "KES 0" then updates).
-      const balanceText = await page.evaluate(async () => {
-        for (let i = 0; i < 20; i++) {
-          const links = document.querySelectorAll('a[href="/account"]');
-          for (let j = 0; j < links.length; j++) {
-            const text = links[j].textContent?.trim() || "";
-            if (text.startsWith("KES")) {
-              const num = parseFloat(text.replace(/[^0-9.]/g, ""));
-              if (num > 0) return text;
-            }
-          }
-          await new Promise((r) => setTimeout(r, 500));
-        }
-        // Final attempt — return whatever is there
-        const finalLinks = document.querySelectorAll('a[href="/account"]');
-        for (let j = 0; j < finalLinks.length; j++) {
-          const text = finalLinks[j].textContent?.trim() || "";
-          if (text.startsWith("KES")) return text;
-        }
-        return null;
-      });
-
-      if (balanceText) {
-        const numStr = balanceText.replace(/[^0-9.,]/g, "").replace(/,/g, "");
-        const parsed = parseFloat(numStr);
-        return isNaN(parsed) ? null : parsed;
-      }
-
-      return null;
+      return await checkPakakumiBalance(page, phone, pass);
     } catch (error) {
       console.error("[Balance] Scrape error:", error);
       throw error;

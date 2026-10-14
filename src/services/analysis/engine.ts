@@ -34,7 +34,7 @@ const db = new Proxy(rootDb, { get(_target, key) {
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
-const HOUSE_EDGE = 0.01; // 1%
+const HOUSE_EDGE = 0.01; // Model assumption; current Crash RTP has not been verified.
 export const TARGETS = [
   2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90,
   100, 150, 200, 250, 300, 350, 400, 450, 500, 600, 700, 800, 900, 1000, 1500,
@@ -1067,7 +1067,7 @@ function buildCluster(alerts: RawAlert[]): AlertCluster {
     : Math.max(...alerts.map((a) => a.idealPlanRounds));
 
   const status =
-    alerts[0].pureOverdueRatio >= 1.5 ? "Very Overdue" : "Hot & Ready";
+    alerts[0].pureOverdueRatio >= 1.5 ? "Long model gap" : "Model threshold reached";
 
   return {
     alerts,
@@ -1094,36 +1094,11 @@ function generateReason(
   overdueRatio: number,
   confidence: number,
 ): string {
-  const expectedGapRounded = Math.round(expectedGap);
-
-  if (overdueRatio >= 2.0) {
-    return (
-      `${target}x has not appeared in the last ${currentGap} games. ` +
-      `Normally it shows up every ${expectedGapRounded} games. ` +
-      `It is very overdue — the game usually corrects this kind of delay.`
-    );
-  }
-
-  if (overdueRatio >= 1.5) {
-    return (
-      `${target}x last appeared ${currentGap} games ago. ` +
-      `The average gap is ${expectedGapRounded} games. ` +
-      `It is overdue and could drop soon.`
-    );
-  }
-
-  if (overdueRatio >= 1.0) {
-    return (
-      `${target}x is approaching its expected timing. ` +
-      `It has been ${currentGap} games since the last hit (average is ${expectedGapRounded}). ` +
-      `The pattern says it is getting close.`
-    );
-  }
-
   return (
-    `${target}x is building up. ` +
-    `${currentGap} games since the last one (normally every ${expectedGapRounded}). ` +
-    `Confidence is at ${confidence}%.`
+    target + "x last appeared " + currentGap + " recorded rounds ago. " +
+    "The model average is " + Math.round(expectedGap) + " rounds, using an assumed 1% house edge. " +
+    "Gap ratio: " + overdueRatio.toFixed(2) + "; heuristic score: " + confidence + "%. " +
+    "Each round is independent; this does not predict the next hit."
   );
 }
 
