@@ -1,4 +1,7 @@
-import { generateAlgorithmBets, type StrategyConfig } from "../../utils/strategies/core.js";
+import { generateAlgorithmBets } from "../../utils/strategies/core.js";
+import { usesLocalPlayerEngine } from "../../utils/local-player/strategy/config.js";
+import type { StrategyConfig } from "../../utils/local-player/strategy/core.js";
+import { StrategyRunner } from "../../utils/local-player/strategy/runner.js";
 
 export type BacktestOutcome = "win" | "loss";
 export type OutcomeAction = "strategy" | "continue" | "reset" | "pause" | "stop";
@@ -60,6 +63,7 @@ export interface BacktestLedgerEntry {
   amount: number;
   cashout: number;
   outcome: BacktestOutcome;
+  payout: number;
   pnl: number;
   capital: number;
   strategyStep: number;
@@ -70,6 +74,8 @@ export interface BacktestResult {
   summary: {
     startingCapital: number;
     endingCapital: number;
+    highestCapital: number;
+    lowestCapital: number;
     netProfit: number;
     roiPercent: number;
     totalBets: number;
@@ -77,6 +83,7 @@ export interface BacktestResult {
     losses: number;
     winRatePercent: number;
     totalWagered: number;
+    totalPaid: number;
     grossProfit: number;
     grossLoss: number;
     profitFactor: number | null;
@@ -165,13 +172,31 @@ export function runBacktest(input: {
     ),
     rules: requestedScenario.rules ?? configuredScenario.rules,
   };
-  const bets = resolveBets(strategy);
+  let historicalTime = rounds.length ? new Date(rounds[0]!.createdAt).getTime() : 0;
+  const runner = usesLocalPlayerEngine(strategy)
+    ? new StrategyRunner({
+        initialCapital,
+        maxBet: 5000,
+        mode: "practice",
+        strategy: {
+          ...strategy,
+          execution: {
+            ...strategy.execution,
+            ...scenario,
+            maxBets: scenario.maxBets || undefined,
+            stopLoss: scenario.stopLoss || undefined,
+            takeProfit: scenario.takeProfit || undefined,
+          },
+        },
+      }, () => historicalTime)
+    : null;
+  const bets = runner ? [] : resolveBets(strategy);
   const warnings: string[] = [];
 
   if (!Number.isFinite(initialCapital) || initialCapital <= 0) {
     throw new Error("Initial capital must be a positive finite number");
   }
-  if (bets.length === 0) throw new Error("Strategy does not contain any bets");
+  if (!runner && bets.length === 0) throw new Error("Strategy does not contain any bets");
 
   let capital = initialCapital;
   let step = 0;
@@ -180,9 +205,11 @@ export function runBacktest(input: {
   let wins = 0;
   let losses = 0;
   let totalWagered = 0;
+  let totalPaid = 0;
   let grossProfit = 0;
   let grossLoss = 0;
   let peakCapital = initialCapital;
+  let lowCapital = initialCapital;
   let maxDrawdown = 0;
   let maxDrawdownPercent = 0;
   let consecutiveWins = 0;
@@ -207,28 +234,46 @@ export function runBacktest(input: {
     roundsSinceWin++;
     roundsSinceLoss++;
 
-    if (pauseRemaining > 0) {
+    if (!runner && pauseRemaining > 0) {
       pauseRemaining--;
       roundsSkipped++;
       continue;
     }
 
-    const placedStep = step;
-    const bet = bets[placedStep];
-    if (!bet) {
+    const placedStep = runner?.stepIndex ?? step;
+    // Decide before revealing this result. A trigger can only arm a later round.
+    const bet = runner ? runner.nextBet() : bets[placedStep];
+    if (runner) {
+      if (runner.stopReason) {
+        roundsProcessed--;
+        stopReason = runner.stopReason;
+        break;
+      }
+      historicalTime = Math.max(historicalTime, new Date(round.createdAt).getTime());
+      runner.observeRound(round.bust);
+      if (!bet) { roundsSkipped++; continue; }
+    } else if (!bet) {
       stopReason = `Strategy step ${step} does not exist`;
       break;
     }
+    if (!bet) continue;
     if (bet.amount > capital) {
       stopReason = "Insufficient capital for the next bet";
       break;
     }
 
     const outcome: BacktestOutcome = round.bust >= bet.cashout ? "win" : "loss";
-    const pnl = outcome === "win" ? bet.amount * (bet.cashout - 1) : -bet.amount;
+    const payout = outcome === "win" ? bet.amount * bet.cashout : 0;
+    const settled = runner?.settle(round.bust, bet, payout, false, {
+      roundsSinceLast3000: round.roundsSinceLast3000,
+      totalReserveFunds: round.metricsComplete === false ? null : round.totalReserveFunds,
+    });
+    const pnl = settled?.netProfit ?? (outcome === "win" ? bet.amount * (bet.cashout - 1) : -bet.amount);
+    const paid = Math.round((bet.amount + pnl) * 100) / 100;
     capital = Math.round((capital + pnl) * 100) / 100;
     totalBets++;
     totalWagered += bet.amount;
+    totalPaid += paid;
 
     if (outcome === "win") {
       wins++;
@@ -247,6 +292,7 @@ export function runBacktest(input: {
     }
 
     peakCapital = Math.max(peakCapital, capital);
+    lowCapital = Math.min(lowCapital, capital);
     const drawdown = peakCapital - capital;
     maxDrawdown = Math.max(maxDrawdown, drawdown);
     maxDrawdownPercent = Math.max(
@@ -254,71 +300,74 @@ export function runBacktest(input: {
       peakCapital > 0 ? (drawdown / peakCapital) * 100 : 0,
     );
 
-    const strategyNextStep = outcome === "win"
-      ? 0
-      : step + 1 >= bets.length ? 0 : step + 1;
-    const metrics: Record<RuleMetric, number | null> = {
-      bust: round.bust,
-      capital,
-      profit: capital - initialCapital,
-      drawdown,
-      consecutiveWins,
-      consecutiveLosses,
-      roundsSinceWin,
-      roundsSinceLoss,
-      roundsSinceLast3000: round.roundsSinceLast3000 ?? null,
-      totalReserveFunds: round.totalReserveFunds ?? null,
-      // Execution-rule round numbers are one-based in the live bot and UI.
-      // Ledger/equity indexes remain zero-based array positions.
-      roundIndex: roundIndex + 1,
-    };
+    let ruleId = settled?.ruleId;
+    if (runner) {
+      stopReason = runner.stopReason;
+    } else {
+      const strategyNextStep = outcome === "win"
+        ? 0
+        : step + 1 >= bets.length ? 0 : step + 1;
+      const metrics: Record<RuleMetric, number | null> = {
+        bust: round.bust,
+        capital,
+        profit: capital - initialCapital,
+        drawdown,
+        consecutiveWins,
+        consecutiveLosses,
+        roundsSinceWin,
+        roundsSinceLoss,
+        roundsSinceLast3000: round.roundsSinceLast3000 ?? null,
+        totalReserveFunds: round.totalReserveFunds ?? null,
+        // Execution-rule round numbers are one-based in the live bot and UI.
+        // Ledger/equity indexes remain zero-based array positions.
+        roundIndex: roundIndex + 1,
+      };
 
-    const matchedRule = scenario.rules?.find((rule) => {
-      if (rule.once && firedOnceRules.has(rule.id)) return false;
-      if (rule.event && rule.event !== "any" && rule.event !== outcome) return false;
-      const matches = rule.conditions.map((condition) => {
-        const metric = metrics[condition.metric];
-        return metric !== null && compare(metric, condition.operator, condition.value);
+      const matchedRule = scenario.rules?.find((rule) => {
+        if (rule.once && firedOnceRules.has(rule.id)) return false;
+        if (rule.event && rule.event !== "any" && rule.event !== outcome) return false;
+        const matches = rule.conditions.map((condition) => {
+          const metric = metrics[condition.metric];
+          return metric !== null && compare(metric, condition.operator, condition.value);
+        });
+        return (rule.match ?? "all") === "all"
+          ? matches.every(Boolean)
+          : matches.some(Boolean);
       });
-      return (rule.match ?? "all") === "all"
-        ? matches.every(Boolean)
-        : matches.some(Boolean);
-    });
 
-    const requestedAction = outcome === "win"
-      ? scenario.afterWin
-      : scenario.afterLoss;
-    let ruleId: string | undefined;
-
-    if (matchedRule) {
-      if (matchedRule.once) firedOnceRules.add(matchedRule.id);
-      ruleId = matchedRule.id;
-      const action = matchedRule.action;
-      if (action.type === "stop") stopReason = `Rule '${matchedRule.id}' stopped the run`;
-      if (action.type === "pause") {
-        pauseRemaining = Math.max(0, Math.floor(action.rounds ?? 0));
-        step = action.step === undefined
-          ? strategyNextStep
-          : Math.min(Math.max(0, Math.floor(action.step)), bets.length - 1);
-      } else if (action.type === "reset") step = 0;
-      else if (action.type === "continue") step = (step + 1) % bets.length;
-      else if (action.type === "jump") {
-        step = Math.min(Math.max(0, Math.floor(action.step ?? 0)), bets.length - 1);
-      }
-    } else if (
-      outcome === "win" &&
-      strategy.stopAfterWin &&
-      (!requestedAction || requestedAction.action === "strategy")
-    ) {
-      stopReason = "Strategy is configured to stop after a win";
-    } else if (requestedAction?.action === "stop") {
-      stopReason = `Configured to stop after a ${outcome}`;
-    } else if (requestedAction?.action === "pause") {
-      pauseRemaining = Math.max(0, Math.floor(requestedAction.pauseRounds ?? 0));
-      step = strategyNextStep;
-    } else if (requestedAction?.action === "reset") step = 0;
-    else if (requestedAction?.action === "continue") step = (step + 1) % bets.length;
-    else step = strategyNextStep;
+      const requestedAction = outcome === "win"
+        ? scenario.afterWin
+        : scenario.afterLoss;
+      if (matchedRule) {
+        if (matchedRule.once) firedOnceRules.add(matchedRule.id);
+        ruleId = matchedRule.id;
+        const action = matchedRule.action;
+        if (action.type === "stop") stopReason = `Rule '${matchedRule.id}' stopped the run`;
+        if (action.type === "pause") {
+          pauseRemaining = Math.max(0, Math.floor(action.rounds ?? 0));
+          step = action.step === undefined
+            ? strategyNextStep
+            : Math.min(Math.max(0, Math.floor(action.step)), bets.length - 1);
+        } else if (action.type === "reset") step = 0;
+        else if (action.type === "continue") step = (step + 1) % bets.length;
+        else if (action.type === "jump") {
+          step = Math.min(Math.max(0, Math.floor(action.step ?? 0)), bets.length - 1);
+        }
+      } else if (
+        outcome === "win" &&
+        strategy.stopAfterWin &&
+        (!requestedAction || requestedAction.action === "strategy")
+      ) {
+        stopReason = "Strategy is configured to stop after a win";
+      } else if (requestedAction?.action === "stop") {
+        stopReason = `Configured to stop after a ${outcome}`;
+      } else if (requestedAction?.action === "pause") {
+        pauseRemaining = Math.max(0, Math.floor(requestedAction.pauseRounds ?? 0));
+        step = strategyNextStep;
+      } else if (requestedAction?.action === "reset") step = 0;
+      else if (requestedAction?.action === "continue") step = (step + 1) % bets.length;
+      else step = strategyNextStep;
+    }
 
     if (input.includeLedger && ledger.length < 10_000) {
       ledger.push({
@@ -329,6 +378,7 @@ export function runBacktest(input: {
         amount: bet.amount,
         cashout: bet.cashout,
         outcome,
+        payout: paid,
         pnl,
         capital,
         strategyStep: placedStep,
@@ -337,13 +387,13 @@ export function runBacktest(input: {
     }
     equityCurve.push({ roundIndex, capital });
 
-    if (scenario.stopLoss !== undefined && scenario.stopLoss > 0 && initialCapital - capital >= scenario.stopLoss) {
+    if (!runner && scenario.stopLoss !== undefined && scenario.stopLoss > 0 && initialCapital - capital >= scenario.stopLoss) {
       stopReason = "Stop-loss reached";
     }
-    if (scenario.takeProfit !== undefined && scenario.takeProfit > 0 && capital - initialCapital >= scenario.takeProfit) {
+    if (!runner && scenario.takeProfit !== undefined && scenario.takeProfit > 0 && capital - initialCapital >= scenario.takeProfit) {
       stopReason = "Take-profit reached";
     }
-    if (scenario.maxBets !== undefined && scenario.maxBets > 0 && totalBets >= scenario.maxBets) {
+    if (!runner && scenario.maxBets !== undefined && scenario.maxBets > 0 && totalBets >= scenario.maxBets) {
       stopReason = "Maximum bet count reached";
     }
     if (stopReason) break;
@@ -366,6 +416,8 @@ export function runBacktest(input: {
     summary: {
       startingCapital: initialCapital,
       endingCapital: capital,
+      highestCapital: peakCapital,
+      lowestCapital: lowCapital,
       netProfit,
       roiPercent: (netProfit / initialCapital) * 100,
       totalBets,
@@ -373,6 +425,7 @@ export function runBacktest(input: {
       losses,
       winRatePercent: totalBets > 0 ? (wins / totalBets) * 100 : 0,
       totalWagered: Math.round(totalWagered * 100) / 100,
+      totalPaid: Math.round(totalPaid * 100) / 100,
       grossProfit: Math.round(grossProfit * 100) / 100,
       grossLoss: Math.round(grossLoss * 100) / 100,
       profitFactor: grossLoss > 0 ? grossProfit / grossLoss : null,

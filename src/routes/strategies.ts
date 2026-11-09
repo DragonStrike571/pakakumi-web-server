@@ -11,6 +11,8 @@ import { z } from "zod";
 import { requireAuth } from "../middleware/auth.js";
 import { AuthenticatedRequest } from "../types/express.js";
 import { requireActiveAccess } from "../middleware/access.js";
+import { assertPlayableStrategy } from "../utils/strategies/core.js";
+import { usesLocalPlayerEngine } from "../utils/local-player/strategy/config.js";
 
 const router = Router();
 
@@ -130,6 +132,10 @@ router.post("/", async (req: Request, res: Response) => {
   }
 
   const { name, config } = validation.data;
+  try {
+    if (!usesLocalPlayerEngine(config)) assertPlayableStrategy(config);
+  }
+  catch (error) { res.status(400).json({ error: (error as Error).message }); return; }
   const userId = (req as AuthenticatedRequest).user.id;
 
   const { data: result, error } = await trycatch(async () => {
@@ -172,6 +178,13 @@ router.put("/:id", async (req: Request, res: Response) => {
   }
 
   const strategyId = parsed.data.id;
+  if (validation.data.config) {
+    try {
+      const config = validation.data.config;
+      if (!usesLocalPlayerEngine(config)) assertPlayableStrategy(config);
+    }
+    catch (error) { res.status(400).json({ error: (error as Error).message }); return; }
+  }
   const userId = (req as AuthenticatedRequest).user.id;
 
   const { data: result, error } = await trycatch(async () => {

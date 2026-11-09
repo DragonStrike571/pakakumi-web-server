@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { parseStrategy } from "../utils/local-player/strategy/config.js";
 
 export const algorithmConfigSchema = z.object({
   capital: z.number().positive().finite().max(1_000_000_000),
@@ -56,9 +57,10 @@ export const executionConfigSchema = z.object({
   takeProfit: z.number().positive().finite().max(1_000_000_000).optional(),
 });
 
-export const strategyConfigSchema = z
+const legacyStrategyConfigSchema = z
   .object({
     type: z.enum(["sequence", "algorithm"]),
+    engine: z.never().optional(),
     stopAfterWin: z.boolean().optional(),
     autoCashout: z.number().gt(1).finite().max(1_000_000).optional(),
     execution: executionConfigSchema.optional(),
@@ -76,6 +78,19 @@ export const strategyConfigSchema = z
       path: ["config"],
     },
   );
+
+const localPlayerStrategyConfigSchema = z.union([
+  z.looseObject({ type: z.enum(["adaptive", "phased"]) }),
+  z.looseObject({ type: z.enum(["sequence", "algorithm"]), engine: z.literal("local-player") }),
+]).transform((value, context) => {
+  try { return parseStrategy(value); }
+  catch (error) {
+    context.addIssue({ code: "custom", path: ["config"], message: (error as Error).message });
+    return z.NEVER;
+  }
+});
+
+export const strategyConfigSchema = z.union([localPlayerStrategyConfigSchema, legacyStrategyConfigSchema]);
 
 export const createStrategySchema = z.object({
   name: z.string().trim().min(1).max(120),

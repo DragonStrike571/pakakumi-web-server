@@ -1,5 +1,7 @@
 # Current page and rules check — 14 October 2026
 
+The page integrations were checked again on **3 November 2026** against three new captures and the public site. See [CURRENT_SITE_VERIFICATION.md](CURRENT_SITE_VERIFICATION.md) for the added signed-out safeguards and current test results. The published-rules findings below remain the findings from 14 October; this follow-up does not claim a new terms review.
+
 The earlier redirect/history fix covered the collector. This follow-up also updates login, balance checks, the database-connected local bot and the fully local player. Changes are local and have not been deployed.
 
 ## Verified page integration

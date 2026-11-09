@@ -8,9 +8,12 @@ const browser = await chromium.launch({ headless: true,
 after(() => browser.close());
 
 // All requests are intercepted. No provider accounts, funds or services are used.
-const html = `<form><label for="phone">Phone number</label><input id="phone" type="text">
-  <label for="password">Password</label><input id="password" type="password">
-  <button id="login">LOGIN</button></form>
+// Sanitized structure from the supplied current login capture: generated IDs,
+// nested controls, an existing country prefix and a nested button label.
+const html = `<header><a href="/login"><button>Login</button></a></header>
+  <form><div><label for="P0-0">Phone number</label><div><span>+254</span><input id="P0-0" type="text"></div></div>
+  <div><label for="P0-1">Password</label><div><input id="P0-1" type="password"><span>Show password</span></div></div>
+  <button id="login"><div>Login</div></button></form>
   <label for="amount">Amount</label><input id="amount" type="number" value="10">
   <label for="cashout">Auto Cashout (X)</label><input id="cashout" type="number" value="2">
   <button id="bet">Bet</button><script type="module" src="/fixture-app.js"></script>`;
@@ -27,7 +30,7 @@ const app = `const handlers = {};
   document.querySelector('form').onsubmit = async e => {
     e.preventDefault();
     const reply = await fetch('https://api.pakakumi.com/auth/login', { method: 'POST', body: JSON.stringify({
-      phone: '+254' + document.querySelector('#phone').value, password: document.querySelector('#password').value
+      phone: '+254' + document.querySelector('[id="P0-0"]').value, password: document.querySelector('[id="P0-1"]').value
     }) });
     if (reply.ok) { await fetch('https://api.pakakumi.com/accounts/me'); history.pushState({}, '', '/crash'); }
   };
@@ -39,7 +42,7 @@ const app = `const handlers = {};
   };
   await fetch('https://api.pakakumi.com/config');`;
 
-async function fixture(rejectLogin = false) {
+async function fixture(rejectLogin = false, mode: "signed-in" | "signed-out" | "verification" = "signed-in") {
   const context = await browser.newContext();
   const page = await context.newPage();
   const requests: { path: string; body: string | null }[] = [];
@@ -49,9 +52,9 @@ async function fixture(rejectLogin = false) {
     const cors = { "access-control-allow-origin": "*" };
     if (url.pathname === "/fixture-app.js") return route.fulfill({ contentType: "text/javascript", body: app });
     if (url.pathname === "/config") return route.fulfill({ contentType: "application/json", headers: cors, body: JSON.stringify({ currency: "KES", "crash.min_wager": 10, "crash.max_wager": 5000 }) });
-    if (url.pathname === "/auth/login") return route.fulfill({ status: rejectLogin ? 401 : 200, contentType: "application/json", headers: cors, body: JSON.stringify(rejectLogin ? { message: "do-not-log-fixture-password" } : { id: 7 }) });
+    if (url.pathname === "/auth/login") return route.fulfill({ status: rejectLogin ? 401 : 200, contentType: "application/json", headers: cors, body: JSON.stringify(rejectLogin ? { message: "do-not-log-fixture-password" } : { id: 7, phone_verification_required: mode === "verification" }) });
     if (url.pathname === "/accounts/me") return route.fulfill({ contentType: "application/json", headers: cors, body: JSON.stringify({ accounts: [{ currency: "KES", wallets: [{ wallet: "default", balance: 0 }] }] }) });
-    if (url.origin === "https://pakakumi.com") return route.fulfill({ contentType: "text/html", body: html });
+    if (url.origin === "https://pakakumi.com") return route.fulfill({ contentType: "text/html", body: mode === "signed-out" ? html.replace('<button id="bet">Bet</button>', '<button id="bet"><span>Login</span><span>Or Register</span></button>') : html });
     throw new Error("Unexpected fixture request");
   });
   return { page, context, requests };
@@ -96,6 +99,41 @@ test("rejected login cannot be mistaken for success or expose the password", asy
     });
     assert.equal(new URL(page.url()).pathname, "/login");
   } finally { await context.close(); }
+});
+
+test("a successful HTTP response requiring phone verification is not a confirmed login", async () => {
+  const { page, context } = await fixture(false, "verification");
+  try {
+    await assert.rejects(loginPakakumi(page, "0712345678", "fixture-password"), /login could not be confirmed/);
+    assert.equal(await page.evaluate("window.betClicks"), 0);
+  } finally { await context.close(); }
+});
+
+test("the signed-out crash page cannot start a player despite exposing amount and cashout fields", async () => {
+  const { page, context } = await fixture(false, "signed-out");
+  const game = new PakakumiGamePage(page);
+  try {
+    await page.goto("https://pakakumi.com/crash");
+    await assert.rejects(game.observe("7", async () => {}, () => {}), /signed out/);
+    assert.equal(await game.phase(), "unknown");
+    assert.equal(await page.evaluate("window.betClicks"), 0);
+  } finally { await game.dispose(); await context.close(); }
+});
+
+test("losing the signed-in Bet control stops observation before filling or submitting another bet", async () => {
+  const { page, context } = await fixture();
+  const game = new PakakumiGamePage(page), errors: Error[] = [];
+  try {
+    await page.goto("https://pakakumi.com/crash");
+    await game.observe("7", async () => {}, error => { errors.push(error); });
+    await emit(page, "1501");
+    await page.locator("#bet").evaluate(button => { button.innerHTML = "<span>Login</span><span>Or Register</span>"; });
+    await assert.rejects(game.placeBet(20, 3), /Bet control disappeared/);
+    assert.equal(await game.phase(), "unknown");
+    assert.equal(errors.length, 1);
+    assert.equal(await page.getByLabel("Amount", { exact: true }).inputValue(), "10");
+    assert.equal(await page.evaluate("window.betClicks"), 0);
+  } finally { await game.dispose(); await context.close(); }
 });
 
 test("new round events distinguish identical busts, record early payouts, and stop on lost connection", async () => {

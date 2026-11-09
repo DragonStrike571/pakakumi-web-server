@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { runBacktest } from "./engine.js";
 import { runBacktestSchema } from "../../validation/backtests.js";
+import { parseAdvancedStrategy } from "../../utils/local-player/strategy/config.js";
 
 const strategy = {
   type: "sequence" as const,
@@ -27,6 +28,61 @@ function rounds(...busts: number[]) {
     createdAt: new Date(2026, 0, 1, 0, index),
   }));
 }
+
+const profitWindow = {
+  type: "adaptive", adaptive: {
+    kind: "window", target: 5, roundsMode: "fixed", windowRounds: 1, windowBudget: 10,
+    start: "now", windowAfter: "repeat", progression: { type: "multiply", value: 2 }, windowProfitGoal: 250,
+  },
+};
+
+test("the local 5x profit switch survives request validation and historical settlement", () => {
+  const request = runBacktestSchema.parse({ strategy: profitWindow, initialCapital: 1000, includeLedger: true });
+  const result = runBacktest({ ...request, strategy: request.strategy!, rounds: rounds(1, 1, 1, 1, 5) });
+  assert.deepEqual(result.ledger?.map(row => row.amount), [10, 20, 40, 80, 100]);
+  assert.deepEqual(result.ledger?.map(row => row.outcome), ["loss", "loss", "loss", "loss", "win"]);
+  assert.equal(result.ledger?.at(-1)?.payout, 500);
+  assert.equal(result.summary.totalPaid, 500);
+  assert.equal(result.summary.netProfit, 250);
+  assert.equal(result.summary.lowestCapital, 850);
+  assert.equal(result.summary.highestCapital, 1250);
+});
+
+test("imported sequences keep the local funds mode and step numbers", () => {
+  const request = runBacktestSchema.parse({ strategy: {
+    ...strategy, engine: "local-player", execution: { fundsMode: "use-remaining" },
+  }, initialCapital: 25, includeLedger: true });
+  const result = runBacktest({ ...request, strategy: request.strategy!, rounds: rounds(1, 1, 1) });
+  assert.deepEqual(result.ledger?.map(row => [row.strategyStep, row.amount]), [[0, 10], [1, 15]]);
+  assert.equal(result.summary.endingCapital, 0);
+});
+
+test("a historical trigger arms the following round and missing financial metrics stay unavailable", () => {
+  const strategy = parseAdvancedStrategy({
+    ...profitWindow,
+    adaptive: { ...profitWindow.adaptive, start: "after-target", windowAfter: "wait" },
+    execution: { rules: [{ id: "reserve", conditions: [{ metric: "totalReserveFunds", operator: "eq", value: 0 }], action: { type: "stop" } }] },
+  });
+  const history = rounds(1, 5, 1, 5, 5);
+  history[2] = Object.assign(history[2]!, { totalReserveFunds: 0, metricsComplete: false });
+  history[4] = Object.assign(history[4]!, { totalReserveFunds: 0, metricsComplete: true });
+  const result = runBacktest({ strategy, initialCapital: 1000, rounds: history, includeLedger: true });
+  assert.deepEqual(result.ledger?.map(row => [row.roundIndex, row.amount, row.ruleId]), [[2, 10, undefined], [4, 20, "reserve"]]);
+  assert.equal(result.summary.roundsSkipped, 3);
+  assert.ok(result.summary.stopReason);
+});
+
+test("phased and adaptive plans honor the recorded clock and explicit risk overrides", () => {
+  const phased = parseAdvancedStrategy({ type: "phased", phased: {
+    cycleBudget: 100, baseBet: 10, baseTarget: 2, targetReturn: 2, boostBet: 10, boostRounds: 1, stageRounds: [3],
+  }, execution: { maxBets: 1 } });
+  const replay = runBacktest({ strategy: phased, initialCapital: 1000, rounds: rounds(1, 1, 2), scenario: { maxBets: 0 } });
+  assert.ok(replay.summary.totalBets > 1);
+  const timed = parseAdvancedStrategy({ ...profitWindow, execution: { maxDurationMinutes: 0.5 } });
+  const result = runBacktest({ strategy: timed, initialCapital: 1000, rounds: rounds(1, 5, 5) });
+  assert.equal(result.summary.totalBets, 2);
+  assert.match(result.summary.stopReason ?? "", /Time limit/);
+});
 
 test("backtest applies the sequence to chronological outcomes", () => {
   const result = runBacktest({

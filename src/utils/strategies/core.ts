@@ -61,6 +61,17 @@ export interface BetAction {
   stop?: boolean;
 }
 
+/** Live eligibility is separate from historical simulation inputs. */
+export function assertPlayableStrategy(config: Pick<StrategyConfig, "algorithm" | "sequence" | "autoCashout"> & { type: string }) {
+  const validAmount = (amount: number) => Number.isFinite(amount) && amount >= 10 && amount <= 5000 && Math.abs(amount * 100 - Math.round(amount * 100)) <= 1e-6;
+  const validTarget = (target: number) => Number.isFinite(target) && target >= 1.01 && target <= 3000;
+  if (config.autoCashout !== undefined && !validTarget(config.autoCashout)) throw new Error("Target multiplier must be between 1.01 and 3,000");
+  const a = config.algorithm;
+  if (config.type === "algorithm" && a && (!validAmount(a.minAmount) || a.maxPlayable !== undefined && !validAmount(a.maxPlayable))) throw new Error("Strategy amounts must be between KES 10 and 5,000 with at most two decimal places");
+  const bets = config.type === "algorithm" && a ? generateAlgorithmBets(a.capital, a.minAmount, a.multiplier, a.targetReturn, a.roundingOption, a.maxPlayable) : config.sequence?.bets ?? [];
+  if (!bets.length || bets.some(b => !validAmount(b.amount) || !validTarget(b.cashout))) throw new Error("Every live step needs an amount of KES 10–5,000 and a multiplier of 1.01–3,000");
+}
+
 export function roundNumber(
   num: number,
   option?: "none" | "whole" | "five" | "ten",

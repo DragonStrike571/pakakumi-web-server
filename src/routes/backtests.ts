@@ -8,8 +8,9 @@ import { requireActiveAccess } from "../middleware/access.js";
 import type { AuthenticatedRequest } from "../types/express.js";
 import { backtestRunner } from "../services/backtest/runner.js";
 import { runBacktestSchema } from "../validation/backtests.js";
-import type { StrategyConfig } from "../utils/strategies/core.js";
 import { strategyConfigSchema } from "../validation/strategies.js";
+import { toRunSettings, usesLocalPlayerEngine } from "../utils/local-player/strategy/config.js";
+import type { z } from "zod";
 
 const router = Router();
 router.use(requireAuth, requireActiveAccess());
@@ -28,7 +29,7 @@ router.post("/run", async (req: Request, res: Response) => {
   }
 
   const userId = (req as AuthenticatedRequest).user.id;
-  let strategy: StrategyConfig;
+  let strategy: z.output<typeof strategyConfigSchema>;
 
   if (parsed.data.strategy) {
     strategy = parsed.data.strategy;
@@ -65,6 +66,17 @@ router.post("/run", async (req: Request, res: Response) => {
     strategy = storedStrategy.data;
   }
 
+  if (usesLocalPlayerEngine(strategy)) {
+    try {
+      const rules = parsed.data.scenario?.rules;
+      const config = rules ? { ...strategy, execution: { ...strategy.execution, rules } } : strategy;
+      toRunSettings({ strategy: config, initialCapital: parsed.data.initialCapital, maxBet: 5000, mode: "practice" });
+    } catch (error) {
+      res.status(422).json({ error: (error as Error).message });
+      return;
+    }
+  }
+
   const conditions = [];
   if (parsed.data.range.startDate) {
     conditions.push(gte(rounds.createdAt, new Date(parsed.data.range.startDate)));
@@ -86,7 +98,7 @@ router.post("/run", async (req: Request, res: Response) => {
       })
       .from(rounds)
       .where(conditions.length ? and(...conditions) : undefined)
-      .orderBy(desc(rounds.createdAt))
+      .orderBy(desc(rounds.createdAt), desc(rounds.id))
       .limit(parsed.data.range.limit))
       .reverse();
 

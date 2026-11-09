@@ -1,5 +1,7 @@
 # Deploy the three latest updates together
 
+3 November follow-up: the supplied signed-in, signed-out and login captures were checked against all projects. Both players now explicitly reject signed-out game controls. See [CURRENT_SITE_VERIFICATION.md](CURRENT_SITE_VERIFICATION.md). Deploy this follow-up with the same steps below; it adds no dependencies, migrations or environment settings.
+
 Use this guide for the scraper layout fix, the page/rules update and the other-project reliability review. It replaces the separate deployment instructions for those updates. The fixes are currently on this computer; they have not been deployed. The Git projects must be committed and pushed before your VPS can download them with `git pull`.
 
 Paste each command separately and press **Enter**. If a command reports an error, stop at that command and keep the message. Do not continue with a failed build.

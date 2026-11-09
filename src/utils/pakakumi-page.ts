@@ -76,16 +76,20 @@ export function accountBalance(payload: unknown): number {
   return Math.round(balance * 100) / 100;
 }
 
-export async function checkPakakumiBalance(page: Page, phone: string, password: string) {
+export async function loginPakakumiWithBalance(page: Page, phone: string, password: string) {
   // The page requests these wallets itself after confirmed login. Observe that
   // reply rather than repeatedly querying the provider or reading a hydrated 0.
   const balanceReply = page.waitForResponse(r => sourceResponse(r.url(), "/accounts/me") && r.request().method() === "GET", { timeout: 28_000 });
   // Attach a rejection handler immediately if login fails before this resolves.
   void balanceReply.catch(() => undefined);
-  await loginPakakumi(page, phone, password);
+  const userId = await loginPakakumi(page, phone, password);
   const response = await balanceReply;
   if (!response.ok()) throw new Error("Pakakumi could not load the account balance");
-  return accountBalance(await response.json());
+  return { userId, balance: accountBalance(await response.json()) };
+}
+
+export async function checkPakakumiBalance(page: Page, phone: string, password: string) {
+  return (await loginPakakumiWithBalance(page, phone, password)).balance;
 }
 
 export interface ProviderRound {
@@ -232,6 +236,13 @@ export class PakakumiGamePage {
   async observe(userId: string, onRound: (round: ProviderRound) => Promise<void>, onError: (error: Error) => void) {
     if (this.observing || this.disposed) throw new Error("Pakakumi observer is already attached or disposed");
     await this.page.getByLabel("Amount", { exact: true }).waitFor({ timeout: 20_000 });
+    // The signed-out crash page has the same amount/cashout fields. They are
+    // insufficient evidence that login survived navigation to the game.
+    if (await this.page.getByRole("button", { name: /^login\s*or\s*register$/i }).isVisible()) {
+      throw new Error("Pakakumi is signed out. Log in again before starting the player.");
+    }
+    try { await this.page.getByRole("button", { name: /^bet$/i }).waitFor({ state: "visible", timeout: 10_000 }); }
+    catch { throw new Error("Pakakumi's signed-in Bet control is unavailable. Check the account and game page before restarting."); }
     this.observing = true;
     this.onFailure = onError;
     this.page.on("framenavigated", this.onNavigation);
@@ -262,6 +273,12 @@ export class PakakumiGamePage {
 
   async placeBet(amount: number, cashout: number, beforeSubmit?: () => Promise<boolean>) {
     if (this.failed || this.disposed) throw new Error("Pakakumi game observation is unavailable; no bet was submitted");
+    const submit = this.page.getByRole("button", { name: /^bet$/i });
+    if (!await submit.isVisible()) {
+      const error = new Error("Pakakumi's signed-in Bet control disappeared. Check the account and last bet before restarting.");
+      this.fail(error);
+      throw error;
+    }
     if (!Number.isFinite(amount) || !Number.isFinite(cashout) || cashout < 1.01 || cashout > 3000) {
       throw new Error("Bet cashout must be between 1.01x and the published 3000x game limit");
     }
@@ -289,7 +306,7 @@ export class PakakumiGamePage {
       (window as any).__pakakumiGame.submission = { amount, cashout, active: true, sent: false, acknowledged: false, accepted: false };
     }, { amount, cashout });
     try {
-      await this.page.getByRole("button", { name: /^bet$/i }).click({ timeout: 1500 });
+      await submit.click({ timeout: 1500 });
       const accepted = await this.page.waitForFunction(({ before, amount }) => {
         const state = (window as any).__pakakumiGame;
         return state && !state.failed && state.submission?.sent && state.submission.accepted &&

@@ -15,6 +15,8 @@ import { requireActiveAccess } from "../middleware/access.js";
 import rateLimit from "express-rate-limit";
 import { encrypt } from "../utils/crypto.js";
 import { strategyConfigSchema } from "../validation/strategies.js";
+import { assertPlayableStrategy } from "../utils/strategies/core.js";
+import { toRunSettings, usesLocalPlayerEngine } from "../utils/local-player/strategy/config.js";
 import { requireHealthySource } from "../middleware/source.js";
 
 const router = Router();
@@ -143,8 +145,18 @@ router.post("/start", botLimiter, requireHealthySource(), async (req: Request, r
     if (!hasAccess) {
       throw new Error("Strategy access denied");
     }
-    if (!strategyConfigSchema.safeParse(strategy.config).success) {
+    const parsedStrategy = strategyConfigSchema.safeParse(strategy.config);
+    if (!parsedStrategy.success) {
       throw new Error("Strategy configuration is invalid");
+    }
+    const config = parsedStrategy.data;
+    try {
+      if (!usesLocalPlayerEngine(config)) assertPlayableStrategy(config);
+      else {
+        toRunSettings({ strategy: config, initialCapital, maxBet: 5000, mode: "live" });
+      }
+    } catch (error) {
+      throw Object.assign(new Error((error as Error).message), { code: "STRATEGY_SETTINGS" });
     }
 
     // 2. Only insert session AFTER all validation passes
@@ -177,7 +189,7 @@ router.post("/start", botLimiter, requireHealthySource(), async (req: Request, r
       res
         .status(403)
         .json({ error: "You do not have access to this strategy" });
-    } else if (err.message === "Strategy configuration is invalid") {
+    } else if (err.message === "Strategy configuration is invalid" || (err as { code?: string }).code === "STRATEGY_SETTINGS") {
       res.status(422).json({ error: err.message });
     } else if ((err as { code?: string }).code === "23505") {
       res.status(409).json({ error: "You already have a live bot session" });
