@@ -26,7 +26,8 @@ test("fresh PostgreSQL bootstrap is complete and rerunning migrations preserves 
     await database.exec("INSERT INTO users(id,name,email) VALUES ('a','A','a@test.invalid')");
     await migrateDatabase(database);
     assert.equal((await database.query('SELECT * FROM users')).rows.length, 1);
-    assert.equal((await database.query('SELECT * FROM drizzle.__drizzle_migrations')).rows.length, 9);
+    assert.equal((await database.query('SELECT * FROM drizzle.__drizzle_migrations')).rows.length, 10);
+    assert.equal((await database.query("SELECT table_name FROM information_schema.tables WHERE table_name IN ('player_runs','player_run_batches')")).rows.length, 2);
     assert.equal((await database.query("SELECT column_name FROM information_schema.columns WHERE table_name='telegram_users' AND column_name='revoked_at'")).rows.length, 1);
   } finally { await database.close(); }
 });
@@ -71,7 +72,7 @@ test("an existing installation gains the outbox and recovers one invite per paid
   const database = new PGlite();
   try {
     await migrateDatabase(database);
-    await database.exec(`DROP TABLE analysis_checkpoints; DROP TABLE telegram_deliveries;
+    await database.exec(`DROP TABLE player_run_batches; DROP TABLE player_runs; DROP TABLE analysis_checkpoints; DROP TABLE telegram_deliveries;
       ALTER TABLE payments DROP COLUMN next_verification_at; ALTER TABLE telegram_users DROP COLUMN revoked_at;`);
     const journal = JSON.parse(await readFile("drizzle/meta/_journal.json", "utf8"));
     await database.query('DELETE FROM drizzle.__drizzle_migrations WHERE created_at >= $1', [journal.entries[7].when]);

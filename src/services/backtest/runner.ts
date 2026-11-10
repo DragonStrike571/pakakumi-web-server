@@ -1,9 +1,11 @@
 import { Worker } from "node:worker_threads";
-import type { BacktestRound, BacktestSettings, createBacktest, runBacktest } from "./engine.js";
+import type { BacktestLedgerEntry, BacktestRound, BacktestSettings, createBacktest, runBacktest } from "./engine.js";
 
 type Input = Parameters<typeof runBacktest>[0];
 type Result = ReturnType<typeof runBacktest> & { dataset?: ReturnType<typeof createBacktest>["dataset"] };
-type Job = { input: BacktestSettings | Input; loadBatch?: () => Promise<BacktestRound[]>; resolve: (result: Result) => void; reject: (error: Error) => void;
+type ArchiveBatch = (rounds: BacktestRound[], plays: Array<BacktestLedgerEntry | null>) => Promise<void>;
+type Job = { input: BacktestSettings | Input; loadBatch?: () => Promise<BacktestRound[]>; archiveBatch?: ArchiveBatch;
+  pending?: Promise<void>; resolve: (result: Result) => void; reject: (error: Error) => void;
   signal?: AbortSignal; cancel: () => void; timer?: ReturnType<typeof setTimeout>; worker?: Worker; finished: boolean };
 
 export class BacktestRunner {
@@ -16,16 +18,16 @@ export class BacktestRunner {
     return this.enqueue(input, signal);
   }
 
-  runHistory(input: BacktestSettings, loadBatch: () => Promise<BacktestRound[]>, signal?: AbortSignal): Promise<Result> {
-    return this.enqueue(input, signal, loadBatch);
+  runHistory(input: BacktestSettings, loadBatch: () => Promise<BacktestRound[]>, signal?: AbortSignal, archiveBatch?: ArchiveBatch): Promise<Result> {
+    return this.enqueue(input, signal, loadBatch, archiveBatch);
   }
 
-  private enqueue(input: Job["input"], signal?: AbortSignal, loadBatch?: Job["loadBatch"]): Promise<Result> {
+  private enqueue(input: Job["input"], signal?: AbortSignal, loadBatch?: Job["loadBatch"], archiveBatch?: ArchiveBatch): Promise<Result> {
     if (this.stopped) return Promise.reject(new Error("Backtests are stopping"));
     if (signal?.aborted) return Promise.reject(new Error("Backtest cancelled"));
     if (this.queue.length >= 8) return Promise.reject(new Error("Backtest service is busy; retry later"));
     return new Promise((resolve, reject) => {
-      const job: Job = { input, loadBatch, resolve, reject, signal, finished: false, cancel: () => this.finish(job, new Error("Backtest cancelled")) };
+      const job: Job = { input, loadBatch, archiveBatch, resolve, reject, signal, finished: false, cancel: () => this.finish(job, new Error("Backtest cancelled")) };
       const timeout = loadBatch ? Math.max(this.timeoutMs, 120_000) : this.timeoutMs;
       job.timer = setTimeout(() => this.finish(job, new Error("Backtest exceeded its time limit")), timeout);
       signal?.addEventListener("abort", job.cancel, { once: true });
@@ -50,23 +52,30 @@ export class BacktestRunner {
               return;
             }
             const run = createBacktest(workerData.input);
+            let plays;
             for (;;) {
               const batch = await new Promise(resolve => {
                 parentPort.once('message', resolve);
-                parentPort.postMessage({ load: true });
+                parentPort.postMessage({ load: true, plays });
               });
               if (batch.length === 0) break;
-              for (const round of batch) run.observe(round);
+              if (workerData.archive) plays = batch.map(round => run.observe(round, true) ?? null);
+              else for (const round of batch) run.observe(round);
             }
             parentPort.postMessage({ ...run.result(), dataset: run.dataset });
           })().catch(error => { throw error; });
-        `, { eval: true, workerData: { input: job.input, stream: !!job.loadBatch, source, module: new URL(source ? "./engine.ts" : "./engine.js", import.meta.url).href } });
+        `, { eval: true, workerData: { input: job.input, stream: !!job.loadBatch, archive: !!job.archiveBatch, source, module: new URL(source ? "./engine.ts" : "./engine.js", import.meta.url).href } });
+        let previous: BacktestRound[] = [];
         job.worker.on("message", message => {
           if (job.finished) return;
           if (message.load && job.loadBatch) {
-            void job.loadBatch().then(batch => {
-              if (!job.finished) job.worker!.postMessage(batch);
-            }).catch(error => this.finish(job, error instanceof Error ? error : new Error(String(error))));
+            job.pending = (async () => {
+              if (message.plays) await job.archiveBatch!(previous, message.plays);
+              if (job.finished) return;
+              previous = await job.loadBatch!();
+              if (!job.finished) job.worker!.postMessage(previous);
+            })();
+            void job.pending.catch(error => this.finish(job, error instanceof Error ? error : new Error(String(error))));
           } else this.finish(job, undefined, message);
         });
         job.worker.once("error", error => this.finish(job, error instanceof Error ? error : new Error(String(error))));
@@ -82,7 +91,7 @@ export class BacktestRunner {
     job.signal?.removeEventListener("abort", job.cancel);
     this.queue = this.queue.filter(item => item !== job);
     const terminated = job.worker?.terminate() || Promise.resolve();
-    void terminated.catch(() => undefined).finally(() => {
+    void Promise.allSettled([terminated, job.pending]).then(() => {
       this.active.delete(job);
       if (error) job.reject(error); else job.resolve(result!);
       this.pump();

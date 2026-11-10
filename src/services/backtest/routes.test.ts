@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import express from "express";
+import { eq } from "drizzle-orm";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { migrateDatabase } from "../../db/migrations.js";
@@ -27,6 +28,10 @@ test("a saved local-player setup backtests database rounds in order and stays pr
   })));
   context.mock.method(db, "select", fixture.select.bind(fixture));
   context.mock.method(db, "insert", fixture.insert.bind(fixture));
+  context.mock.method(db, "update", fixture.update.bind(fixture));
+  context.mock.method(db, "delete", fixture.delete.bind(fixture));
+  context.mock.method(db, "execute", fixture.execute.bind(fixture));
+  context.mock.method(db, "transaction", fixture.transaction.bind(fixture));
   context.mock.method(auth.api, "getSession", async ({ headers }: { headers: Headers }) => ({
     user: { id: headers.get("x-fixture-user") ?? "owner", role: "user", accessStatus: "active" },
     session: {},
@@ -44,6 +49,7 @@ test("a saved local-player setup backtests database rounds in order and stays pr
   const post = (path: string, body: object, user = "owner") => fetch(`http://127.0.0.1:${address.port}${path}`, {
     method: "POST", headers: { "Content-Type": "application/json", "x-fixture-user": user }, body: JSON.stringify(body),
   });
+  const get = (path: string, user = "owner") => fetch(`http://127.0.0.1:${address.port}${path}`, { headers: { "x-fixture-user": user } });
 
   const response = await post("/strategies", {
     name: "Local 5x switch", config: {
@@ -59,11 +65,20 @@ test("a saved local-player setup backtests database rounds in order and stays pr
   } };
   const tested = await post("/backtests/run", request);
   assert.equal(tested.status, 200);
-  const result = await tested.json() as { summary: { netProfit: number }; dataset: { rounds: number }; ledger: { amount: number }[] };
+  const result = await tested.json() as { runId: string; summary: { netProfit: number }; dataset: { rounds: number }; ledger: { amount: number }[] };
   assert.equal(result.dataset.rounds, 5);
   assert.deepEqual(result.ledger.map(row => row.amount), [10, 20, 40, 80, 100]);
   assert.equal(result.summary.netProfit, 250);
   assert.equal((await post("/backtests/run", request, "other")).status, 404);
+  const savedPath = `/backtests/runs/${result.runId}`;
+  const detail = await (await get(savedPath)).json();
+  assert.deepEqual(detail.settings.strategy, strategy.config);
+  assert.equal((await get(savedPath, "other")).status, 404);
+  assert.equal((await get(`${savedPath}/rounds`, "other")).status, 404);
+  assert.deepEqual(await (await get("/backtests/runs", "other")).json(), { runs: [], hasMore: false });
+  const losses = await (await get(`${savedPath}/rounds?filter=loss`)).json();
+  assert.equal(losses.total, 4);
+  assert.deepEqual(losses.rows.map((row: { roundIndex: number }) => row.roundIndex), [0, 1, 2, 3]);
 
   const fixed = { type: "sequence", engine: "local-player", sequence: { bets: [{ amount: 10, cashout: 2 }] } };
   const example = await post("/backtests/run", { strategy: fixed, initialCapital: 25, source: "examples",
@@ -73,6 +88,9 @@ test("a saved local-player setup backtests database rounds in order and stays pr
   assert.equal(simulated.dataset.rounds, 4);
   assert.deepEqual(simulated.ledger.map(row => row.amount), [10, 10]);
   assert.equal(simulated.summary.netProfit, -20);
+  const noPlay = await (await get(`/backtests/runs/${simulated.runId}/rounds?filter=observed`)).json();
+  assert.equal(noPlay.total, 2);
+  assert.deepEqual(noPlay.rows.map((row: { round: { bust: number } }) => row.round.bust), [1, 5]);
 
   // A tied timestamp straddles the batch boundary. A small limit must not truncate this scope.
   await pg.exec(`INSERT INTO rounds (bust, bust_id, created_at)
@@ -82,15 +100,31 @@ test("a saved local-player setup backtests database rounds in order and stays pr
   const archive = await full.json() as typeof result;
   assert.equal(archive.dataset.rounds, 10_009);
   assert.equal(archive.summary.netProfit, 100_010);
+  const lastPage = await (await get(`/backtests/runs/${archive.runId}/rounds?page=201&filter=win`)).json();
+  assert.equal(lastPage.total, 10_005);
+  assert.equal(lastPage.rows.length, 5);
+
+  const originalRounds = await (await get(`${savedPath}/rounds`)).json();
+  await fixture.update(schema.rounds).set({ bust: 9 }).where(eq(schema.rounds.bustId, "fixture-1"));
+  const replayRequest = { strategy: fixed, initialCapital: 200, replayOf: result.runId };
+  assert.equal((await post("/backtests/run", replayRequest, "other")).status, 404);
+  const replay = await post("/backtests/run", replayRequest);
+  assert.equal(replay.status, 200);
+  const replayed = await replay.json() as typeof result;
+  assert.deepEqual(replayed.dataset, result.dataset);
+  assert.equal(replayed.summary.netProfit, -30);
+  const replayPath = `/backtests/runs/${replayed.runId}`;
+  assert.equal((await (await get(replayPath)).json()).replayOf, result.runId);
+  const replayRounds = await (await get(`${replayPath}/rounds`)).json();
+  assert.deepEqual(replayRounds.rows.map((row: { round: object }) => row.round), originalRounds.rows.map((row: { round: object }) => row.round));
 
   assert.equal((await post("/backtests/practice", { strategy: fixed, name: "Fixed", initialCapital: 25, includeLedger: true })).status, 201);
   const startPractice = { strategy: fixed, initialCapital: 25 };
   assert.equal((await post("/backtests/practice", startPractice)).status, 409);
-  hostedPractice.observe({ id: "stale", createdAt: new Date(Date.now() - 1000), bust: 1 });
+  await hostedPractice.observe({ id: "stale", createdAt: new Date(Date.now() - 1000), bust: 1 });
   const observed = { id: "new", createdAt: new Date(Date.now() + 1000), bust: 1 };
-  hostedPractice.observe(observed);
-  hostedPractice.observe(observed);
-  hostedPractice.observe({ ...observed, id: "next", createdAt: new Date(observed.createdAt.getTime() + 1000), bust: 2 });
+  await Promise.all([hostedPractice.observe(observed), hostedPractice.observe(observed),
+    hostedPractice.observe({ ...observed, id: "next", createdAt: new Date(observed.createdAt.getTime() + 1000), bust: 2 })]);
   const getPractice = (user: string) => fetch(`http://127.0.0.1:${address.port}/backtests/practice`, { headers: { "x-fixture-user": user } });
   const practice = await (await getPractice("owner")).json() as { session: { running: boolean; result: typeof result } };
   assert.equal(practice.session.result.dataset.rounds, 2);
@@ -98,4 +132,13 @@ test("a saved local-player setup backtests database rounds in order and stays pr
   assert.deepEqual(await (await getPractice("other")).json(), { session: null });
   const stopped = await (await post("/backtests/practice/stop", {})).json() as typeof practice;
   assert.equal(stopped.session.running, false);
+  const practicePath = `/backtests/runs/${stopped.session.result.runId}`;
+  assert.ok((await (await get(practicePath)).json()).finishedAt);
+  const practiceReplay = await post("/backtests/run", { ...startPractice, replayOf: stopped.session.result.runId });
+  assert.equal(practiceReplay.status, 200);
+  const practiceResult = await practiceReplay.json() as typeof result;
+  assert.deepEqual(practiceResult.dataset, stopped.session.result.dataset);
+  const practiceWins = await (await get(`/backtests/runs/${practiceResult.runId}/rounds?filter=win`)).json();
+  assert.equal(practiceWins.total, 1);
+  assert.equal(practiceWins.rows[0].round.id, "next");
 });

@@ -10,8 +10,10 @@ import {
   boolean,
   real,
   uniqueIndex,
+  primaryKey,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
+import type { BacktestLedgerEntry, BacktestRound, BacktestSettings, createBacktest, BacktestResult } from "../services/backtest/engine.js";
 
 export const users = pgTable(
   "users",
@@ -36,6 +38,27 @@ export const users = pgTable(
     index("phone_idx").on(table.phone),
   ],
 );
+
+export const playerRuns = pgTable("player_runs", {
+  id: uuid("id").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  source: text("source", { enum: ["recorded", "examples", "practice"] }).notNull(),
+  replayOf: uuid("replay_of"),
+  roundsRunId: uuid("rounds_run_id").notNull(),
+  startedAt: timestamp("started_at", { mode: "date" }).defaultNow().notNull(),
+  finishedAt: timestamp("finished_at", { mode: "date" }),
+  stopReason: text("stop_reason"),
+  settings: jsonb("settings").$type<BacktestSettings>().notNull(),
+  result: jsonb("result").$type<Omit<BacktestResult, "ledger"> & { dataset: ReturnType<typeof createBacktest>["dataset"] }>(),
+}, table => [index("player_runs_user_started_idx").on(table.userId, table.startedAt.desc(), table.id.desc())]);
+
+export const playerRunBatches = pgTable("player_run_batches", {
+  runId: uuid("run_id").notNull().references(() => playerRuns.id, { onDelete: "cascade" }),
+  batch: integer("batch").notNull(),
+  rounds: jsonb("rounds").$type<BacktestRound[]>(),
+  plays: jsonb("plays").$type<Array<BacktestLedgerEntry | null>>().notNull(),
+}, table => [primaryKey({ columns: [table.runId, table.batch] })]);
 
 export const sessions = pgTable(
   "sessions",

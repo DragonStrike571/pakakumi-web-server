@@ -160,7 +160,7 @@ async function handleRoundEnded(data: CapturedRound) {
   const savedRound = await roundService.processRound(data);
 
   if (savedRound) {
-    hostedPractice.observe(savedRound);
+    const savePractice = hostedPractice.observe(savedRound);
     broadcastRoundUpdate({
       ...savedRound,
       bust: Number(savedRound.bust),
@@ -172,6 +172,7 @@ async function handleRoundEnded(data: CapturedRound) {
       totalReserveFunds: toNullableNumber(savedRound.totalReserveFunds),
     });
 
+    await savePractice;
     await runAnalysis({
       id: savedRound.id,
       bust: Number(savedRound.bust),
@@ -290,6 +291,7 @@ async function shutdown(signal: string, exitCode = 0) {
       clean("Telegram polling", async () => { if (bot?.isRunning()) await bot.stop(); }),
     ]);
     await clean("collection inbox", () => collectionInbox.drain());
+    await clean("hosted practice", () => hostedPractice.shutdown());
     await clean("analysis", drainAnalysis);
     await daemonsStopped;
     await httpClosed;

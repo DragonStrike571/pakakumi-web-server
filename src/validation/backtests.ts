@@ -11,6 +11,7 @@ export const runBacktestSchema = z.object({
   strategyId: z.uuid().optional(),
   strategy: strategyConfigSchema.optional(),
   name: z.string().trim().min(1).max(120).optional(),
+  replayOf: z.uuid().optional(),
   initialCapital: z.number().positive().finite().max(1_000_000_000),
   source: z.enum(["recorded", "examples"]).default("recorded"),
   exampleRounds: z.array(z.number().finite().min(1).max(1_000_000)).min(1).max(10_000).optional(),

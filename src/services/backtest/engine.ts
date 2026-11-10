@@ -238,7 +238,7 @@ export function createBacktest(input: BacktestSettings) {
   let stride = 1;
   let lastPoint = equityCurve[0]!;
 
-  function observe(round: BacktestRound) {
+  function observe(round: BacktestRound, capture = false): BacktestLedgerEntry | undefined {
     const roundIndex = seen++;
     if (roundIndex === 0) {
       firstRoundAt = round.createdAt;
@@ -388,8 +388,9 @@ export function createBacktest(input: BacktestSettings) {
       else step = strategyNextStep;
     }
 
-    if (input.includeLedger && ledger.length < ledgerLimit) {
-      ledger.push({
+    const preview = input.includeLedger && ledger.length < ledgerLimit;
+    const entry = capture || preview
+      ? {
         roundId: round.id,
         roundIndex,
         createdAt: new Date(round.createdAt).toISOString(),
@@ -402,8 +403,8 @@ export function createBacktest(input: BacktestSettings) {
         capital,
         strategyStep: placedStep,
         ruleId,
-      });
-    }
+      } : undefined;
+    if (preview) ledger.push(entry!);
     lastPoint = { roundIndex, capital };
     if (roundIndex % stride === 0) equityCurve.push(lastPoint);
     if (equityCurve.length >= 2_000) {
@@ -424,11 +425,12 @@ export function createBacktest(input: BacktestSettings) {
     if (!runner && scenario.maxBets !== undefined && scenario.maxBets > 0 && totalBets >= scenario.maxBets) {
       stopReason = "Maximum bet count reached";
     }
+    return entry;
   }
 
-  function result(): BacktestResult {
+  function result(includeLedger = input.includeLedger): BacktestResult {
     const warnings: string[] = [];
-    if (input.includeLedger && totalBets > ledger.length) {
+    if (includeLedger && totalBets > ledger.length) {
       warnings.push(`Showing the first ${ledgerLimit.toLocaleString()} individual plays. The totals include every play.`);
     }
     if (incompleteMetrics > 0) {
@@ -466,7 +468,7 @@ export function createBacktest(input: BacktestSettings) {
         stopReason,
       },
       equityCurve: sampleEquityCurve(equityCurve.at(-1) === lastPoint ? [...equityCurve] : [...equityCurve, lastPoint]),
-      ...(input.includeLedger ? { ledger: [...ledger] } : {}),
+      ...(includeLedger ? { ledger: [...ledger] } : {}),
       warnings,
     };
   }
