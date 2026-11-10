@@ -8,6 +8,7 @@ import { resolve } from "node:path";
 import { drainAnalysis } from "./services/analysis/engine.js";
 import { balancePool } from "./services/balance-pool.js";
 import { backtestRunner } from "./services/backtest/runner.js";
+import { hostedPractice } from "./services/backtest/practice.js";
 import { shutdownWithDeadline } from "./utils/shutdown.js";
 import { resolveProxyTrust } from "./config/proxy.js";
 import { startDeliveryWorker } from "./services/telegram/outbox.js";
@@ -159,6 +160,7 @@ async function handleRoundEnded(data: CapturedRound) {
   const savedRound = await roundService.processRound(data);
 
   if (savedRound) {
+    hostedPractice.observe(savedRound);
     broadcastRoundUpdate({
       ...savedRound,
       bust: Number(savedRound.bust),

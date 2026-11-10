@@ -143,14 +143,16 @@ function resolveBets(config: StrategyConfig) {
     : bets.map((bet) => ({ ...bet, cashout: config.autoCashout! }));
 }
 
-export function runBacktest(input: {
-  rounds: BacktestRound[];
+export interface BacktestSettings {
   strategy: StrategyConfig;
   initialCapital: number;
   scenario?: BacktestScenario;
   includeLedger?: boolean;
-}): BacktestResult {
-  const { rounds, strategy, initialCapital } = input;
+  ledgerLimit?: number;
+}
+
+export function createBacktest(input: BacktestSettings) {
+  const { strategy, initialCapital } = input;
   const configuredScenario = strategy.execution ?? {};
   const requestedScenario = input.scenario ?? {};
   const resolveOutcomeDirective = (
@@ -172,7 +174,7 @@ export function runBacktest(input: {
     ),
     rules: requestedScenario.rules ?? configuredScenario.rules,
   };
-  let historicalTime = rounds.length ? new Date(rounds[0]!.createdAt).getTime() : 0;
+  let historicalTime = 0;
   const runner = usesLocalPlayerEngine(strategy)
     ? new StrategyRunner({
         initialCapital,
@@ -191,7 +193,6 @@ export function runBacktest(input: {
       }, () => historicalTime)
     : null;
   const bets = runner ? [] : resolveBets(strategy);
-  const warnings: string[] = [];
 
   if (!Number.isFinite(initialCapital) || initialCapital <= 0) {
     throw new Error("Initial capital must be a positive finite number");
@@ -227,9 +228,27 @@ export function runBacktest(input: {
     { roundIndex: 0, capital },
   ];
   const ledger: BacktestLedgerEntry[] = [];
+  const ledgerLimit = input.ledgerLimit ?? 10_000;
 
-  for (let roundIndex = 0; roundIndex < rounds.length; roundIndex++) {
-    const round = rounds[roundIndex]!;
+  let seen = 0;
+  let firstRoundAt: BacktestRound["createdAt"] | null = null;
+  let lastRoundAt: BacktestRound["createdAt"] | null = null;
+  let incompleteMetrics = 0;
+  let detectedGaps = 0;
+  let stride = 1;
+  let lastPoint = equityCurve[0]!;
+
+  function observe(round: BacktestRound) {
+    const roundIndex = seen++;
+    if (roundIndex === 0) {
+      firstRoundAt = round.createdAt;
+      historicalTime = new Date(round.createdAt).getTime();
+      runner?.startClock();
+    }
+    lastRoundAt = round.createdAt;
+    if (round.metricsComplete === false) incompleteMetrics++;
+    if (round.gapDetected) detectedGaps++;
+    if (stopReason) return;
     roundsProcessed++;
     roundsSinceWin++;
     roundsSinceLoss++;
@@ -237,7 +256,7 @@ export function runBacktest(input: {
     if (!runner && pauseRemaining > 0) {
       pauseRemaining--;
       roundsSkipped++;
-      continue;
+      return;
     }
 
     const placedStep = runner?.stepIndex ?? step;
@@ -247,19 +266,19 @@ export function runBacktest(input: {
       if (runner.stopReason) {
         roundsProcessed--;
         stopReason = runner.stopReason;
-        break;
+        return;
       }
       historicalTime = Math.max(historicalTime, new Date(round.createdAt).getTime());
       runner.observeRound(round.bust);
-      if (!bet) { roundsSkipped++; continue; }
+      if (!bet) { roundsSkipped++; return; }
     } else if (!bet) {
       stopReason = `Strategy step ${step} does not exist`;
-      break;
+      return;
     }
-    if (!bet) continue;
+    if (!bet) return;
     if (bet.amount > capital) {
       stopReason = "Insufficient capital for the next bet";
-      break;
+      return;
     }
 
     const outcome: BacktestOutcome = round.bust >= bet.cashout ? "win" : "loss";
@@ -369,7 +388,7 @@ export function runBacktest(input: {
       else step = strategyNextStep;
     }
 
-    if (input.includeLedger && ledger.length < 10_000) {
+    if (input.includeLedger && ledger.length < ledgerLimit) {
       ledger.push({
         roundId: round.id,
         roundIndex,
@@ -385,7 +404,16 @@ export function runBacktest(input: {
         ruleId,
       });
     }
-    equityCurve.push({ roundIndex, capital });
+    lastPoint = { roundIndex, capital };
+    if (roundIndex % stride === 0) equityCurve.push(lastPoint);
+    if (equityCurve.length >= 2_000) {
+      stride *= 2;
+      let write = 1;
+      for (let i = 1; i < equityCurve.length; i++) {
+        if (equityCurve[i]!.roundIndex % stride === 0) equityCurve[write++] = equityCurve[i]!;
+      }
+      equityCurve.length = write;
+    }
 
     if (!runner && scenario.stopLoss !== undefined && scenario.stopLoss > 0 && initialCapital - capital >= scenario.stopLoss) {
       stopReason = "Stop-loss reached";
@@ -396,50 +424,63 @@ export function runBacktest(input: {
     if (!runner && scenario.maxBets !== undefined && scenario.maxBets > 0 && totalBets >= scenario.maxBets) {
       stopReason = "Maximum bet count reached";
     }
-    if (stopReason) break;
   }
 
-  if (input.includeLedger && totalBets > ledger.length) {
-    warnings.push("Ledger was capped at 10,000 entries to limit response size");
-  }
-  const incompleteMetrics = rounds.filter((round) => round.metricsComplete === false).length;
-  const detectedGaps = rounds.filter((round) => round.gapDetected).length;
-  if (incompleteMetrics > 0) {
-    warnings.push(`${incompleteMetrics.toLocaleString()} rounds have incomplete player or financial metrics; rules using those metrics do not match those rounds`);
-  }
-  if (detectedGaps > 0) {
-    warnings.push(`${detectedGaps.toLocaleString()} rounds are marked with a data-continuity gap`);
+  function result(): BacktestResult {
+    const warnings: string[] = [];
+    if (input.includeLedger && totalBets > ledger.length) {
+      warnings.push(`Showing the first ${ledgerLimit.toLocaleString()} individual plays. The totals include every play.`);
+    }
+    if (incompleteMetrics > 0) {
+      warnings.push(`${incompleteMetrics.toLocaleString()} rounds have incomplete player or financial metrics; rules using those metrics do not match those rounds`);
+    }
+    if (detectedGaps > 0) {
+      warnings.push(`${detectedGaps.toLocaleString()} rounds are marked with a data-continuity gap`);
+    }
+
+    const netProfit = Math.round((capital - initialCapital) * 100) / 100;
+    return {
+      summary: {
+        startingCapital: initialCapital,
+        endingCapital: capital,
+        highestCapital: peakCapital,
+        lowestCapital: lowCapital,
+        netProfit,
+        roiPercent: (netProfit / initialCapital) * 100,
+        totalBets,
+        wins,
+        losses,
+        winRatePercent: totalBets > 0 ? (wins / totalBets) * 100 : 0,
+        totalWagered: Math.round(totalWagered * 100) / 100,
+        totalPaid: Math.round(totalPaid * 100) / 100,
+        grossProfit: Math.round(grossProfit * 100) / 100,
+        grossLoss: Math.round(grossLoss * 100) / 100,
+        profitFactor: grossLoss > 0 ? grossProfit / grossLoss : null,
+        maxDrawdown: Math.round(maxDrawdown * 100) / 100,
+        maxDrawdownPercent,
+        longestWinStreak,
+        longestLossStreak,
+        roundsProcessed,
+        roundsSkipped,
+        stoppedEarly: Boolean(stopReason),
+        stopReason,
+      },
+      equityCurve: sampleEquityCurve(equityCurve.at(-1) === lastPoint ? [...equityCurve] : [...equityCurve, lastPoint]),
+      ...(input.includeLedger ? { ledger: [...ledger] } : {}),
+      warnings,
+    };
   }
 
-  const netProfit = Math.round((capital - initialCapital) * 100) / 100;
   return {
-    summary: {
-      startingCapital: initialCapital,
-      endingCapital: capital,
-      highestCapital: peakCapital,
-      lowestCapital: lowCapital,
-      netProfit,
-      roiPercent: (netProfit / initialCapital) * 100,
-      totalBets,
-      wins,
-      losses,
-      winRatePercent: totalBets > 0 ? (wins / totalBets) * 100 : 0,
-      totalWagered: Math.round(totalWagered * 100) / 100,
-      totalPaid: Math.round(totalPaid * 100) / 100,
-      grossProfit: Math.round(grossProfit * 100) / 100,
-      grossLoss: Math.round(grossLoss * 100) / 100,
-      profitFactor: grossLoss > 0 ? grossProfit / grossLoss : null,
-      maxDrawdown: Math.round(maxDrawdown * 100) / 100,
-      maxDrawdownPercent,
-      longestWinStreak,
-      longestLossStreak,
-      roundsProcessed,
-      roundsSkipped,
-      stoppedEarly: Boolean(stopReason),
-      stopReason,
-    },
-    equityCurve: sampleEquityCurve(equityCurve),
-    ...(input.includeLedger ? { ledger } : {}),
-    warnings,
+    observe,
+    result,
+    get stopped() { return stopReason !== null; },
+    get dataset() { return { rounds: seen, firstRoundAt, lastRoundAt }; },
   };
+}
+
+export function runBacktest({ rounds, ...settings }: BacktestSettings & { rounds: BacktestRound[] }): BacktestResult {
+  const run = createBacktest(settings);
+  for (const round of rounds) run.observe(round);
+  return run.result();
 }

@@ -12,9 +12,9 @@ process.env.DATABASE_URL = "postgresql://offline:offline@127.0.0.1:1/test";
 process.env.BETTER_AUTH_SECRET = "offline-test-fixture-secret-for-strategies";
 
 test("a saved local-player setup backtests database rounds in order and stays private", async context => {
-  const [{ db, pool }, { auth }, { default: strategies }, { default: backtests }, { backtestRunner }] = await Promise.all([
+  const [{ db, pool }, { auth }, { default: strategies }, { default: backtests }, { backtestRunner }, { hostedPractice }] = await Promise.all([
     import("../../db/index.js"), import("../../lib/auth.js"), import("../../routes/strategies.js"),
-    import("../../routes/backtests.js"), import("./runner.js"),
+    import("../../routes/backtests.js"), import("./runner.js"), import("./practice.js"),
   ]);
   const pg = new PGlite();
   const fixture = drizzle(pg, { schema });
@@ -64,4 +64,38 @@ test("a saved local-player setup backtests database rounds in order and stays pr
   assert.deepEqual(result.ledger.map(row => row.amount), [10, 20, 40, 80, 100]);
   assert.equal(result.summary.netProfit, 250);
   assert.equal((await post("/backtests/run", request, "other")).status, 404);
+
+  const fixed = { type: "sequence", engine: "local-player", sequence: { bets: [{ amount: 10, cashout: 2 }] } };
+  const example = await post("/backtests/run", { strategy: fixed, initialCapital: 25, source: "examples",
+    exampleRounds: [1, 1, 1, 5], includeLedger: true });
+  assert.equal(example.status, 200);
+  const simulated = await example.json() as typeof result;
+  assert.equal(simulated.dataset.rounds, 4);
+  assert.deepEqual(simulated.ledger.map(row => row.amount), [10, 10]);
+  assert.equal(simulated.summary.netProfit, -20);
+
+  // A tied timestamp straddles the batch boundary. A small limit must not truncate this scope.
+  await pg.exec(`INSERT INTO rounds (bust, bust_id, created_at)
+    SELECT 2, 'archive-' || i, '2026-01-01'::timestamp FROM generate_series(1, 10002) i`);
+  const full = await post("/backtests/run", { strategy: fixed, initialCapital: 1000, range: { all: true, limit: 1 } });
+  assert.equal(full.status, 200);
+  const archive = await full.json() as typeof result;
+  assert.equal(archive.dataset.rounds, 10_009);
+  assert.equal(archive.summary.netProfit, 100_010);
+
+  assert.equal((await post("/backtests/practice", { strategy: fixed, name: "Fixed", initialCapital: 25, includeLedger: true })).status, 201);
+  const startPractice = { strategy: fixed, initialCapital: 25 };
+  assert.equal((await post("/backtests/practice", startPractice)).status, 409);
+  hostedPractice.observe({ id: "stale", createdAt: new Date(Date.now() - 1000), bust: 1 });
+  const observed = { id: "new", createdAt: new Date(Date.now() + 1000), bust: 1 };
+  hostedPractice.observe(observed);
+  hostedPractice.observe(observed);
+  hostedPractice.observe({ ...observed, id: "next", createdAt: new Date(observed.createdAt.getTime() + 1000), bust: 2 });
+  const getPractice = (user: string) => fetch(`http://127.0.0.1:${address.port}/backtests/practice`, { headers: { "x-fixture-user": user } });
+  const practice = await (await getPractice("owner")).json() as { session: { running: boolean; result: typeof result } };
+  assert.equal(practice.session.result.dataset.rounds, 2);
+  assert.deepEqual(practice.session.result.ledger.map(row => row.amount), [10, 10]);
+  assert.deepEqual(await (await getPractice("other")).json(), { session: null });
+  const stopped = await (await post("/backtests/practice/stop", {})).json() as typeof practice;
+  assert.equal(stopped.session.running, false);
 });
