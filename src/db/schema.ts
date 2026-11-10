@@ -51,14 +51,14 @@ export const playerRuns = pgTable("player_runs", {
   stopReason: text("stop_reason"),
   settings: jsonb("settings").$type<BacktestSettings>().notNull(),
   result: jsonb("result").$type<Omit<BacktestResult, "ledger"> & { dataset: ReturnType<typeof createBacktest>["dataset"] }>(),
-}, table => [index("player_runs_user_started_idx").on(table.userId, table.startedAt.desc(), table.id.desc())]);
+}, table => [index("player_runs_user_started_idx").on(table.userId, table.startedAt.desc(), table.id.desc())]).enableRLS();
 
 export const playerRunBatches = pgTable("player_run_batches", {
   runId: uuid("run_id").notNull().references(() => playerRuns.id, { onDelete: "cascade" }),
   batch: integer("batch").notNull(),
   rounds: jsonb("rounds").$type<BacktestRound[]>(),
   plays: jsonb("plays").$type<Array<BacktestLedgerEntry | null>>().notNull(),
-}, table => [primaryKey({ columns: [table.runId, table.batch] })]);
+}, table => [primaryKey({ columns: [table.runId, table.batch] })]).enableRLS();
 
 export const sessions = pgTable(
   "sessions",

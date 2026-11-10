@@ -71,6 +71,13 @@
       "when": 1794271048398,
       "tag": "0009_player_run_history",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1794275303967,
+      "tag": "0010_shallow_smasher",
+      "breakpoints": true
     }
   ]
 }

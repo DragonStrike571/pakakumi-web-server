@@ -22,12 +22,19 @@ async function applyOld(database: PGlite, count: number) {
 test("fresh PostgreSQL bootstrap is complete and rerunning migrations preserves data", async () => {
   const database = new PGlite();
   try {
+    await database.exec("CREATE ROLE anon; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon");
     await migrateDatabase(database);
     await database.exec("INSERT INTO users(id,name,email) VALUES ('a','A','a@test.invalid')");
     await migrateDatabase(database);
     assert.equal((await database.query('SELECT * FROM users')).rows.length, 1);
-    assert.equal((await database.query('SELECT * FROM drizzle.__drizzle_migrations')).rows.length, 10);
+    assert.equal((await database.query('SELECT * FROM drizzle.__drizzle_migrations')).rows.length, 11);
     assert.equal((await database.query("SELECT table_name FROM information_schema.tables WHERE table_name IN ('player_runs','player_run_batches')")).rows.length, 2);
+    assert.deepEqual((await database.query(`SELECT relname, relrowsecurity,
+      has_table_privilege('anon', oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') AS api_access
+      FROM pg_class WHERE oid IN ('public.player_runs'::regclass, 'public.player_run_batches'::regclass) ORDER BY relname`)).rows, [
+      { relname: "player_run_batches", relrowsecurity: true, api_access: false },
+      { relname: "player_runs", relrowsecurity: true, api_access: false },
+    ]);
     assert.equal((await database.query("SELECT column_name FROM information_schema.columns WHERE table_name='telegram_users' AND column_name='revoked_at'")).rows.length, 1);
   } finally { await database.close(); }
 });
