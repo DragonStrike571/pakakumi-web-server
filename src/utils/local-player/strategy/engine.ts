@@ -166,6 +166,8 @@ export class StrategyEngine {
 
   cycleCount() { return this.baseCycle; }
 
+  firstAmount() { return this.baseBets![0]!.amount; }
+
   reset() { this.phase = this.makeBasePhase(++this.baseCycle); }
 
   private startProfitStage(stageNumber: number, priorNetProfit: number, events: string[]) {

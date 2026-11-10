@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import express from "express";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { migrateDatabase } from "../../db/migrations.js";
@@ -92,14 +92,18 @@ test("a saved local-player setup backtests database rounds in order and stays pr
   assert.equal(noPlay.total, 2);
   assert.deepEqual(noPlay.rows.map((row: { round: { bust: number } }) => row.round.bust), [1, 5]);
 
-  // A tied timestamp straddles the batch boundary. A small limit must not truncate this scope.
+  // A tied sub-millisecond timestamp straddles the batch boundary. The cursor must retain its precision.
   await pg.exec(`INSERT INTO rounds (bust, bust_id, created_at)
-    SELECT 2, 'archive-' || i, '2026-01-01'::timestamp FROM generate_series(1, 10002) i`);
-  const full = await post("/backtests/run", { strategy: fixed, initialCapital: 1000, range: { all: true, limit: 1 } });
+    SELECT 2, 'archive-' || i, '2026-01-01 00:00:00.000123'::timestamp FROM generate_series(1, 10002) i`);
+  const full = await post("/backtests/run", { strategy: fixed, initialCapital: 1000, includeLedger: true, range: { all: true, limit: 1 } });
   assert.equal(full.status, 200);
   const archive = await full.json() as typeof result;
   assert.equal(archive.dataset.rounds, 10_009);
   assert.equal(archive.summary.netProfit, 100_010);
+  assert.equal(archive.ledger.length, 200);
+  const [snapshot] = await fixture.select({ rounds: schema.playerRunBatches.rounds }).from(schema.playerRunBatches)
+    .where(eq(schema.playerRunBatches.runId, archive.runId)).limit(1);
+  assert.ok(Array.isArray(snapshot?.rounds?.[0]));
   const lastPage = await (await get(`/backtests/runs/${archive.runId}/rounds?page=201&filter=win`)).json();
   assert.equal(lastPage.total, 10_005);
   assert.equal(lastPage.rows.length, 5);
@@ -134,6 +138,10 @@ test("a saved local-player setup backtests database rounds in order and stays pr
   assert.equal(stopped.session.running, false);
   const practicePath = `/backtests/runs/${stopped.session.result.runId}`;
   assert.ok((await (await get(practicePath)).json()).finishedAt);
+  // Old saves contain objects and new saves contain compact arrays. They can share a replay.
+  await fixture.update(schema.playerRunBatches).set({ rounds: [observed] }).where(and(
+    eq(schema.playerRunBatches.runId, stopped.session.result.runId), eq(schema.playerRunBatches.batch, 0),
+  ));
   const practiceReplay = await post("/backtests/run", { ...startPractice, replayOf: stopped.session.result.runId });
   assert.equal(practiceReplay.status, 200);
   const practiceResult = await practiceReplay.json() as typeof result;

@@ -93,6 +93,7 @@ export interface BacktestResult {
     longestLossStreak: number;
     roundsProcessed: number;
     roundsSkipped: number;
+    progressionRestarts: number;
     stoppedEarly: boolean;
     stopReason: string | null;
   };
@@ -147,6 +148,7 @@ export interface BacktestSettings {
   strategy: StrategyConfig;
   initialCapital: number;
   scenario?: BacktestScenario;
+  onBlocked?: "stop" | "restart";
   includeLedger?: boolean;
   ledgerLimit?: number;
 }
@@ -190,7 +192,7 @@ export function createBacktest(input: BacktestSettings) {
             takeProfit: scenario.takeProfit || undefined,
           },
         },
-      }, () => historicalTime)
+      }, () => historicalTime, undefined, input.onBlocked === "restart")
     : null;
   const bets = runner ? [] : resolveBets(strategy);
 
@@ -221,6 +223,7 @@ export function createBacktest(input: BacktestSettings) {
   let roundsSinceLoss = 0;
   let roundsProcessed = 0;
   let roundsSkipped = 0;
+  let progressionRestarts = 0;
   let stopReason: string | null = null;
 
   const firedOnceRules = new Set<string>();
@@ -259,9 +262,23 @@ export function createBacktest(input: BacktestSettings) {
       return;
     }
 
-    const placedStep = runner?.stepIndex ?? step;
     // Decide before revealing this result. A trigger can only arm a later round.
-    const bet = runner ? runner.nextBet() : bets[placedStep];
+    let bet = runner ? runner.nextBet() : bets[step];
+    if (!runner && bet && input.onBlocked === "restart") {
+      const lossRoom = scenario.stopLoss ? scenario.stopLoss - (initialCapital - capital) : Infinity;
+      const available = Math.min(capital, 5000, lossRoom);
+      if (bet.amount > available + 1e-7) {
+        if (step !== 0 && bets[0]!.amount <= available + 1e-7) {
+          step = 0;
+          bet = bets[0];
+          progressionRestarts++;
+        } else {
+          stopReason = "The starting amount cannot fit the remaining funds or test limits.";
+          return;
+        }
+      }
+    }
+    const placedStep = runner?.stepIndex ?? step;
     if (runner) {
       if (runner.stopReason) {
         roundsProcessed--;
@@ -464,6 +481,7 @@ export function createBacktest(input: BacktestSettings) {
         longestLossStreak,
         roundsProcessed,
         roundsSkipped,
+        progressionRestarts: runner?.progressionRestarts ?? progressionRestarts,
         stoppedEarly: Boolean(stopReason),
         stopReason,
       },

@@ -80,6 +80,7 @@ export function windowAmount(budget: number, rounds: number, minimum: number, ma
 export class AdaptivePlan {
   cycle = 1;
   stopReason: string | null = null;
+  private blockedByAmount = false;
   private waiting: boolean;
   private seen = 0;
   private openedAt: number | null = null;
@@ -94,7 +95,7 @@ export class AdaptivePlan {
   private sizingForProfit = false;
   private protectedAmount = 0;
   private protectionActive = false;
-  constructor(readonly config: AdaptiveConfig, private initial: number) {
+  constructor(readonly config: AdaptiveConfig, private initial: number, private restartOnBlocked = false) {
     this.waiting = config.start === "after-target";
     this.budget = config.windowBudget;
   }
@@ -120,7 +121,7 @@ export class AdaptivePlan {
     const remaining = Math.max(0, cents(capital - this.protectedAmount));
     return this.protectionActive ? Math.min(remaining, down(capital * this.config.protection!.maxUsePercent / 100)) : remaining;
   }
-  private amount(capital: number) {
+  private amount(capital: number, spent = this.spent, maximum = this.config.maximum) {
     const c = this.config;
     if (c.kind === "window") return this.sizingForProfit ? cents(this.budget / c.windowRounds) : windowAmount(this.budget, c.windowRounds, c.minimum, c.maximum, c.rounding).amount;
     let raw: number;
@@ -128,11 +129,19 @@ export class AdaptivePlan {
       const basis = c.fractionBasis === "initial" ? this.initial : c.fractionBasis === "available" ? this.usable(capital) : capital;
       raw = basis * (c.fractionPercent === undefined ? 1 / c.target : c.fractionPercent / 100);
     } else if (c.kind === "roi") {
-      raw = c.returnMode === "profit" ? (this.spent + c.goalProfit) / (c.target - (c.adjustBeforeRound ? 1 : 0)) : this.spent * c.returnMultiple / (c.target - (c.adjustBeforeRound ? c.returnMultiple : 0));
+      raw = c.returnMode === "profit" ? (spent + c.goalProfit) / (c.target - (c.adjustBeforeRound ? 1 : 0)) : spent * c.returnMultiple / (c.target - (c.adjustBeforeRound ? c.returnMultiple : 0));
       raw = Math.max(c.baseAmount, raw);
     } else raw = this.budget / c.windowRounds;
-    const amount = Math.min(c.maximum, Math.max(c.minimum, roundAmount(raw, c.rounding)));
+    const amount = Math.min(maximum, Math.max(c.minimum, roundAmount(raw, c.rounding)));
     return cents(amount);
+  }
+  private windowExceedsMaximum() {
+    const c = this.config;
+    return this.restartOnBlocked && c.kind === "window" && this.budget > c.windowBudget && !this.sizingForProfit &&
+      windowAmount(this.budget, c.windowRounds, c.minimum, Infinity, c.rounding).amount > c.maximum;
+  }
+  private blockMaximum() {
+    return this.block(`The next amount exceeds the KES ${this.config.maximum.toFixed(2)} per-round limit.`);
   }
   next(capital: number, useRemaining = false) {
     this.protect(capital);
@@ -140,6 +149,8 @@ export class AdaptivePlan {
     if (this.windowEnding) this.finishWindow();
     if (this.waiting || this.stopReason) return null;
     if (this.openedAt === null) this.openWindow();
+    const c = this.config;
+    if (this.windowExceedsMaximum()) return this.blockMaximum();
     let amount = this.amount(capital);
     if (this.config.kind === "roi" && this.spent + amount > this.config.cycleBudget + 1e-7) {
       this.spent = 0; this.cycle++;
@@ -147,19 +158,34 @@ export class AdaptivePlan {
       if (this.config.cycleEnd === "wait") { this.wait(); return null; }
       amount = this.amount(capital);
     }
-    if (amount < this.config.minimum) { this.stopReason = `This window has KES ${this.budget.toFixed(2)}. ${this.config.windowRounds} rounds need at least KES ${(this.config.minimum * this.config.windowRounds).toFixed(2)}.`; return null; }
+    if (this.restartOnBlocked && c.kind === "roi" && this.spent > 0 && this.amount(capital, this.spent, Infinity) > c.maximum) {
+      return this.blockMaximum();
+    }
+    if (amount < this.config.minimum) return this.block(`This window has KES ${this.budget.toFixed(2)}. ${this.config.windowRounds} rounds need at least KES ${(this.config.minimum * this.config.windowRounds).toFixed(2)}.`);
     const remaining = this.config.windowRounds - (this.seen - (this.openedAt ?? this.seen));
     if (this.sizingForProfit && amount * Math.max(1, remaining) > this.usable(capital) + 1e-7) {
-      this.stopReason = "Available funds cannot cover the remaining rounds at the profit-target amount.";
-      return null;
+      return this.block("Available funds cannot cover the remaining rounds at the profit-target amount.");
     }
-    if (!this.sizingForProfit && !useRemaining && this.config.kind === "window" && this.spent === 0 && amount * this.config.windowRounds > this.usable(capital) + 1e-7) { this.stopReason = "Available funds cannot cover this complete window."; return null; }
+    if (!this.sizingForProfit && !useRemaining && this.config.kind === "window" && this.spent === 0 && amount * this.config.windowRounds > this.usable(capital) + 1e-7) return this.block("Available funds cannot cover this complete window.");
     if (useRemaining) { amount = Math.min(amount, down(this.usable(capital))); if (amount < this.config.minimum) { this.stopReason = "Playable funds are below the minimum amount. Protected funds are kept aside."; return null; } }
-    if (amount > this.usable(capital) + 1e-7) { this.stopReason = this.protectionActive ? "The next amount would use protected funds." : "Available funds cannot cover the next amount."; return null; }
+    if (amount > this.usable(capital) + 1e-7) return this.block(this.protectionActive ? "The next amount would use protected funds." : "Available funds cannot cover the next amount.");
     return { amount, cashout: this.config.target };
   }
+  private block(reason: string) { this.blockedByAmount = true; this.stopReason = reason; return null; }
+  restartBlocked(capital: number, lossRoom: number, amount?: number) {
+    if (!this.restartOnBlocked || (this.stopReason && !this.blockedByAmount)) return false;
+    const c = this.config;
+    const progressed = c.kind === "window" ? this.budget !== c.windowBudget || this.sizingForProfit : c.kind === "roi" && this.spent > 0;
+    if (!progressed) return false;
+    if (c.kind === "roi" && this.amount(capital, 0, Infinity) > c.maximum) return false;
+    const first = c.kind === "window" ? windowAmount(c.windowBudget, c.windowRounds, c.minimum, c.maximum, c.rounding).amount : this.amount(capital, 0);
+    const required = c.kind === "window" ? first * c.windowRounds : first;
+    if (first < c.minimum || required > this.usable(capital) + 1e-7 || first > lossRoom + 1e-7 || (amount !== undefined && first >= amount)) return false;
+    this.reset(c.kind !== "window" || this.spent > 0);
+    return true;
+  }
   canUse(amount: number, capital: number) { return !this.waiting && !this.stopReason && !this.windowEnding && amount <= this.usable(capital) + 1e-7; }
-  settle(amount: number, payout: number, capital: number) {
+  settle(amount: number, payout: number, capital: number, useRemaining = false) {
     const c = this.config, won = payout >= amount * c.target - 0.01 && payout > 0;
     this.spent = cents(this.spent + amount); this.protect(capital, won);
     if (c.windowProfitGoal !== undefined) this.lossSinceHit = won ? 0 : cents(this.lossSinceHit + amount - payout);
@@ -179,6 +205,10 @@ export class AdaptivePlan {
     }
     if (this.windowEnding && !this.stopReason) {
       this.finishWindow();
+      if (this.restartOnBlocked && c.kind === "window" && c.windowAfter === "wait" && !this.windowWon && !this.stopReason &&
+          (this.sizingForProfit || !useRemaining) && this.amount(capital) * c.windowRounds > this.usable(capital) + 1e-7) {
+        this.block("Available funds cannot cover this complete window.");
+      }
       events.push(this.stopReason ?? (this.waiting ? `Window complete. Waiting for ${c.trigger}x or higher.` : "Window complete. The next window starts next round."));
     }
     return events;
@@ -198,7 +228,8 @@ export class AdaptivePlan {
     const c = this.config, goal = c.windowProfitGoal;
     if (goal === undefined) {
       this.advanceBudget();
-      this.checkBudget();
+      if (!Number.isFinite(this.budget) || this.budget > 1e12) this.block("The next window allocation is too large.");
+      else if (this.windowExceedsMaximum()) this.blockMaximum();
       return;
     }
 
@@ -215,7 +246,7 @@ export class AdaptivePlan {
       const unit = c.rounding === "cents" ? 0.01 : c.rounding.includes("five") ? 5 : c.rounding.includes("ten") ? 10 : 1;
       const amount = Math.max(c.minimum, cents(Math.ceil(raw / unit - 1e-8) * unit));
       if (raw > c.maximum + 1e-7) {
-        this.stopReason = `The profit target needs more than the KES ${c.maximum.toFixed(2)} per-round limit.`;
+        this.block(`The profit target needs more than the KES ${c.maximum.toFixed(2)} per-round limit.`);
         return;
       }
       this.budget = cents(Math.min(c.maximum, amount) * c.windowRounds);
@@ -228,14 +259,31 @@ export class AdaptivePlan {
     else if (this.config.hitBudget === "advance") { this.advanceBudget(); this.checkBudget(); }
   }
   private finishWindow() {
-    if (this.config.kind === "window") { if (this.windowWon) this.applyHitBudget(); else this.advanceMissedWindow(); this.spent = 0; }
+    if (this.config.kind === "window") {
+      if (this.windowWon) this.applyHitBudget();
+      else this.advanceMissedWindow();
+      this.spent = 0;
+      if (this.config.windowAfter === "stop") this.blockedByAmount = false;
+    }
     else if (this.config.resetSpentAfterWindow) this.spent = 0;
     this.cycle++;
     if (this.config.windowAfter === "stop") { this.windowEnding = false; this.stopReason ??= "The play window is complete. Stopped as configured."; }
     else if (this.config.windowAfter === "repeat") this.openWindow();
     else this.wait();
   }
-  reset() { this.cycle++; this.spent = 0; this.lossSinceHit = 0; this.sizingForProfit = false; this.budget = this.config.windowBudget; this.budgetIndex = 0; this.windowEnding = false; if (this.config.start === "after-target") this.wait(); else if (this.config.windowEnabled) this.openWindow(); else this.waiting = false; }
+  reset(advanceCycle = true) {
+    if (this.restartOnBlocked && this.blockedByAmount) { this.stopReason = null; this.blockedByAmount = false; }
+    if (advanceCycle) this.cycle++;
+    this.spent = 0;
+    this.lossSinceHit = 0;
+    this.sizingForProfit = false;
+    this.budget = this.config.windowBudget;
+    this.budgetIndex = 0;
+    this.windowEnding = false;
+    if (this.config.start === "after-target") this.wait();
+    else if (this.config.windowEnabled) this.openWindow();
+    else this.waiting = false;
+  }
   resume() { const wasWaiting = this.waiting; this.waiting = false; if (this.config.windowEnabled && wasWaiting) this.openWindow(); }
   view(capital: number): PlanView {
     const c = this.config, amount = this.amount(capital), remaining = c.windowEnabled ? Math.max(0, c.windowRounds - (this.seen - (this.openedAt ?? this.seen))) : null;

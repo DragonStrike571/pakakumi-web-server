@@ -48,6 +48,47 @@ test("the local 5x profit switch survives request validation and historical sett
   assert.equal(result.summary.highestCapital, 1250);
 });
 
+test("a blocked profit progression can restart without restoring the funds it spent", () => {
+  const request = runBacktestSchema.parse({ strategy: {
+    ...profitWindow, adaptive: { ...profitWindow.adaptive, maximum: 80 },
+  }, onBlocked: "restart", initialCapital: 1000, includeLedger: true });
+  const input = { ...request, strategy: request.strategy!, rounds: rounds(1, 1, 1, 1, 1, 1) };
+  const result = runBacktest(input);
+  assert.deepEqual(result.ledger?.map(row => row.amount), [10, 20, 40, 80, 10, 20]);
+  assert.equal(result.summary.progressionRestarts, 1);
+  assert.equal(result.summary.endingCapital, 820);
+  assert.equal(runBacktest({ ...input, onBlocked: "stop" }).summary.totalBets, 4);
+});
+
+test("restarting a capped window still requires a fresh trigger and respects explicit stops", () => {
+  const adaptive = { ...profitWindow.adaptive, windowProfitGoal: undefined, maximum: 30,
+    trigger: 3, start: "after-target", windowAfter: "wait" };
+  const input = { strategy: parseAdvancedStrategy({ type: "adaptive", adaptive }), onBlocked: "restart" as const,
+    initialCapital: 100, includeLedger: true, rounds: rounds(3, 1, 3, 1, 1, 3, 1) };
+  const result = runBacktest(input);
+  assert.deepEqual(result.ledger?.map(row => [row.roundIndex, row.amount]), [[1, 10], [3, 20], [6, 10]]);
+  assert.equal(result.summary.progressionRestarts, 1);
+  const shortOfFunds = runBacktest({ ...input, initialCapital: 55, strategy: parseAdvancedStrategy({ type: "adaptive", adaptive: { ...adaptive, maximum: 100 } }) });
+  assert.deepEqual(shortOfFunds.ledger?.map(row => [row.roundIndex, row.amount]), [[1, 10], [3, 20], [6, 10]]);
+  const stopped = runBacktest({ ...input, strategy: parseAdvancedStrategy({ type: "adaptive", adaptive: { ...adaptive, windowAfter: "stop" } }) });
+  assert.equal(stopped.summary.totalBets, 1);
+  assert.equal(stopped.summary.progressionRestarts, 0);
+});
+
+test("an unaffordable step restarts at the exact base amount and stops once that would exceed the loss limit", () => {
+  for (const config of [strategy, { ...strategy, engine: "local-player" as const }]) {
+    const result = runBacktest({ strategy: config, onBlocked: "restart", initialCapital: 100, includeLedger: true,
+      scenario: { stopLoss: 25 }, rounds: rounds(1, 1, 1, 1) });
+    assert.deepEqual(result.ledger?.map(row => [row.strategyStep, row.amount]), [[0, 10], [0, 10]]);
+    assert.equal(result.summary.progressionRestarts, 1);
+    assert.equal(result.summary.endingCapital, 80);
+    assert.ok(result.summary.stopReason);
+    const shortOfFunds = runBacktest({ strategy: config, onBlocked: "restart", initialCapital: 25, includeLedger: true, rounds: rounds(1, 1, 1) });
+    assert.deepEqual(shortOfFunds.ledger?.map(row => row.amount), [10, 10]);
+    assert.equal(shortOfFunds.summary.endingCapital, 5);
+  }
+});
+
 test("imported sequences keep the local funds mode and step numbers", () => {
   const request = runBacktestSchema.parse({ strategy: {
     ...strategy, engine: "local-player", execution: { fundsMode: "use-remaining" },

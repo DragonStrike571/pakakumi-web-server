@@ -13,7 +13,8 @@ import {
   primaryKey,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
-import type { BacktestLedgerEntry, BacktestRound, BacktestSettings, createBacktest, BacktestResult } from "../services/backtest/engine.js";
+import type { BacktestLedgerEntry, BacktestSettings, createBacktest, BacktestResult } from "../services/backtest/engine.js";
+import type { StoredRound } from "../services/backtest/round-data.js";
 
 export const users = pgTable(
   "users",
@@ -56,7 +57,7 @@ export const playerRuns = pgTable("player_runs", {
 export const playerRunBatches = pgTable("player_run_batches", {
   runId: uuid("run_id").notNull().references(() => playerRuns.id, { onDelete: "cascade" }),
   batch: integer("batch").notNull(),
-  rounds: jsonb("rounds").$type<BacktestRound[]>(),
+  rounds: jsonb("rounds").$type<StoredRound[]>(),
   plays: jsonb("plays").$type<Array<BacktestLedgerEntry | null>>().notNull(),
 }, table => [primaryKey({ columns: [table.runId, table.batch] })]).enableRLS();
 

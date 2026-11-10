@@ -43,10 +43,11 @@ export class StrategyRunner {
   private fired = new Set<string>();
   private lastBust: number | null = null;
   private startedAt: number;
+  private restarts = 0;
   stopReason: string | null = null;
   readonly unavailableMetrics: string[];
 
-  constructor(input: RunSettings | StrategySettings, private clock: () => number = Date.now, private onHistory?: (event: RunEvent) => void) {
+  constructor(input: RunSettings | StrategySettings, private clock: () => number = Date.now, private onHistory?: (event: RunEvent) => void, private restartOnBlocked = false) {
     this.settings = toRunSettings(input);
     this.config = this.settings.strategy;
     this.capital = this.peak = this.low = this.settings.initialCapital;
@@ -56,7 +57,7 @@ export class StrategyRunner {
     this.bets = this.config.type === "algorithm" && a ? generateAlgorithmBets(a.capital, a.minAmount, a.multiplier, a.targetReturn, a.roundingOption, a.maxPlayable) : this.config.sequence?.bets ?? [];
     if (this.config.autoCashout) this.bets = this.bets.map(b => ({ ...b, cashout: this.config.autoCashout! }));
     this.phase = this.config.type === "phased" ? new StrategyEngine({ initialCapital: this.capital, ...this.config.phased! }) : null;
-    this.adaptive = this.config.type === "adaptive" ? new AdaptivePlan({ ...this.config.adaptive!, maximum: Math.min(this.config.adaptive!.maximum, this.settings.maxBet) }, this.capital) : null;
+    this.adaptive = this.config.type === "adaptive" ? new AdaptivePlan({ ...this.config.adaptive!, maximum: Math.min(this.config.adaptive!.maximum, this.settings.maxBet) }, this.capital, restartOnBlocked) : null;
     if (!this.phase && !this.adaptive && !this.bets.length) throw new Error("This strategy has no steps");
     if (this.bets.some(b => b.amount > this.settings.maxBet)) throw new Error("A strategy step exceeds the session maximum amount");
     if (this.phase && (this.config.phased!.maxBet > this.settings.maxBet || this.config.phased!.boostBet > this.settings.maxBet)) throw new Error("Phase amounts exceed the session maximum");
@@ -65,6 +66,7 @@ export class StrategyRunner {
 
   startClock() { this.startedAt = this.clock(); }
   get stepIndex() { return this.step; }
+  get progressionRestarts() { return this.restarts; }
   observeRound(bust: number) {
     if (!Number.isFinite(bust) || bust < 1) throw new Error("Invalid round result");
     this.rounds++; this.sinceWin++; this.sinceLoss++;
@@ -82,14 +84,46 @@ export class StrategyRunner {
     if (this.skippingPausedRound) return null;
     if (this.pause > 0) { this.pause--; this.skippingPausedRound = true; return null; }
     const useRemaining = this.config.execution?.fundsMode === "use-remaining";
-    let bet = this.adaptive ? this.adaptive.next(this.capital, useRemaining) : this.phase ? this.phase.nextBet() : this.bets[this.step]!;
-    if (this.adaptive) { this.cycle = this.adaptive.cycle; if (this.adaptive.stopReason) this.stopReason = this.adaptive.stopReason; }
-    if (!bet || this.limited()) return null;
-    if (useRemaining) { if (this.capital < 10) { this.stopReason = "Playable funds are below KES 10."; return null; } bet = { ...bet, amount: Math.min(bet.amount, this.capital) }; }
-    if (bet.amount > this.capital) { this.stopReason = "Session funds cannot cover the next amount."; return null; }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let bet = this.adaptive ? this.adaptive.next(this.capital, useRemaining) : this.phase ? this.phase.nextBet() : this.bets[this.step]!;
+      if (this.adaptive) {
+        this.cycle = this.adaptive.cycle;
+        if (this.adaptive.stopReason) {
+          if (attempt === 0 && this.restartBlocked() && !this.limited()) continue;
+          this.stopReason ??= this.adaptive.stopReason;
+          return null;
+        }
+      }
+      if (!bet || this.limited()) return null;
+      if (useRemaining) bet = { ...bet, amount: Math.min(bet.amount, this.capital) };
+      const blocked = bet.amount > this.capital ? "Session funds cannot cover the next amount."
+        : bet.amount > this.lossRoom() + 1e-7 ? "The next amount would exceed the session loss limit." : null;
+      if (!blocked) return { ...bet };
+      if (attempt === 0 && this.restartBlocked(bet.amount) && !this.limited()) continue;
+      this.stopReason ??= blocked;
+      return null;
+    }
+    return null;
+  }
+
+  private lossRoom() {
     const limit = this.config.execution?.stopLoss;
-    if (limit !== undefined && this.settings.initialCapital - this.capital + bet.amount > limit + 1e-7) { this.stopReason = "The next amount would exceed the session loss limit."; return null; }
-    return { ...bet };
+    return limit === undefined ? Infinity : limit - (this.settings.initialCapital - this.capital);
+  }
+
+  private restartBlocked(amount?: number) {
+    if (!this.restartOnBlocked || this.stopReason) return false;
+    if (this.adaptive) {
+      if (!this.adaptive.restartBlocked(this.capital, this.lossRoom(), amount)) return false;
+      this.cycle = this.adaptive.cycle;
+    } else {
+      const first = this.phase?.firstAmount() ?? this.bets[0]!.amount;
+      if (amount === undefined || first >= amount || first > this.capital || first > this.lossRoom() + 1e-7) return false;
+      if (this.phase) { this.phase.reset(); this.cycle = this.phase.cycleCount(); }
+      else { this.step = 0; this.cycle++; }
+    }
+    this.restarts++;
+    return true;
   }
 
   canSubmit(amount: number) {
@@ -111,7 +145,7 @@ export class StrategyRunner {
     this.played++; if (bust !== null) this.lastBust = bust;
     if (won) { this.wins++; this.losses = 0; this.sinceWin = 0; }
     else { this.losses++; this.wins = 0; this.sinceLoss = 0; }
-    const events = this.adaptive?.settle(bet.amount, payout, this.capital) ?? this.phase?.settleRound(bust ?? 1, bet, payout).events ?? [];
+    const events = this.adaptive?.settle(bet.amount, payout, this.capital, this.config.execution?.fundsMode === "use-remaining") ?? this.phase?.settleRound(bust ?? 1, bet, payout).events ?? [];
     const nextStep = won ? 0 : (this.step + 1) % this.bets.length;
     const execution = this.config.execution;
     const values: Record<ExecutionRuleMetric, number | null> = {
@@ -138,7 +172,13 @@ export class StrategyRunner {
       if (this.step === 0) this.cycle++;
     }
     if (this.phase) this.cycle = this.phase.cycleCount();
-    if (this.adaptive) { this.cycle = this.adaptive.cycle; if (this.adaptive.stopReason) this.stopReason = this.adaptive.stopReason; }
+    if (this.adaptive) {
+      this.cycle = this.adaptive.cycle;
+      if (this.adaptive.stopReason) {
+        if (!won && !this.limited() && this.restartBlocked()) events.push("Starting over with the remaining funds.");
+        else this.stopReason ??= this.adaptive.stopReason;
+      }
+    }
     this.limited();
     this.onHistory?.({ type: "result", ordinal: reviewed || this.rounds === 0 ? null : this.rounds, played: this.played, bust, time: this.clock(), amount: bet.amount, target: bet.cashout, payout, capital: this.capital, reviewed });
     return { netProfit: net, events, ruleId: rule?.id };

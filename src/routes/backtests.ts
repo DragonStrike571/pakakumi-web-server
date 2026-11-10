@@ -1,13 +1,14 @@
 import { Router, type Request, type Response } from "express";
 import rateLimit from "express-rate-limit";
-import { and, asc, desc, eq, exists, gte, lte, or, sql } from "drizzle-orm";
+import { and, eq, exists, gte, lte, or, sql } from "drizzle-orm";
 import { db } from "../db/index.js";
 import { rounds, strategies, strategyAccess } from "../db/schema.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireActiveAccess } from "../middleware/access.js";
 import type { AuthenticatedRequest } from "../types/express.js";
 import { hostedPractice } from "../services/backtest/practice.js";
-import { createSavedRun, discardSavedRun, finishSavedRun, getSavedRun, listSavedRounds, listSavedRuns, loadSavedBatches, saveBatches } from "../services/backtest/history.js";
+import { createSavedRun, discardSavedRun, finishSavedRun, getSavedRun, getSavedRunMetadata, listSavedRounds, listSavedRuns, loadSavedBatches, saveBatches } from "../services/backtest/history.js";
+import { loadRecordedRounds, recordedBoundary } from "../services/backtest/round-data.js";
 import type { BacktestRound } from "../services/backtest/engine.js";
 import { backtestRunner } from "../services/backtest/runner.js";
 import { runBacktestSchema } from "../validation/backtests.js";
@@ -25,15 +26,6 @@ const runLimiter = rateLimit({
   legacyHeaders: false,
 });
 const sampleRounds = [1.2, 2.4, 1.01, 5.2, 100, 1.5, 3, 120, 2, 100, 1.2, 1.8, 4.5, 2.2, 1, 7];
-const roundFields = {
-  id: rounds.id,
-  bust: rounds.bust,
-  createdAt: rounds.createdAt,
-  roundsSinceLast3000: rounds.roundsSinceLast3000,
-  totalReserveFunds: rounds.totalReserveFunds,
-  gapDetected: rounds.gapDetected,
-  metricsComplete: rounds.metricsComplete,
-};
 
 async function prepareRun(req: Request, res: Response) {
   const parsed = runBacktestSchema.safeParse(req.body);
@@ -94,8 +86,8 @@ async function prepareRun(req: Request, res: Response) {
     }
   }
 
-  const { initialCapital, scenario, includeLedger } = parsed.data;
-  return { data: parsed.data, userId, name, settings: { strategy, initialCapital, scenario, includeLedger } };
+  const { initialCapital, scenario, includeLedger, onBlocked } = parsed.data;
+  return { data: parsed.data, userId, name, settings: { strategy, initialCapital, scenario, includeLedger, onBlocked } };
 }
 
 router.get("/practice", (req, res) => {
@@ -144,14 +136,14 @@ router.get("/runs/:id/rounds", async (req: Request, res) => {
   const page = pageSchema.safeParse(req.query.page);
   const filter = z.enum(["all", "played", "win", "loss", "observed"]).default("all").safeParse(req.query.filter);
   if (!page.success || !filter.success) { res.status(400).json({ error: "Invalid page or result filter" }); return; }
-  const run = id.success ? await getSavedRun((req as AuthenticatedRequest).user.id, id.data) : undefined;
-  if (!run?.result) { res.status(404).json({ error: "Saved run not found" }); return; }
+  const run = id.success ? await getSavedRunMetadata((req as AuthenticatedRequest).user.id, id.data) : undefined;
+  if (!run) { res.status(404).json({ error: "Saved run not found" }); return; }
   const size = 50;
-  const summary = run.result.summary;
-  const total = { all: run.result.dataset.rounds, played: summary.totalBets, win: summary.wins,
-    loss: summary.losses, observed: run.result.dataset.rounds - summary.totalBets }[filter.data];
+  const { summary, roundCount } = run;
+  const total = { all: roundCount, played: summary.totalBets, win: summary.wins,
+    loss: summary.losses, observed: roundCount - summary.totalBets }[filter.data];
   const offset = (page.data - 1) * size;
-  res.json({ total, size, rows: offset < total ? await listSavedRounds(run, filter.data, offset, size) : [] });
+  res.json({ total, size, rows: offset < total ? await listSavedRounds(run, roundCount, filter.data, offset, size) : [] });
 });
 
 router.post("/run", runLimiter, async (req: Request, res: Response) => {
@@ -164,14 +156,14 @@ router.post("/run", runLimiter, async (req: Request, res: Response) => {
   let runId: string | undefined;
 
   try {
-    let original = data.replayOf ? await getSavedRun(run.userId, data.replayOf) : undefined;
+    let original = data.replayOf ? await getSavedRunMetadata(run.userId, data.replayOf) : undefined;
     if (data.replayOf && !original) { res.status(404).json({ error: "Saved run not found" }); return; }
     if (original && hostedPractice.isRunning(run.userId, original.id)) {
       res.status(409).json({ error: "Stop practice and record at least one round before replaying it." });
       return;
     }
-    if (original && !original.finishedAt) original = await getSavedRun(run.userId, original.id);
-    if (data.replayOf && !original?.result?.dataset.rounds) {
+    if (original && !original.finishedAt) original = await getSavedRunMetadata(run.userId, original.id);
+    if (data.replayOf && !original?.roundCount) {
       res.status(409).json({ error: "This saved run has no rounds to replay." });
       return;
     }
@@ -180,14 +172,14 @@ router.post("/run", runLimiter, async (req: Request, res: Response) => {
       const id = await createSavedRun(run.userId, run.name, original?.source ?? data.source, settings, original);
       runId = id;
       let batch = 0;
-      const result = await backtestRunner.runHistory(settings, load, controller.signal, async (history, plays) => {
+      const result = await backtestRunner.runHistory({ ...settings, ledgerLimit: 200 }, load, controller.signal, async (history, plays) => {
         if (original) {
           await saveBatches(replayBatches.map(saved => ({ runId: id, batch: saved.batch,
             plays: plays.slice(saved.batch - batch, saved.batch - batch + saved.rounds!.length) })));
         } else await saveBatches([{ runId: id, batch, rounds: history, plays }]);
         batch += history.length;
       });
-      if (original && result.dataset?.rounds !== original.result?.dataset.rounds) throw new Error("The saved round snapshot is incomplete.");
+      if (original && result.dataset?.rounds !== original.roundCount) throw new Error("The saved round snapshot is incomplete.");
       if (truncated) result.warnings.push(`This test used the newest ${data.range.limit.toLocaleString()} matching rounds. Choose all matching rounds for the full range.`);
       const { ledger, dataset, ...summary } = result;
       await finishSavedRun(id, { ...summary, dataset: dataset! });
@@ -195,8 +187,10 @@ router.post("/run", runLimiter, async (req: Request, res: Response) => {
     };
     if (original) {
       let position = 0;
+      const { roundCount, roundsRunId, source } = original;
       await archive(async () => {
-        replayBatches = await loadSavedBatches(original.roundsRunId, position, original.source === "practice" ? 200 : 1);
+        if (position >= roundCount) return [];
+        replayBatches = await loadSavedBatches(roundsRunId, position, source === "practice" ? 200 : 1);
         const saved = replayBatches.flatMap(({ rounds }) => rounds ?? []);
         position += saved.length;
         return saved;
@@ -218,46 +212,26 @@ router.post("/run", runLimiter, async (req: Request, res: Response) => {
     if (data.range.endDate) conditions.push(lte(rounds.createdAt, new Date(data.range.endDate)));
     const scope = and(...conditions);
 
-    if (data.range.all) {
-      // Freeze the end of this replay while the collector keeps appending new rounds.
-      const [last] = await db.select({ id: rounds.id, createdAt: rounds.createdAt })
-        .from(rounds).where(scope).orderBy(desc(rounds.createdAt), desc(rounds.id)).limit(1);
-      if (!last) {
-        res.status(422).json({ error: "No historical rounds match this date range" });
-        return;
-      }
-      const end = sql`(${rounds.createdAt}, ${rounds.id}) <= (${sql.param(last.createdAt, rounds.createdAt)}, ${last.id}::uuid)`;
-      let cursor: typeof last | undefined;
-      let exhausted = false;
-      await archive(async () => {
-        if (exhausted) return [];
-        const after = cursor && sql`(${rounds.createdAt}, ${rounds.id}) > (${sql.param(cursor.createdAt, rounds.createdAt)}, ${cursor.id}::uuid)`;
-        const batch = await db.select(roundFields).from(rounds)
-          .where(and(scope, lte(rounds.createdAt, last.createdAt), end,
-            cursor && gte(rounds.createdAt, cursor.createdAt), after))
-          .orderBy(asc(rounds.createdAt), asc(rounds.id)).limit(10_000);
-        cursor = batch.at(-1);
-        exhausted = batch.length < 10_000;
-        return batch;
-      });
-      return;
-    }
-
-    const history = (await db.select(roundFields).from(rounds).where(scope)
-      .orderBy(desc(rounds.createdAt), desc(rounds.id)).limit(data.range.limit + 1));
-    if (history.length === 0) {
+    // Freeze the selection and page from the oldest round inside it.
+    const last = await recordedBoundary(scope);
+    if (!last) {
       res.status(422).json({ error: "No historical rounds match this date range" });
       return;
     }
-    const truncated = history.length > data.range.limit;
-    if (truncated) history.pop();
-    history.reverse();
-    let position = 0;
+    const end = sql`(${rounds.createdAt}, ${rounds.id}) <= (${last.at}::timestamp, ${last.id}::uuid)`;
+    const endScope = and(scope, sql`${rounds.createdAt} <= ${last.at}::timestamp`, end);
+    const excluded = data.range.all ? undefined : await recordedBoundary(endScope, data.range.limit);
+    let cursor = excluded;
+    let remaining = data.range.all ? Infinity : data.range.limit;
     await archive(async () => {
-      const batch = history.slice(position, position + 10_000);
-      position += batch.length;
-      return batch;
-    }, truncated);
+      if (!remaining) return [];
+      const after = cursor && sql`(${rounds.createdAt}, ${rounds.id}) > (${cursor.at}::timestamp, ${cursor.id}::uuid)`;
+      const size = Math.min(10_000, remaining);
+      const page = await loadRecordedRounds(and(endScope, cursor && sql`${rounds.createdAt} >= ${cursor.at}::timestamp`, after), size);
+      remaining = page.rounds.length < size ? 0 : remaining - page.rounds.length;
+      if (page.lastAt) cursor = { at: page.lastAt, id: page.rounds.at(-1)!.id };
+      return page.rounds;
+    }, Boolean(excluded));
   } catch (error) {
     if (runId) await discardSavedRun(runId).catch(cleanup => console.error("Could not discard incomplete run:", cleanup));
     if (controller.signal.aborted) return;
