@@ -12,6 +12,7 @@ import { createSocketSessionLookup } from "./session-lookup.js";
 // ─── Typed WS Payload Interfaces ────────────────────────────────────────────
 
 interface WsActiveSignal {
+  openedAt: string;
   target: number;
   confidence: number;
   expectedRoundsRemaining: number;
@@ -45,6 +46,8 @@ type WsPayload =
   | {
       type: "analysisUpdate";
       data: {
+        sourceBustId: string;
+        capturedAt: string;
         updatedAt: string;
         deadTargets: number[];
         activeSignals: WsActiveSignal[];
@@ -60,6 +63,7 @@ function sendJson(socket: WebSocket, payload: WsPayload) {
 }
 
 export function attachWebSocketServer(httpServer: Server) {
+  const opportunityClients = new Set<WebSocket>();
   const guards = new Map<WebSocket, SocketAccessGuard>();
   const wss = new WebSocketServer({
     server: httpServer,
@@ -71,6 +75,7 @@ export function attachWebSocketServer(httpServer: Server) {
   });
 
   wss.on("connection", function (ws: WebSocket & { isAlive?: boolean }, req) {
+    if (new URL(req.url ?? "/ws","http://localhost").searchParams.get("stream") === "opportunities") opportunityClients.add(ws);
     ws.on("error", console.error);
     ws.isAlive = true;
     ws.on("pong", function () {
@@ -79,7 +84,7 @@ export function attachWebSocketServer(httpServer: Server) {
 
     const guard = new SocketAccessGuard(createSocketSessionLookup(() => auth.api.getSession({ headers: fromNodeHeaders(req.headers), query: { disableCookieCache: true } })), () => ws.terminate());
     guards.set(ws, guard);
-    ws.once("close", () => { guard.dispose(); guards.delete(ws); });
+    ws.once("close", () => { guard.dispose(); guards.delete(ws); opportunityClients.delete(ws); });
     void guard.send(() => sendJson(ws, {
       type: "welcome",
       message: "Welcome to the Pakakumi Round Analyzer!",
@@ -103,10 +108,12 @@ export function attachWebSocketServer(httpServer: Server) {
 
   function broadcastRoundUpdate(round: Round) {
     const payload: WsPayload = { type: "roundUpdate", data: round };
-    broadcastAuthorized(JSON.stringify(payload));
+    if (guards.size > opportunityClients.size) broadcastAuthorized(JSON.stringify(payload));
   }
 
   function broadcastAnalysisUpdate(data: {
+    sourceBustId: string;
+    capturedAt: string;
     updatedAt: string;
     deadTargets: number[];
     activeSignals: WsActiveSignal[];
@@ -114,13 +121,19 @@ export function attachWebSocketServer(httpServer: Server) {
     stats: WsAnalysisStats;
     hitTargets: number[];
     correlationStreaks: number[][];
-  }) {
+  }, currentObservation: boolean) {
+    if (currentObservation && opportunityClients.size && Date.now() - Date.parse(data.capturedAt) < 5000) {
+      const activeSignals = data.activeSignals.map(({openedAt,target,confidence,expectedRoundsRemaining}) =>
+        ({openedAt,target,confidence,expectedRoundsRemaining}));
+      const message = JSON.stringify({type:"analysisUpdate",data:{sourceBustId:data.sourceBustId,capturedAt:data.capturedAt,activeSignals}});
+      for (const socket of opportunityClients) void guards.get(socket)?.send(()=>sendText(socket,message));
+    }
     const payload: WsPayload = { type: "analysisUpdate", data };
-    broadcastAuthorized(JSON.stringify(payload));
+    if (guards.size > opportunityClients.size) broadcastAuthorized(JSON.stringify(payload));
   }
 
   function broadcastAuthorized(serialized: string) {
-    for (const [ws, guard] of guards) void guard.send(() => sendText(ws, serialized));
+    for (const [ws, guard] of guards) if (!opportunityClients.has(ws)) void guard.send(() => sendText(ws, serialized));
   }
 
   async function closeWebSocketServer() {

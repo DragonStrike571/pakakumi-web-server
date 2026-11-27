@@ -24,6 +24,7 @@ export interface RoundData {
   maxAmountPlayed: number | null;
   metricsComplete: boolean;
   sourceGap?: boolean;
+  latestObservedAt?: string;
 }
 
 class CaptureFailure extends Error {}
@@ -447,6 +448,7 @@ export class GameScraper extends EventEmitter {
         averageAmountPlayed: metricsComplete ? data.averageSpending : null,
         maxAmountPlayed: metricsComplete ? data.maxSpending : null,
         metricsComplete,
+        ...(item.sourceIndex === 0 ? {latestObservedAt: new Date(this.lastHistoryAt).toISOString()} : {}),
         sourceGap: anchor < 0 && this.checkpoint !== null && batch.length === 0,
       };
       batch.push(roundData);

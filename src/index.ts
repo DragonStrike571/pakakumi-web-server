@@ -172,8 +172,7 @@ async function handleRoundEnded(data: CapturedRound) {
       totalReserveFunds: toNullableNumber(savedRound.totalReserveFunds),
     });
 
-    await savePractice;
-    await runAnalysis({
+    const analysis = runAnalysis({
       id: savedRound.id,
       bust: Number(savedRound.bust),
       createdAt: savedRound.createdAt,
@@ -181,6 +180,8 @@ async function handleRoundEnded(data: CapturedRound) {
       .then((analysisResult) => {
         if (analysisResult && !analysisResult.replayed) {
           broadcastAnalysisUpdate({
+            sourceBustId: savedRound.bustId,
+            capturedAt: data.latestObservedAt ?? data.capturedAt,
             updatedAt: analysisResult.updatedAt.toISOString(),
             activeSignals: analysisResult.activeSignals,
             correlationStreaks: analysisResult.correlationStreaks,
@@ -188,10 +189,13 @@ async function handleRoundEnded(data: CapturedRound) {
             stats: analysisResult.stats,
             hitTargets: analysisResult.hitTargets,
             deadTargets: analysisResult.deadTargets,
-          });
+          }, data.latestObservedAt !== undefined);
         }
       })
       .catch((err) => { console.error("❌ Analyzer error; durable observation will retry:", err); throw err; });
+    // Publish live signals as soon as analysis finishes. Keep durable processing ordered on retry.
+    const writes = await Promise.allSettled([analysis, savePractice]);
+    for (const write of writes) if (write.status === "rejected") throw write.reason;
   }
 }
 

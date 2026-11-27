@@ -3,6 +3,7 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import test from "node:test";
 import express from "express";
+import WebSocket from "ws";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/pglite";
 import { PGlite } from "@electric-sql/pglite";
@@ -61,4 +62,28 @@ test("authenticated Analysis reads reconcile legacy snapshots, pending signals a
   assert.equal(history.pagination.total, 1);
   assert.equal((await get("history?target=invalid", cookie)).status, 400);
   assert.equal((await get("gaps?pointLimit=51", cookie)).status, 400);
+
+  await t.test("the authenticated opportunity subscription receives only fresh live signal fields",async()=>{
+    const {attachWebSocketServer} = await import("../ws/server.js");
+    const hub=attachWebSocketServer(server);
+    const origin="http://localhost:3000", url="ws://127.0.0.1:"+address.port+"/ws";
+    const tracker=new WebSocket(url+"?stream=opportunities",{origin,headers:{Cookie:cookie}});
+    const dashboard=new WebSocket(url,{origin,headers:{Cookie:cookie}});
+    const read=(socket:WebSocket)=>once(socket,"message",{signal:AbortSignal.timeout(5000)}).then(([bytes])=>JSON.parse(bytes.toString()));
+    try {
+      const welcomes=await Promise.all([read(tracker),read(dashboard)]);
+      assert.ok(welcomes.every(message=>message.type==="welcome"));
+      const capturedAt=new Date().toISOString(), sourceBustId="1-2-3-4-5-6-7-8-9-10";
+      const data={sourceBustId,capturedAt,updatedAt:capturedAt,activeSignals:[{...signal,openedAt:capturedAt}],
+        upcomingOpportunities:[],correlationStreaks:[],stats:{totalHits:0,totalSignals:1,totalResolved:0,accuracy:0,roundsAnalyzed:10},hitTargets:[],deadTargets:[]};
+      const compact=read(tracker);
+      for (const [observation,live] of [[{...data,sourceBustId:"recovered-round"},false],[{...data,capturedAt:new Date(Date.now()-6000).toISOString()},true]] as const) {
+        const full=read(dashboard);hub.broadcastAnalysisUpdate(observation,live);
+        assert.equal((await full).data.activeSignals[0].reason,signal.reason);
+      }
+      const full=read(dashboard);hub.broadcastAnalysisUpdate(data,true);
+      assert.deepEqual((await compact).data,{sourceBustId,capturedAt,activeSignals:[{openedAt:capturedAt,target:10,confidence:83,expectedRoundsRemaining:3}]});
+      assert.equal((await full).data.activeSignals[0].reason,signal.reason);
+    } finally { tracker.terminate();dashboard.terminate();await hub.closeWebSocketServer(); }
+  });
 });

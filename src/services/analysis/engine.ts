@@ -106,6 +106,7 @@ export interface AnalysisResult {
   hitTargets: number[];
   deadTargets: number[];
   activeSignals: {
+    openedAt: string;
     target: number;
     confidence: number;
     expectedRoundsRemaining: number;
@@ -850,10 +851,7 @@ async function analyzeRound(newRound?: {
           pendingTargetSet.add(alert.target);
 
           // Add to in-memory cache
-          cachedPendingSignals!.push({
-            ...newPendingRow,
-            createdAt: new Date(),
-          } as typeof pendingSignals.$inferSelect);
+          cachedPendingSignals!.push(inserted[0]!);
 
           // Record in signal history
           await db.insert(signalHistory).values({
@@ -893,6 +891,7 @@ async function analyzeRound(newRound?: {
   const snapshotData = {
     updatedAt: new Date(),
     activeSignals: cachedPendingSignals!.map((s) => ({
+      openedAt: s.createdAt.toISOString(),
       target: Number(s.target),
       confidence: s.confidence,
       expectedRoundsRemaining: Math.max(0, s.maxLifespan - s.roundsElapsed),
