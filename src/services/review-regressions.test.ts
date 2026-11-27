@@ -209,24 +209,41 @@ test("analysis cold start excludes future recovery rows, serializes hits and flu
     assert.equal(cold.stats.roundsAnalyzed, 1);
     const results = await Promise.all([engine.runAnalysisEngine(rows[1]!), engine.runAnalysisEngine(rows[2]!)]);
     assert.equal(results[1]!.stats.roundsAnalyzed, 3);
-    assert.equal(results[1]!.stats.totalHits, 1); assert.ok(results[1]!.stats.accuracy <= 100);
+    assert.equal(results[1]!.stats.totalHits, 1);
+    assert.equal(results[1]!.stats.accuracy, 100);
+    assert.deepEqual(engine.signalTotals(3, 8, 2), { totalSignals: 8, totalHits: 3, totalResolved: 6, accuracy: 50 });
+    assert.equal(engine.signalTotals(0, 2, 2).totalResolved, 0);
+    const hits = await engine.getSignalHistory(5, 1, "hit", 3000);
+    assert.equal(hits.data.length, 1);
+    assert.equal(hits.pagination.total, 1);
+    assert.equal((await engine.getSignalHistory(5, 2, "hit", 3000)).pagination.total, 1);
+    assert.deepEqual((await engine.getSignalHistory(5, 1, "missed", 3000)).data, []);
+    assert.deepEqual((await engine.getSignalHistory(5, 1, "hit", 2)).data, []);
     assert.equal((await database.select().from(schema.signalHistory).where(eq(schema.signalHistory.target, 3000)))[0]!.actualRoundsToHit, 2);
     await engine.runAnalysisEngine(rows[2]!);
     const fourth = { id: randomUUID(), bust: 1.01, bustId: "fourth", createdAt: new Date(time + 3) };
     await database.insert(schema.rounds).values(fourth);
     const transaction = database.transaction.bind(database);
+    const committed = await engine.getAnalysisSnapshot();
     let fail = true;
     (db as any).transaction = (callback: any) => transaction(async tx => {
       const result = await callback(tx);
-      if (fail) { fail = false; throw new Error("synthetic transaction rollback"); }
+      if (fail) {
+        assert.deepEqual(await engine.getAnalysisSnapshot(), committed);
+        fail = false;
+        throw new Error("synthetic transaction rollback");
+      }
       return result;
     });
     await assert.rejects(engine.runAnalysisEngine(fourth), /synthetic transaction rollback/);
     const retry = await engine.runAnalysisEngine(fourth);
     assert.equal(retry.stats.roundsAnalyzed, 4);
     const restarted = await import(new URL(`./analysis/engine.${import.meta.url.endsWith(".ts") ? "ts" : "js"}?restart`, import.meta.url).href);
+    await database.insert(schema.rounds).values({ bust: 3000, bustId: "future", createdAt: new Date(time + 4) });
     const replay = await restarted.runAnalysisEngine(fourth);
     assert.equal(replay.replayed, true); assert.equal(replay.stats.totalHits, 1);
+    assert.equal(replay.stats.roundsAnalyzed, 4);
+    assert.equal(replay.stats.totalSignals, retry.stats.totalSignals);
     await engine.drainAnalysis();
     assert.equal((await database.select().from(schema.systemStats))[0]!.hits, 1);
     assert.equal((await database.select().from(schema.dailyStats))[0]!.totalHits, 1);

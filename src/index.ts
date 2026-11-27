@@ -179,31 +179,15 @@ async function handleRoundEnded(data: CapturedRound) {
       createdAt: savedRound.createdAt,
     })
       .then((analysisResult) => {
-        if (analysisResult) {
+        if (analysisResult && !analysisResult.replayed) {
           broadcastAnalysisUpdate({
-            activeSignals: analysisResult.activeSignals.map((a) => ({
-              target: a.target,
-              confidence: a.confidence,
-              expectedRoundsRemaining: a.expectedRoundsRemaining,
-              status: a.status,
-              reason: a.reason,
-              roundsElapsed: a.roundsElapsed,
-            })),
+            updatedAt: analysisResult.updatedAt.toISOString(),
+            activeSignals: analysisResult.activeSignals,
             correlationStreaks: analysisResult.correlationStreaks,
-            upcomingOpportunities: analysisResult.upcomingOpportunities.map(
-              (o) => ({
-                target: o.target,
-                confidence: o.confidence,
-                expectedGap: o.expectedGap,
-                expectedRoundsRemaining: o.expectedRoundsRemaining,
-                pureOverdueRatio: o.pureOverdueRatio,
-                reason: o.reason,
-                idealPlanRounds: o.idealPlanRounds,
-                isLate: o.isLate,
-              }),
-            ),
+            upcomingOpportunities: analysisResult.upcomingOpportunities,
             stats: analysisResult.stats,
             hitTargets: analysisResult.hitTargets,
+            deadTargets: analysisResult.deadTargets,
           });
         }
       })

@@ -1,8 +1,8 @@
 // Generated from pakakumi-fully-local-player/src/strategy/config.ts by sync-local-player-engine.mjs.
-import type { ExecutionConfig, ExecutionRule, StrategyConfig } from "./core.js";
+import type { BaseProgression, ExecutionConfig, ExecutionRule, StrategyConfig } from "./core.js";
 import { generateAlgorithmBets } from "./core.js";
 import type { RunSettings, StrategySettings } from "../types.js";
-import { windowAmount, type AdaptiveConfig } from "./adaptive.js";
+import { roundAmount, windowAmount, type AdaptiveConfig } from "./adaptive.js";
 
 export const MIN_AMOUNT = 10;
 export const MAX_AMOUNT = 5000;
@@ -29,6 +29,13 @@ function choice<T extends string>(value: unknown, values: readonly T[], label: s
 }
 function optionalNumber(o: ObjectValue, key: string, min: number, max: number, integer = false) {
   return o[key] === undefined ? undefined : number(o[key], key, min, max, integer);
+}
+function parseBaseProgression(value: unknown): BaseProgression {
+  const change = object(value, "Base increase after a miss");
+  const type = choice(change.type, ["add", "multiply"] as const, "base increase");
+  const amount = number(change.value, type === "add" ? "Base increase" : "Base multiplier", type === "add" ? 0.01 : 1.000001, 1e6);
+  if (type === "add" && Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-6) throw new Error("Base increases support two decimal places");
+  return { type, value: amount, every: number(change.every ?? 1, "Misses before increasing the base", 1, 100000, true) };
 }
 const actions = ["strategy", "continue", "reset", "pause", "stop"] as const;
 const metrics = ["bust", "capital", "profit", "drawdown", "consecutiveWins", "consecutiveLosses", "roundsSinceWin", "roundsSinceLoss", "roundsSinceLast3000", "totalReserveFunds", "roundIndex"] as const;
@@ -93,16 +100,21 @@ export function parseStrategy(value: unknown): StrategyConfig {
   } else if (type === "algorithm") {
     const a = object(o.algorithm);
     result.algorithm = { capital: money(a.capital, "Cycle allocation", 1e9), minAmount: money(a.minAmount, "Starting amount"), multiplier: number(a.multiplier, "Target multiplier", 1.01, MAX_TARGET), targetReturn: number(a.targetReturn, "Sizing factor", 0.01, 1e6), roundingOption: choice(a.roundingOption ?? "none", ["none", "whole", "five", "ten"] as const, "rounding"), maxPlayable: money(a.maxPlayable ?? MAX_AMOUNT, "Maximum amount") };
+    if (a.baseAfterMiss !== undefined) result.algorithm.baseAfterMiss = parseBaseProgression(a.baseAfterMiss);
     if (result.algorithm.maxPlayable! < result.algorithm.minAmount) throw new Error("Maximum amount must cover the starting amount");
-    if (!generateAlgorithmBets(result.algorithm.capital, result.algorithm.minAmount, result.algorithm.multiplier, result.algorithm.targetReturn, result.algorithm.roundingOption, result.algorithm.maxPlayable).length) throw new Error("This configuration produces no steps");
+    if (!generateAlgorithmBets(result.algorithm.capital, result.algorithm.minAmount, result.algorithm.multiplier, result.algorithm.targetReturn, result.algorithm.roundingOption, result.algorithm.maxPlayable, result.algorithm.baseAfterMiss).length) throw new Error("This configuration produces no steps");
   } else if (type === "phased") {
     result.phased = parsePhase(o.phased);
     if (result.autoCashout) result.phased.baseTarget = result.autoCashout;
     if (result.execution?.rules?.some(r => r.action.type === "jump" || r.action.step !== undefined)) throw new Error("Step navigation rules need a sequence or calculated strategy");
   } else {
     result.adaptive = parseAdaptive(o.adaptive);
-    if (result.autoCashout) { result.adaptive.target = result.autoCashout; result.adaptive = parseAdaptive(result.adaptive); }
-    if (result.execution?.rules?.some(r => r.action.type === "jump" || r.action.step !== undefined)) throw new Error("Step navigation rules need a custom sequence");
+    if (result.autoCashout) {
+      if (result.adaptive.returnCalculation === "website") result.adaptive.calculationTarget ??= result.adaptive.target;
+      result.adaptive.target = result.autoCashout;
+      result.adaptive = parseAdaptive(result.adaptive);
+    }
+    if (result.adaptive.returnCalculation !== "website" && result.execution?.rules?.some(r => r.action.type === "jump" || r.action.step !== undefined)) throw new Error("Step navigation rules need calculated Target Return or a custom sequence");
   }
   return result;
 }
@@ -146,13 +158,54 @@ export function parseAdaptive(value: unknown): AdaptiveConfig {
     factor, roundsMode, windowRounds: Math.max(1, windowRounds), windowEnabled: kind === "window" || o.windowEnabled === true, windowAfter: choice(o.windowAfter ?? "wait", ["wait", "repeat", "stop"] as const, "window end"), resetSpentAfterWindow: o.resetSpentAfterWindow === true,
     windowBudget: firstBudget, progression: { type: progressionType, value: number(p.value ?? 2, "Window change", 0.01, 1e6), values, repeat: p.repeat === true }, hitBudget: choice(o.hitBudget ?? "reset", ["reset", "keep", "advance"] as const, "window amount after a target"),
   };
+  if (o.returnCalculation !== undefined) {
+    if (kind !== "roi") throw new Error("Return calculation applies to Target Return");
+    result.returnCalculation = choice(o.returnCalculation, ["website", "cycle"] as const, "return calculation");
+    if (result.returnCalculation === "website" && (result.returnMode !== "multiple" || result.adjustBeforeRound)) {
+      throw new Error("The website calculation uses a return factor after each completed play");
+    }
+  }
+  if (o.calculationTarget !== undefined) result.calculationTarget = number(o.calculationTarget, "Calculation multiplier", 1.01, MAX_TARGET);
+  if (result.returnCalculation === "website") {
+    const first = Math.max(minimum, roundAmount(result.baseAmount, result.rounding));
+    if (first > maximum || first > result.cycleBudget) throw new Error(`The cycle allocation and maximum amount must cover the first KES ${first.toFixed(2)} play`);
+  }
+  if (o.baseAfterMiss !== undefined) {
+    if (kind !== "roi") throw new Error("Base increases after a miss apply to the target return strategy");
+    const change = object(o.baseAfterMiss, "Base increase after a miss");
+    result.baseAfterMiss = { ...parseBaseProgression(change), resetOnHit: change.resetOnHit !== false };
+  }
+  if (o.attempts !== undefined) {
+    if (kind !== "roi" || result.returnCalculation !== "website") throw new Error("Attempt controls require the website Target Return calculation");
+    if (result.baseAfterMiss || result.windowEnabled) throw new Error("Attempt controls replace per-round base increases and fixed-length windows. Disable those options first.");
+    const a = object(o.attempts, "Attempt settings");
+    const rows = a.increases ?? [];
+    if (!Array.isArray(rows) || rows.length > 100) throw new Error("Use at most 100 ordered attempt increases");
+    const outcome = (value: unknown, hit: boolean) => {
+      const row = value === undefined ? {} : object(value, "Action after attempt");
+      return { action: choice(row.action ?? (hit ? "restart" : "advance"), hit ? ["restart", "finish", "stop"] as const : ["advance", "repeat", "stop"] as const, "attempt action"),
+        timing: choice(row.timing ?? "trigger", ["immediate", "trigger"] as const, "next attempt timing"),
+        pauseRounds: number(row.pauseRounds ?? 0, "Rounds to wait", 0, 100000, true) };
+    };
+    result.attempts = { increases: rows.map(raw => {
+      const row = object(raw, "Attempt increase");
+      const type = choice(row.type, ["multiply", "add-base", "add-budget"] as const, "attempt increase");
+      const value = number(row.value, "Attempt increase", type === "multiply" ? 1.000001 : 0.01, 1e6);
+      if (type !== "multiply" && Math.abs(value * 100 - Math.round(value * 100)) > 1e-6) throw new Error("Fixed increases support two decimal places");
+      return { type, value, times: number(row.times ?? 1, "Failed attempts for this increase", 1, 100000, true) };
+    }), afterIncreases: choice(a.afterIncreases ?? "last", ["last", "repeat", "hold"] as const, "end of increase list"),
+    afterMiss: outcome(a.afterMiss, false), afterHit: outcome(a.afterHit, true), resetOnHit: a.resetOnHit !== false };
+    if (a.onBlocked !== undefined) result.attempts.onBlocked = choice(a.onBlocked, ["stop", "restart"] as const, "action when the next attempt cannot fit");
+    if (a.profitFloor !== undefined) { const floor = object(a.profitFloor, "Profit to maintain"); result.attempts.profitFloor = {
+      amount: number(floor.amount, "Net profit to maintain", 0.01, 1e9), scope: choice(floor.scope ?? "since-hit", ["since-hit", "session"] as const, "profit calculation") }; }
+  }
   if (o.windowProfitGoal !== undefined) {
     if (kind !== "window" || progressionType !== "multiply") throw new Error("The profit target switch requires a multiplying play window");
     if (target <= windowRounds) throw new Error("For the profit target switch, the target multiplier must be higher than the number of rounds per window");
     result.windowProfitGoal = number(o.windowProfitGoal, "Net profit target after a hit", 0.01, 1e9);
   }
   if (o.fractionPercent !== undefined) result.fractionPercent = number(o.fractionPercent, "Percentage of funds", 0.001, 100);
-  if (kind === "roi" && result.adjustBeforeRound && result.returnMode === "multiple" && result.returnMultiple >= target) throw new Error("The return multiple must be below the target multiplier");
+  if (kind === "roi" && result.adjustBeforeRound && result.returnMode === "multiple" && result.returnMultiple >= (result.calculationTarget ?? target)) throw new Error("The return multiple must be below the calculation multiplier");
   if (kind === "roi" && result.cycleBudget < result.baseAmount) throw new Error("Cycle amount must cover the starting amount");
   if (o.protection !== undefined) { const protection = object(o.protection); result.protection = { profit: number(protection.profit, "Profit to protect", 0.01, 1e9), keepInitial: protection.keepInitial !== false, maxUsePercent: number(protection.maxUsePercent ?? 40, "Maximum percentage available after profit", 0.01, 100), raiseOnWin: protection.raiseOnWin !== false }; }
   return result;

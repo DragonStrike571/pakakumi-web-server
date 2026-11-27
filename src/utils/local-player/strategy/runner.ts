@@ -3,7 +3,7 @@ import { generateAlgorithmBets, type ExecutionRuleMetric, type StrategyConfig } 
 import { StrategyEngine } from "./engine.js";
 import { toRunSettings } from "./config.js";
 import type { RunSettings, StrategySettings, RunEvent } from "../types.js";
-import { AdaptivePlan } from "./adaptive.js";
+import { AdaptivePlan, roundAmount } from "./adaptive.js";
 
 export interface Bet { amount: number; cashout: number }
 export interface RecordedRoundMetrics {
@@ -54,7 +54,7 @@ export class StrategyRunner {
     this.trail = [this.capital];
     this.startedAt = clock();
     const a = this.config.algorithm;
-    this.bets = this.config.type === "algorithm" && a ? generateAlgorithmBets(a.capital, a.minAmount, a.multiplier, a.targetReturn, a.roundingOption, a.maxPlayable) : this.config.sequence?.bets ?? [];
+    this.bets = this.config.type === "algorithm" && a ? generateAlgorithmBets(a.capital, a.minAmount, a.multiplier, a.targetReturn, a.roundingOption, a.maxPlayable, a.baseAfterMiss) : this.config.sequence?.bets ?? [];
     if (this.config.autoCashout) this.bets = this.bets.map(b => ({ ...b, cashout: this.config.autoCashout! }));
     this.phase = this.config.type === "phased" ? new StrategyEngine({ initialCapital: this.capital, ...this.config.phased! }) : null;
     this.adaptive = this.config.type === "adaptive" ? new AdaptivePlan({ ...this.config.adaptive!, maximum: Math.min(this.config.adaptive!.maximum, this.settings.maxBet) }, this.capital, restartOnBlocked) : null;
@@ -65,7 +65,23 @@ export class StrategyRunner {
   }
 
   startClock() { this.startedAt = this.clock(); }
-  get stepIndex() { return this.step; }
+  get stepIndex() { return this.adaptive?.stepIndex ?? this.step; }
+  get calculatedSummary() {
+    let config = this.config.algorithm;
+    let bets = this.bets;
+    const adaptive = this.config.adaptive;
+    if (adaptive?.kind === "roi" && adaptive.returnCalculation === "website") {
+      config = { capital: adaptive.cycleBudget, minAmount: adaptive.baseAmount, multiplier: adaptive.calculationTarget ?? adaptive.target,
+        targetReturn: adaptive.returnMultiple, maxPlayable: adaptive.maximum,
+        baseAfterMiss: adaptive.baseAfterMiss };
+      bets = generateAlgorithmBets(config.capital, config.minAmount, config.multiplier, config.targetReturn,
+        undefined, Math.min(config.maxPlayable!, this.settings.maxBet), config.baseAfterMiss,
+        amount => Math.max(adaptive.minimum, roundAmount(amount, adaptive.rounding)));
+    }
+    if (!config) return undefined;
+    const total = cents(bets.reduce((sum, bet) => sum + bet.amount, 0));
+    return { steps: bets.length, budget: config.capital, total, remaining: cents(config.capital - total) };
+  }
   get progressionRestarts() { return this.restarts; }
   observeRound(bust: number) {
     if (!Number.isFinite(bust) || bust < 1) throw new Error("Invalid round result");
@@ -112,7 +128,7 @@ export class StrategyRunner {
   }
 
   private restartBlocked(amount?: number) {
-    if (!this.restartOnBlocked || this.stopReason) return false;
+    if ((!this.restartOnBlocked && this.config.adaptive?.attempts?.onBlocked !== "restart") || this.stopReason) return false;
     if (this.adaptive) {
       if (!this.adaptive.restartBlocked(this.capital, this.lossRoom(), amount)) return false;
       this.cycle = this.adaptive.cycle;
@@ -145,7 +161,6 @@ export class StrategyRunner {
     this.played++; if (bust !== null) this.lastBust = bust;
     if (won) { this.wins++; this.losses = 0; this.sinceWin = 0; }
     else { this.losses++; this.wins = 0; this.sinceLoss = 0; }
-    const events = this.adaptive?.settle(bet.amount, payout, this.capital, this.config.execution?.fundsMode === "use-remaining") ?? this.phase?.settleRound(bust ?? 1, bet, payout).events ?? [];
     const nextStep = won ? 0 : (this.step + 1) % this.bets.length;
     const execution = this.config.execution;
     const values: Record<ExecutionRuleMetric, number | null> = {
@@ -158,15 +173,19 @@ export class StrategyRunner {
     });
     const directive = won ? execution?.afterWin : execution?.afterLoss;
     const action = rule?.action.type ?? directive?.action ?? "strategy";
+    const events = this.adaptive?.settle(bet.amount, payout, this.capital, this.config.execution?.fundsMode === "use-remaining", action)
+      ?? this.phase?.settleRound(bust ?? 1, bet, payout).events ?? [];
     if (rule) { if (rule.once) this.fired.add(rule.id); events.push(`Rule: ${rule.id}.`); }
     if (action === "stop" || won && this.config.stopAfterWin && action === "strategy") this.stopReason = "Strategy requested a stop.";
     else if (action === "pause") {
       this.pause = rule?.action.rounds ?? directive?.pauseRounds ?? 0;
+      if (this.adaptive && rule?.action.step !== undefined) this.adaptive.jumpTo(rule.action.step);
       if (!this.phase && !this.adaptive) { this.step = rule?.action.step === undefined ? nextStep : Math.min(rule.action.step, this.bets.length - 1); if (this.step === 0) this.cycle++; }
     } else if (action === "reset") {
       if (this.adaptive) this.adaptive.reset(); else if (this.phase) this.phase.reset(); else { this.step = 0; this.cycle++; }
     } else if (this.adaptive) {
       if (action === "continue") this.adaptive.resume();
+      if (action === "jump") this.adaptive.jumpTo(rule?.action.step ?? 0);
     } else if (!this.phase) {
       this.step = action === "jump" ? Math.min(rule?.action.step ?? 0, this.bets.length - 1) : action === "continue" ? (this.step + 1) % this.bets.length : nextStep;
       if (this.step === 0) this.cycle++;
@@ -198,7 +217,7 @@ export class StrategyRunner {
 
   snapshot() {
     const next = this.phase?.nextBet() ?? this.bets[this.step], plan = this.adaptive?.view(this.capital);
-    const pausedRounds = this.pause + (this.skippingPausedRound ? 1 : 0);
+    const pausedRounds = this.pause + (this.skippingPausedRound ? 1 : 0) + (plan?.pausedRounds ?? 0);
     return { clockStartedAt: this.startedAt, capitalTrail: [...this.trail], initialCapital: this.settings.initialCapital, highestCapital: this.peak, lowestCapital: this.low, maxDrawdown: this.maxDrop, smallestAmount: this.smallest, largestAmount: this.largest, currentCapital: this.capital, totalProfit: cents(this.capital - this.settings.initialCapital), phaseLabel: pausedRounds > 0 ? `Paused · ${pausedRounds} rounds left` : plan?.message ?? this.phase?.snapshot().phaseLabel ?? `Step ${this.step + 1} of ${this.bets.length}`, roundIndex: this.played, observedRounds: this.rounds, lastBust: this.lastBust, currentBet: plan ? plan.nextAmount : next?.amount ?? null, cycle: this.cycle, stopReason: this.stopReason, pausedRounds, ...(plan ? { plan } : {}) };
   }
 }

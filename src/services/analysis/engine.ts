@@ -22,7 +22,7 @@ import {
   dailyStats,
   analysisCheckpoints,
 } from "../../db/schema.js";
-import { desc, eq, inArray, sql, lt } from "drizzle-orm";
+import { and, count, desc, eq, inArray, sql, lt, lte } from "drizzle-orm";
 import { dailyTargetPatch } from "./daily-target-patch.js";
 
 const databaseContext = new AsyncLocalStorage<typeof rootDb>();
@@ -86,12 +86,14 @@ export interface AlertCluster {
 
 export interface AnalysisResult {
   replayed?: boolean;
+  updatedAt: Date;
   alerts: RawAlert[];
   clusters: AlertCluster[];
   upcomingOpportunities: RawAlert[];
   stats: {
     totalSignals: number;
     totalHits: number;
+    totalResolved: number;
     accuracy: number;
     roundsAnalyzed: number;
   };
@@ -142,6 +144,7 @@ export interface CustomAnalysisResult {
 let cachedRounds: { id?: string; bust: number; createdAt: Date }[] = [];
 let analysisQueue: Promise<unknown> = Promise.resolve();
 let lastAnalysisResult: AnalysisResult | null = null;
+let committedLastAlertRound = 0;
 
 export function runAnalysisEngine(newRound?: { id?: string; bust: number; createdAt: Date }): Promise<AnalysisResult> {
   const task = analysisQueue.then(async () => {
@@ -150,13 +153,18 @@ export function runAnalysisEngine(newRound?: { id?: string; bust: number; create
       const result = await rootDb.transaction(tx => databaseContext.run(tx as unknown as typeof rootDb, async () => {
         const [checkpoint] = await db.select().from(analysisCheckpoints).where(eq(analysisCheckpoints.id, 1)).for("update");
         const replayed = Boolean(newRound?.id && checkpoint && newRound.createdAt <= checkpoint.roundAt);
-        const result = replayed && lastAnalysisResult ? structuredClone(lastAnalysisResult) : await analyzeRound(replayed ? undefined : newRound);
+        const result = replayed && lastAnalysisResult ? lastAnalysisResult : await analyzeRound(replayed ? undefined : newRound, replayed ? checkpoint!.roundAt : undefined);
         await flushDailyStats();
         if (newRound?.id && !replayed) await db.insert(analysisCheckpoints).values({ id: 1, roundId: newRound.id, roundAt: newRound.createdAt })
           .onConflictDoUpdate({ target: analysisCheckpoints.id, set: { roundId: newRound.id, roundAt: newRound.createdAt } });
         return { ...result, replayed };
       }));
       lastAnalysisResult = result;
+      committedLastAlertRound = cachedSystemStats?.lastAlertRound ?? 0;
+      lastSnapshotData = {
+        activeSignals: result.activeSignals, upcomingOpportunities: result.upcomingOpportunities,
+        stats: result.stats, updatedAt: result.updatedAt,
+      };
       return result;
     } catch (error) { restoreEngineState(before); throw error; }
   });
@@ -165,19 +173,19 @@ export function runAnalysisEngine(newRound?: { id?: string; bust: number; create
 }
 
 function captureEngineState() {
-  return structuredClone({ cachedRounds, currentRoundIndex, cooldownMap, cachedSystemStats, systemStatsDirty,
+  // Round records are immutable. Only appends and occasional array replacement need rollback.
+  return { cachedRounds, roundLength: cachedRounds.length, ...structuredClone({ currentRoundIndex, cooldownMap, cachedSystemStats, systemStatsDirty,
     cachedDailyStats, persistedDailyTargets, dailyStatsDirty, cachedPendingSignals, roundsSinceLastSnapshotWrite,
-    roundsSinceLastHistoryPrune, lastSnapshotData });
+    roundsSinceLastHistoryPrune }) };
 }
 function restoreEngineState(state: ReturnType<typeof captureEngineState>) {
-  cachedRounds = state.cachedRounds; currentRoundIndex = state.currentRoundIndex;
+  cachedRounds = state.cachedRounds; cachedRounds.length = state.roundLength; currentRoundIndex = state.currentRoundIndex;
   cooldownMap.clear(); for (const [key, value] of state.cooldownMap) cooldownMap.set(key, value);
   cachedSystemStats = state.cachedSystemStats; systemStatsDirty = state.systemStatsDirty;
   cachedDailyStats = state.cachedDailyStats; dailyStatsDirty = state.dailyStatsDirty;
   persistedDailyTargets = state.persistedDailyTargets;
   cachedPendingSignals = state.cachedPendingSignals; roundsSinceLastSnapshotWrite = state.roundsSinceLastSnapshotWrite;
   roundsSinceLastHistoryPrune = state.roundsSinceLastHistoryPrune;
-  lastSnapshotData = state.lastSnapshotData;
 }
 
 export async function drainAnalysis() {
@@ -246,6 +254,7 @@ let lastSnapshotData: {
   stats: {
     totalSignals: number;
     totalHits: number;
+    totalResolved: number;
     accuracy: number;
     roundsAnalyzed: number;
   };
@@ -332,6 +341,7 @@ async function ensureDailyStatsLoaded(): Promise<void> {
     dailyStatsDirty = false;
   } catch (err) {
     console.error("❌ Error loading daily stats:", err);
+    throw err;
   }
 }
 
@@ -523,7 +533,7 @@ async function analyzeRound(newRound?: {
   id?: string;
   bust: number;
   createdAt: Date;
-}): Promise<AnalysisResult> {
+}, replayThrough?: Date): Promise<AnalysisResult> {
   // ─── Load persisted state (from cache, not DB) ────────────────────────
   await ensureSystemStatsLoaded();
   const stats = cachedSystemStats!;
@@ -536,13 +546,14 @@ async function analyzeRound(newRound?: {
   // ─── Load round cache ─────────────────────────────────────────────────
   if (cachedRounds.length === 0) {
     const latestRounds = await db.query.rounds.findMany({
-      where: newRound ? lt(rounds.createdAt, newRound.createdAt) : undefined,
-      orderBy: [desc(rounds.createdAt)],
+      where: newRound ? lt(rounds.createdAt, newRound.createdAt) : replayThrough ? lte(rounds.createdAt, replayThrough) : undefined,
+      orderBy: [desc(rounds.createdAt), desc(rounds.id)],
       limit: 10000,
       columns: { id: true, bust: true, createdAt: true },
     });
     cachedRounds = latestRounds.reverse();
-    currentRoundIndex = cachedRounds.length;
+    // A restart may load a shorter history than the persisted alert index.
+    currentRoundIndex = Math.max(cachedRounds.length, stats.lastAlertRound);
   }
 
   if (newRound?.id && cachedRounds.some(r => r.id === newRound!.id)) newRound = undefined;
@@ -556,10 +567,11 @@ async function analyzeRound(newRound?: {
 
   if (cachedRounds.length === 0) {
     return {
+      updatedAt: new Date(),
       alerts: [],
       clusters: [],
       upcomingOpportunities: [],
-      stats: { totalSignals: 0, totalHits: 0, accuracy: 0, roundsAnalyzed: 0 },
+      stats: { ...signalTotals(stats.hits, stats.signals, pendingProofs.length), roundsAnalyzed: 0 },
       todayStats: {
         totalPredictions: 0,
         totalHits: 0,
@@ -700,6 +712,7 @@ async function analyzeRound(newRound?: {
   const upcomingOpportunities: RawAlert[] = [];
 
   for (const target of TARGETS) {
+    if (pendingTargetSet.has(target)) continue;
     const expectedGap = target / (1 - HOUSE_EDGE);
     const occIndices: number[] = [];
 
@@ -735,13 +748,7 @@ async function analyzeRound(newRound?: {
     );
     const pureOverdueRatio = currentGap / expectedGap;
 
-    let confidence = 0;
-    if (expectedNextGap <= 0) {
-      confidence = 99;
-    } else {
-      const baseConfidence = (currentGap / expectedNextGap) * 100;
-      confidence = Math.min(99, Math.round(baseConfidence));
-    }
+    const confidence = Math.min(99, Math.round((currentGap / expectedNextGap) * 100));
 
     // Determine if this is a "Late" signal
     const isLate = expectedRoundsRemaining === 0 && pureOverdueRatio >= 1.0;
@@ -758,7 +765,7 @@ async function analyzeRound(newRound?: {
       target,
       currentGap,
       expectedGap,
-      pureOverdueRatio,
+      expectedNextGap,
       confidence,
     );
 
@@ -779,7 +786,7 @@ async function analyzeRound(newRound?: {
     }
 
     // Only generate actionable alerts above threshold
-    if (confidence >= activeThreshold && !cooldownMap.has(target)) {
+    if (!replayThrough && confidence >= activeThreshold && !cooldownMap.has(target)) {
       rawAlerts.push(alert);
     }
   }
@@ -884,6 +891,7 @@ async function analyzeRound(newRound?: {
   // ─── Step 6: Update analysis snapshot (throttled) ─────────────────────
   // Build snapshot from in-memory pending signals (no duplicate DB read)
   const snapshotData = {
+    updatedAt: new Date(),
     activeSignals: cachedPendingSignals!.map((s) => ({
       target: Number(s.target),
       confidence: s.confidence,
@@ -897,24 +905,12 @@ async function analyzeRound(newRound?: {
     })),
     upcomingOpportunities: upcomingOpportunities
       .sort((a, b) => b.confidence - a.confidence)
-      .slice(0, 10)
-      .map((o) => ({
-        target: o.target,
-        confidence: o.confidence,
-        expectedRoundsRemaining: o.expectedRoundsRemaining,
-        reason: o.reason,
-      })),
+      .slice(0, 10),
     stats: {
-      totalSignals: stats.signals,
-      totalHits: stats.hits,
-      accuracy:
-        stats.signals > 0 ? Math.round((stats.hits / stats.signals) * 100) : 0,
+      ...signalTotals(stats.hits, stats.signals, cachedPendingSignals!.length),
       roundsAnalyzed: cachedRounds.length,
     },
   };
-
-  // Always update the in-memory snapshot (for WebSocket broadcasts & API)
-  lastSnapshotData = { ...snapshotData, updatedAt: new Date() };
 
   // Only write to DB every SNAPSHOT_WRITE_INTERVAL rounds
   roundsSinceLastSnapshotWrite++;
@@ -924,11 +920,10 @@ async function analyzeRound(newRound?: {
       .values({
         id: 1,
         ...snapshotData,
-        updatedAt: new Date(),
       })
       .onConflictDoUpdate({
         target: analysisSnapshots.id,
-        set: { ...snapshotData, updatedAt: new Date() },
+        set: snapshotData,
       });
     roundsSinceLastSnapshotWrite = 0;
   }
@@ -1010,9 +1005,10 @@ async function analyzeRound(newRound?: {
   });
 
   return {
+    updatedAt: snapshotData.updatedAt,
     alerts: rawAlerts,
     clusters,
-    upcomingOpportunities,
+    upcomingOpportunities: snapshotData.upcomingOpportunities,
     stats: snapshotData.stats,
     todayStats,
     hitTargets: hitTargetsList,
@@ -1091,14 +1087,12 @@ function generateReason(
   target: number,
   currentGap: number,
   expectedGap: number,
-  overdueRatio: number,
+  adjustedGap: number,
   confidence: number,
 ): string {
   return (
-    target + "x last appeared " + currentGap + " recorded rounds ago. " +
-    "The model average is " + Math.round(expectedGap) + " rounds, using an assumed 1% house edge. " +
-    "Gap ratio: " + overdueRatio.toFixed(2) + "; heuristic score: " + confidence + "%. " +
-    "Each round is independent; this does not predict the next hit."
+    `${target}x last appeared ${currentGap} recorded rounds ago. The model baseline is ${expectedGap.toFixed(1)} rounds. ` +
+    `Recent gaps adjust it to ${adjustedGap.toFixed(1)} rounds, giving a score of ${confidence}/100.`
   );
 }
 
@@ -1218,27 +1212,50 @@ export async function getAnalysisSnapshot() {
 /**
  * Get signal history with pagination.
  */
-export async function getSignalHistory(limit = 50, offset = 0) {
-  return await db
-    .select()
-    .from(signalHistory)
-    .orderBy(desc(signalHistory.createdAt))
-    .limit(limit)
-    .offset(offset);
+export async function getSignalHistory(limit: number, page: number, outcome?: string, target?: number) {
+  const condition = and(
+    outcome ? eq(signalHistory.outcome, outcome) : undefined,
+    target !== undefined ? eq(signalHistory.target, target) : undefined,
+  );
+  const totals = db.select({ total: count().as("total") }).from(signalHistory).where(condition).as("totals");
+  const entries = db.select().from(signalHistory).where(condition)
+    .orderBy(desc(signalHistory.createdAt), desc(signalHistory.id))
+    .limit(limit).offset((page - 1) * limit).as("entries");
+  // The count and entries share a database snapshot, including empty and out-of-range pages.
+  const rows = await db.select().from(totals).leftJoin(entries, sql`true`)
+    .orderBy(desc(entries.createdAt), desc(entries.id));
+  const total = rows[0]?.totals.total ?? 0;
+  return {
+    data: rows.flatMap(row => row.entries?.id ? [row.entries] : []),
+    pagination: { total, page, limit, totalPages: Math.ceil(total / limit) },
+  };
 }
 
 /**
  * Get current system stats.
  * Returns from in-memory cache if available.
  */
+export function signalTotals(hits: number, issued: number, pending: number) {
+  const resolved = issued - pending;
+  return { totalSignals: issued, totalHits: hits, totalResolved: resolved,
+    accuracy: resolved > 0 ? Math.round((hits / resolved) * 100) : 0 };
+}
+
 export async function getSystemStats() {
-  await analysisQueue;
-  if (cachedSystemStats) {
-    return cachedSystemStats;
+  if (lastSnapshotData) {
+    return {
+      signals: lastSnapshotData.stats.totalSignals,
+      hits: lastSnapshotData.stats.totalHits,
+      pending: lastSnapshotData.activeSignals.length,
+      lastAlertRound: committedLastAlertRound,
+    };
   }
 
   return await db
-    .select()
+    .select({
+      hits: systemStats.hits, signals: systemStats.signals, lastAlertRound: systemStats.lastAlertRound,
+      pending: sql<number>`(select count(*) from ${pendingSignals})`.mapWith(Number),
+    })
     .from(systemStats)
     .where(eq(systemStats.id, 1))
     .then((res) => res[0] || null);

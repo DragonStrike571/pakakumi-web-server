@@ -165,6 +165,36 @@ test("new round events distinguish identical busts, record early payouts, and st
   } finally { await context.close(); }
 });
 
+test("a normal zero cashout completes an accepted loss without a false connection failure", async () => {
+  const { page, context } = await fixture(), game = new PakakumiGamePage(page);
+  const rounds: ProviderRound[] = [], errors: Error[] = [];
+  try {
+    await page.goto("https://pakakumi.com/crash");
+    await game.observe("7",async round=>{rounds.push(round);},error=>{errors.push(error);});
+    await emit(page,"1501");
+    assert.equal(await game.placeBet(10,100),"100");
+    await emit(page,"1507",{plays:[{user_id:7,idx:0,currency:"KES",game_id:100,bet:10,stopped_at:0}]});
+    await emit(page,"1505",{7:{0:0}});
+    await emit(page,"1504",{gameId:100,gameCrash:1.45,forced:false});
+    await page.waitForTimeout(20);
+    assert.equal(errors.length,0);
+    assert.deepEqual(rounds[0]?.settlement,{gameId:"100",amount:10,grossPayout:0});
+    await emit(page,"1501");assert.equal(await game.phase(),"waiting");
+  } finally {await game.dispose();await context.close();}
+});
+
+test("a duplicate zero-cashout batch cannot erase a confirmed positive payout",async()=>{
+  const {page,context}=await fixture(),game=new PakakumiGamePage(page);const rounds:ProviderRound[]=[],errors:Error[]=[];
+  try{
+    await page.goto("https://pakakumi.com/crash");await game.observe("7",async r=>{rounds.push(r);},e=>{errors.push(e);});
+    await emit(page,"1506",{user_id:7,idx:0,currency:"KES",game_id:100,bet:10,stopped_at:0});
+    await emit(page,"1505",{7:{0:2}});
+    await emit(page,"1507",{plays:[{user_id:7,idx:0,currency:"KES",game_id:100,bet:10,stopped_at:0}]});
+    await emit(page,"1504",{gameId:100,gameCrash:3});await page.waitForTimeout(20);
+    assert.equal(errors.length,0);assert.equal(rounds[0]?.settlement?.grossPayout,20);
+  }finally{await game.dispose();await context.close();}
+});
+
 test("bet controls reject unsupported stakes and require a new accepted own bet", async () => {
   const { page, context } = await fixture();
   const game = new PakakumiGamePage(page);

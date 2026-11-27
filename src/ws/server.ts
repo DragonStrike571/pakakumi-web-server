@@ -32,6 +32,7 @@ interface WsUpcomingOpportunity {
 }
 
 interface WsAnalysisStats {
+  totalResolved: number;
   totalSignals: number;
   totalHits: number;
   accuracy: number;
@@ -44,6 +45,8 @@ type WsPayload =
   | {
       type: "analysisUpdate";
       data: {
+        updatedAt: string;
+        deadTargets: number[];
         activeSignals: WsActiveSignal[];
         upcomingOpportunities: WsUpcomingOpportunity[];
         stats: WsAnalysisStats;
@@ -104,6 +107,8 @@ export function attachWebSocketServer(httpServer: Server) {
   }
 
   function broadcastAnalysisUpdate(data: {
+    updatedAt: string;
+    deadTargets: number[];
     activeSignals: WsActiveSignal[];
     upcomingOpportunities: WsUpcomingOpportunity[];
     stats: WsAnalysisStats;

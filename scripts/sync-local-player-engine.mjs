@@ -7,7 +7,7 @@ const targets = [
   new URL("../src/utils/local-player/", import.meta.url),
   new URL("../../pakakumi-local-bot/src/utils/local-player/", import.meta.url),
 ];
-const files = ["types.ts", ...["adaptive", "config", "core", "engine", "runner"].map(name => `strategy/${name}.ts`)];
+const files = ["types.ts", ...["adaptive", "config", "core", "engine", "runner", "return-attempts"].map(name => `strategy/${name}.ts`)];
 const check = process.argv.includes("--check");
 
 for (const file of files) {

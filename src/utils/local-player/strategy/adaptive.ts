@@ -1,4 +1,7 @@
 // Generated from pakakumi-fully-local-player/src/strategy/adaptive.ts by sync-local-player-engine.mjs.
+import { generateAlgorithmBets } from "./core.js";
+import { ReturnAttempts, type ReturnAttemptsConfig } from "./return-attempts.js";
+
 export type AmountRounding = "cents" | "nearest-whole" | "up-whole" | "down-whole" | "nearest-five" | "up-five" | "down-five" | "nearest-ten" | "up-ten";
 export interface BudgetProgression { type: "fixed" | "multiply" | "add" | "budgets" | "increments"; value: number; values: number[]; repeat: boolean }
 export interface AdaptiveConfig {
@@ -13,7 +16,11 @@ export interface AdaptiveConfig {
   fractionBasis: "current" | "initial" | "available";
   fractionPercent?: number;
   baseAmount: number;
+  baseAfterMiss?: { type: "add" | "multiply"; value: number; every: number; resetOnHit: boolean };
   returnMode: "multiple" | "profit";
+  returnCalculation?: "website" | "cycle";
+  calculationTarget?: number;
+  attempts?: ReturnAttemptsConfig;
   returnMultiple: number;
   goalProfit: number;
   adjustBeforeRound: boolean;
@@ -47,6 +54,11 @@ export interface PlanView {
   spent: number;
   roundingNote?: string | null;
   profitNote?: string | null;
+  baseAmount?: number;
+  pausedRounds?: number;
+  attemptScale?: number;
+  attemptBudget?: number;
+  attemptStep?: number;
 }
 const cents = (n: number) => Math.round(n * 100) / 100;
 const down = (n: number) => Math.floor(n * 100 + 1e-7) / 100;
@@ -95,11 +107,38 @@ export class AdaptivePlan {
   private sizingForProfit = false;
   private protectedAmount = 0;
   private protectionActive = false;
+  private currentBase: number;
+  private missesSinceIncrease = 0;
+  private calculatedBets: Array<{ amount: number; cashout: number }> = [];
+  private calculatedBase: number;
+  private calculatedStep = 0;
+  private attempts?: ReturnAttempts;
   constructor(readonly config: AdaptiveConfig, private initial: number, private restartOnBlocked = false) {
     this.waiting = config.start === "after-target";
     this.budget = config.windowBudget;
+    this.currentBase = config.baseAmount;
+    this.calculatedBase = config.baseAmount;
+    this.buildCalculation();
+    if (config.attempts) this.attempts = new ReturnAttempts(config, initial, this.calculatedBets);
+  }
+  get stepIndex() { return this.attempts?.stepIndex ?? this.calculatedStep; }
+  private syncAttempts() { this.cycle = this.attempts!.cycle; this.stopReason = this.attempts!.stopReason; }
+  private buildCalculation() {
+    const c = this.config;
+    if (c.kind !== "roi" || c.returnCalculation !== "website") return;
+    this.calculatedBase = this.currentBase;
+    this.calculatedBets = generateAlgorithmBets(c.cycleBudget, this.currentBase, c.calculationTarget ?? c.target,
+      c.returnMultiple, undefined, c.maximum, c.baseAfterMiss, amount => Math.max(c.minimum, roundAmount(amount, c.rounding)));
+  }
+  jumpTo(step: number) {
+    if (this.attempts) { this.attempts.jumpTo(step); this.syncAttempts(); return; }
+    if (this.config.returnCalculation !== "website" || !this.calculatedBets.length) return;
+    const next = Math.min(step, this.calculatedBets.length - 1);
+    if (next === 0 && this.calculatedStep !== 0) this.cycle++;
+    this.calculatedStep = next;
   }
   observe(bust: number) {
+    if (this.attempts) return this.attempts.observe(bust);
     this.seen++;
     if (this.waiting) {
       if (this.seen > this.armedAfter && bust >= this.config.trigger) { this.openWindow(); return true; }
@@ -121,7 +160,7 @@ export class AdaptivePlan {
     const remaining = Math.max(0, cents(capital - this.protectedAmount));
     return this.protectionActive ? Math.min(remaining, down(capital * this.config.protection!.maxUsePercent / 100)) : remaining;
   }
-  private amount(capital: number, spent = this.spent, maximum = this.config.maximum) {
+  private amount(capital: number, spent = this.spent, maximum = this.config.maximum, base = this.currentBase) {
     const c = this.config;
     if (c.kind === "window") return this.sizingForProfit ? cents(this.budget / c.windowRounds) : windowAmount(this.budget, c.windowRounds, c.minimum, c.maximum, c.rounding).amount;
     let raw: number;
@@ -129,8 +168,10 @@ export class AdaptivePlan {
       const basis = c.fractionBasis === "initial" ? this.initial : c.fractionBasis === "available" ? this.usable(capital) : capital;
       raw = basis * (c.fractionPercent === undefined ? 1 / c.target : c.fractionPercent / 100);
     } else if (c.kind === "roi") {
-      raw = c.returnMode === "profit" ? (spent + c.goalProfit) / (c.target - (c.adjustBeforeRound ? 1 : 0)) : spent * c.returnMultiple / (c.target - (c.adjustBeforeRound ? c.returnMultiple : 0));
-      raw = Math.max(c.baseAmount, raw);
+      if (c.returnCalculation === "website") return this.calculatedBets[this.calculatedStep]?.amount ?? Infinity;
+      const target = c.calculationTarget ?? c.target;
+      raw = c.returnMode === "profit" ? (spent + c.goalProfit) / (target - (c.adjustBeforeRound ? 1 : 0)) : spent * c.returnMultiple / (target - (c.adjustBeforeRound ? c.returnMultiple : 0));
+      raw = Math.max(base, raw);
     } else raw = this.budget / c.windowRounds;
     const amount = Math.min(maximum, Math.max(c.minimum, roundAmount(raw, c.rounding)));
     return cents(amount);
@@ -145,19 +186,25 @@ export class AdaptivePlan {
   }
   next(capital: number, useRemaining = false) {
     this.protect(capital);
+    if (this.attempts) { const bet = this.attempts.next(capital, this.usable(capital), useRemaining); this.syncAttempts(); return bet; }
     if (this.stopReason) return null;
     if (this.windowEnding) this.finishWindow();
     if (this.waiting || this.stopReason) return null;
     if (this.openedAt === null) this.openWindow();
     const c = this.config;
     if (this.windowExceedsMaximum()) return this.blockMaximum();
+    const website = c.kind === "roi" && c.returnCalculation === "website";
+    if (c.kind === "roi" && !website && this.currentBase > c.maximum + 1e-7) return this.blockMaximum();
     let amount = this.amount(capital);
-    if (this.config.kind === "roi" && this.spent + amount > this.config.cycleBudget + 1e-7) {
-      this.spent = 0; this.cycle++;
+    const overAllocation = this.spent + amount > c.cycleBudget + 1e-7 || website && this.calculatedStep >= this.calculatedBets.length;
+    if (c.kind === "roi" && (overAllocation || website && amount > c.maximum)) {
+      if (website && !this.spent) return this.block("The first amount cannot fit the cycle allocation or per-round limit.");
+      this.currentBase = c.baseAmount; this.missesSinceIncrease = 0; this.clearReturnSpending(); this.cycle++;
       if (this.config.cycleEnd === "stop") { this.stopReason = "Cycle allocation used. Stopped as configured."; return null; }
       if (this.config.cycleEnd === "wait") { this.wait(); return null; }
       amount = this.amount(capital);
     }
+    if (website && amount > c.maximum) return this.blockMaximum();
     if (this.restartOnBlocked && c.kind === "roi" && this.spent > 0 && this.amount(capital, this.spent, Infinity) > c.maximum) {
       return this.blockMaximum();
     }
@@ -173,34 +220,52 @@ export class AdaptivePlan {
   }
   private block(reason: string) { this.blockedByAmount = true; this.stopReason = reason; return null; }
   restartBlocked(capital: number, lossRoom: number, amount?: number) {
+    if (this.attempts) { const restarted = this.attempts.restartBlocked(this.usable(capital), lossRoom, amount, this.restartOnBlocked); this.syncAttempts(); return restarted; }
     if (!this.restartOnBlocked || (this.stopReason && !this.blockedByAmount)) return false;
     const c = this.config;
     const progressed = c.kind === "window" ? this.budget !== c.windowBudget || this.sizingForProfit : c.kind === "roi" && this.spent > 0;
     if (!progressed) return false;
-    if (c.kind === "roi" && this.amount(capital, 0, Infinity) > c.maximum) return false;
-    const first = c.kind === "window" ? windowAmount(c.windowBudget, c.windowRounds, c.minimum, c.maximum, c.rounding).amount : this.amount(capital, 0);
+    const firstReturnAmount = c.returnCalculation === "website" ? Math.max(c.minimum, roundAmount(c.baseAmount, c.rounding)) : this.amount(capital, 0, Infinity, c.baseAmount);
+    if (c.kind === "roi" && firstReturnAmount > c.maximum) return false;
+    const first = c.kind === "window" ? windowAmount(c.windowBudget, c.windowRounds, c.minimum, c.maximum, c.rounding).amount : firstReturnAmount;
     const required = c.kind === "window" ? first * c.windowRounds : first;
     if (first < c.minimum || required > this.usable(capital) + 1e-7 || first > lossRoom + 1e-7 || (amount !== undefined && first >= amount)) return false;
     this.reset(c.kind !== "window" || this.spent > 0);
     return true;
   }
-  canUse(amount: number, capital: number) { return !this.waiting && !this.stopReason && !this.windowEnding && amount <= this.usable(capital) + 1e-7; }
-  settle(amount: number, payout: number, capital: number, useRemaining = false) {
+  canUse(amount: number, capital: number) { return this.attempts ? this.attempts.canUse(amount, this.usable(capital)) : !this.waiting && !this.stopReason && !this.windowEnding && amount <= this.usable(capital) + 1e-7; }
+  settle(amount: number, payout: number, capital: number, useRemaining = false, action = "strategy") {
     const c = this.config, won = payout >= amount * c.target - 0.01 && payout > 0;
+    if (this.attempts) { this.protect(capital, won); const events = this.attempts.settle(amount, payout, capital, action); this.syncAttempts(); return events; }
     this.spent = cents(this.spent + amount); this.protect(capital, won);
     if (c.windowProfitGoal !== undefined) this.lossSinceHit = won ? 0 : cents(this.lossSinceHit + amount - payout);
     const events: string[] = [];
+    if (c.kind === "roi" && c.baseAfterMiss) {
+      const change = c.baseAfterMiss;
+      if (won) {
+        this.missesSinceIncrease = 0;
+        if (change.resetOnHit) this.currentBase = c.baseAmount;
+      } else if (++this.missesSinceIncrease >= change.every) {
+        this.missesSinceIncrease = 0;
+        this.currentBase = cents(change.type === "add" ? this.currentBase + change.value : this.currentBase * change.value);
+        events.push(`Base amount for the next play is KES ${this.currentBase.toFixed(2)}.`);
+      }
+    }
+    const website = c.kind === "roi" && c.returnCalculation === "website";
+    if (website) this.calculatedStep++;
     if (won) {
       if (c.kind === "window") {
         this.windowWon = true;
         if (c.afterHit === "restart-window") { this.applyHitBudget(); this.cycle++; this.openWindow(); events.push("Target reached. A new window starts next round."); }
         else if (c.afterHit === "wait") { this.applyHitBudget(); this.cycle++; this.spent = 0; this.wait(); }
         else if (c.afterHit === "stop") this.stopReason = "Target reached. Stopped as configured.";
-      } else {
-        if (c.kind === "roi" && c.resetSpentOnHit) { this.spent = 0; if (!c.windowEnabled) this.cycle++; }
-        if (c.afterHit === "restart-window" && c.windowEnabled) { this.cycle++; this.openWindow(); }
-        else if (c.afterHit === "wait") { if (c.windowEnabled) this.cycle++; this.wait(); }
-        else if (c.afterHit === "stop") this.stopReason = "Target reached. Stopped as configured.";
+      } else if (!website || action === "strategy" || action === "pause") {
+        if (c.kind === "roi" && c.resetSpentOnHit) { this.clearReturnSpending(); if (!c.windowEnabled) this.cycle++; }
+        if (!website || action !== "pause") {
+          if (c.afterHit === "restart-window" && c.windowEnabled) { this.cycle++; this.openWindow(); }
+          else if (c.afterHit === "wait") { if (c.windowEnabled) this.cycle++; this.wait(); }
+          else if (c.afterHit === "stop") this.stopReason = "Target reached. Stopped as configured.";
+        }
       }
     }
     if (this.windowEnding && !this.stopReason) {
@@ -265,13 +330,14 @@ export class AdaptivePlan {
       this.spent = 0;
       if (this.config.windowAfter === "stop") this.blockedByAmount = false;
     }
-    else if (this.config.resetSpentAfterWindow) this.spent = 0;
+    else if (this.config.resetSpentAfterWindow) this.clearReturnSpending();
     this.cycle++;
     if (this.config.windowAfter === "stop") { this.windowEnding = false; this.stopReason ??= "The play window is complete. Stopped as configured."; }
     else if (this.config.windowAfter === "repeat") this.openWindow();
     else this.wait();
   }
   reset(advanceCycle = true) {
+    if (this.attempts) { this.attempts.reset(); this.syncAttempts(); return; }
     if (this.restartOnBlocked && this.blockedByAmount) { this.stopReason = null; this.blockedByAmount = false; }
     if (advanceCycle) this.cycle++;
     this.spent = 0;
@@ -280,16 +346,37 @@ export class AdaptivePlan {
     this.budget = this.config.windowBudget;
     this.budgetIndex = 0;
     this.windowEnding = false;
+    this.currentBase = this.config.baseAmount;
+    this.missesSinceIncrease = 0;
+    this.clearReturnSpending();
     if (this.config.start === "after-target") this.wait();
     else if (this.config.windowEnabled) this.openWindow();
     else this.waiting = false;
   }
-  resume() { const wasWaiting = this.waiting; this.waiting = false; if (this.config.windowEnabled && wasWaiting) this.openWindow(); }
+  private clearReturnSpending() {
+    this.spent = 0;
+    this.calculatedStep = 0;
+    if (this.calculatedBase !== this.currentBase) this.buildCalculation();
+  }
+  resume() { if (this.attempts) { this.attempts.resume(); return; } const wasWaiting = this.waiting; this.waiting = false; if (this.config.windowEnabled && wasWaiting) this.openWindow(); }
   view(capital: number): PlanView {
-    const c = this.config, amount = this.amount(capital), remaining = c.windowEnabled ? Math.max(0, c.windowRounds - (this.seen - (this.openedAt ?? this.seen))) : null;
+    if (this.attempts) return this.attempts.view(capital, this.usable(capital));
+    const c = this.config, calculatedEnd = c.kind === "roi" && c.returnCalculation === "website" && this.calculatedStep >= this.calculatedBets.length;
+    const amount = calculatedEnd ? Math.max(c.minimum, roundAmount(c.baseAmount, c.rounding)) : this.amount(capital);
+    const remaining = c.windowEnabled ? Math.max(0, c.windowRounds - (this.seen - (this.openedAt ?? this.seen))) : null;
+    const cycleNote = calculatedEnd ? c.cycleEnd === "restart" ? "Cycle complete. Starting over next round." : c.cycleEnd === "wait" ? "Cycle complete. Will wait for a fresh target." : "Cycle complete. Will stop before another play." : null;
     const sizing = c.kind === "window" && !this.sizingForProfit ? windowAmount(this.budget,c.windowRounds,c.minimum,c.maximum,c.rounding) : null;
     const roundingNote = sizing?.adjusted ? `Rounding adjusted to KES ${amount.toFixed(2)} per round to stay within this window's KES ${this.budget.toFixed(2)} allocation.` : null;
     const profitNote = this.sizingForProfit && !this.stopReason ? `Now sizing for KES ${c.windowProfitGoal!.toFixed(2)} net profit after earlier misses if the target hits.` : null;
-    return { state: this.stopReason ? "stopped" : this.waiting ? "waiting" : "ready", message: this.stopReason ?? (this.waiting ? `Waiting for ${c.trigger}x or higher.` : c.windowEnabled ? `${remaining} rounds left in this window.` : `Next amount: ${amount.toFixed(2)} KES at ${c.target}x.`), target: c.target, nextAmount: this.waiting || this.stopReason ? null : amount, indicativeAmount: amount, protectedAmount: this.protectionActive ? cents(capital - this.usable(capital)) : 0, usableFunds: this.usable(capital), windowBudget: c.kind === "window" ? this.budget : null, roundsRemaining: this.waiting && c.windowEnabled ? c.windowRounds : remaining, roundLimit: c.windowEnabled ? c.windowRounds : null, windowNumber: this.cycle, spent: this.spent, roundingNote, profitNote };
+    return {
+      state: this.stopReason ? "stopped" : this.waiting ? "waiting" : "ready",
+      message: this.stopReason ?? (this.waiting ? `Waiting for ${c.trigger}x or higher.` : cycleNote ?? (c.windowEnabled ? `${remaining} rounds left in this window.` : `Next amount: ${amount.toFixed(2)} KES at ${c.target}x.`)),
+      target: c.target, nextAmount: this.waiting || this.stopReason || calculatedEnd ? null : amount, indicativeAmount: amount,
+      protectedAmount: this.protectionActive ? cents(capital - this.usable(capital)) : 0, usableFunds: this.usable(capital),
+      windowBudget: c.kind === "window" ? this.budget : null,
+      roundsRemaining: this.waiting && c.windowEnabled ? c.windowRounds : remaining,
+      roundLimit: c.windowEnabled ? c.windowRounds : null, windowNumber: this.cycle, spent: this.spent,
+      ...(c.kind === "roi" ? { baseAmount: this.currentBase } : {}), roundingNote, profitNote,
+    };
   }
 }

@@ -136,19 +136,23 @@ const INSTALL_GAME_OBSERVER = String.raw`(async () => {
   };
   socket.emit = observedEmit;
   const send = payload => Promise.resolve(window[binding](payload)).catch(() => {});
-  const fail = () => {
+  const fail = (reason = 'Pakakumi connection or game updates were lost') => {
     if (state.failed) return;
     state.failed = true; state.phase = 'unknown';
-    send({ error: 'Pakakumi connection or game updates were lost; check the last bet on Pakakumi before restarting.' });
+    send({ error: reason + '; check the last bet on Pakakumi before restarting.' });
   };
   const ownPlay = play => {
     if (!play || String(play.user_id) !== userId || Number(play.idx) !== 0) return;
-    if (play.currency !== 'KES') return fail();
-    if (play.game_id == null || !Number.isFinite(play.bet) || play.bet <= 0) return fail();
+    if (play.currency !== 'KES') return fail('Pakakumi own-entry currency could not be verified');
+    if (play.game_id == null || !Number.isFinite(play.bet) || play.bet <= 0) return fail('Pakakumi own-entry amount or round could not be verified');
     const previous = state.ownBet?.gameId === String(play.game_id) ? state.ownBet : null;
-    state.ownBet = { gameId: String(play.game_id), amount: play.bet, stoppedAt: play.stopped_at ?? previous?.stoppedAt ?? null };
+    const stoppedAt = play.stopped_at;
+    // Pakakumi represents an entry that has not cashed out as either 0 or null.
+    // A later player-list refresh must not erase a confirmed cashout.
+    if (stoppedAt != null && stoppedAt !== 0 && (!Number.isFinite(stoppedAt) || stoppedAt < 1)) return fail('Pakakumi own-entry cashout value was invalid');
+    state.ownBet = { gameId: String(play.game_id), amount: play.bet, stoppedAt: stoppedAt > 0 ? stoppedAt : previous?.stoppedAt ?? null };
   };
-  on('disconnect', fail);
+  on('disconnect', () => fail('Pakakumi connection was disconnected'));
   on('1501', () => { if (!state.failed) { state.phase = 'waiting'; state.waitingAt = state.heardAt = Date.now(); } });
   on('1502', () => { state.phase = 'playing'; state.heardAt = Date.now(); });
   on('1503', () => { state.heardAt = Date.now(); });
@@ -156,8 +160,8 @@ const INSTALL_GAME_OBSERVER = String.raw`(async () => {
   on('1507', batch => { if (Array.isArray(batch?.plays)) batch.plays.forEach(ownPlay); });
   on('1505', payouts => {
     const stoppedAt = payouts?.[userId]?.[0];
-    if (stoppedAt != null && state.ownBet) {
-      if (!Number.isFinite(stoppedAt) || stoppedAt < 1) return fail();
+    if (stoppedAt != null && stoppedAt !== 0 && state.ownBet) {
+      if (!Number.isFinite(stoppedAt) || stoppedAt < 1) return fail('Pakakumi payout cashout value was invalid');
       state.ownBet.stoppedAt = stoppedAt;
     }
   });
@@ -165,7 +169,7 @@ const INSTALL_GAME_OBSERVER = String.raw`(async () => {
     if (state.failed) return;
     state.heardAt = Date.now();
     state.phase = 'busted';
-    if (!round || round.gameId == null || !Number.isFinite(round.gameCrash) || round.gameCrash < 1) return fail();
+    if (!round || round.gameId == null || !Number.isFinite(round.gameCrash) || round.gameCrash < 1) return fail('Pakakumi round result was invalid');
     const gameId = String(round.gameId);
     if (state.lastRound === gameId) return;
     state.lastRound = gameId;
@@ -173,15 +177,15 @@ const INSTALL_GAME_OBSERVER = String.raw`(async () => {
     const stoppedAt = own?.stoppedAt;
     // A forced termination can involve cancellation/refund rules. Missing a
     // cashout in that case is not sufficient evidence of a lost stake.
-    if (round.forced === true && own && stoppedAt == null) return fail();
-    if (stoppedAt != null && (!Number.isFinite(stoppedAt) || stoppedAt < 1)) return fail();
+    if (round.forced === true && own && stoppedAt == null) return fail('Pakakumi forcibly ended the round without a verified payment');
+    if (stoppedAt != null && (!Number.isFinite(stoppedAt) || stoppedAt < 1)) return fail('Pakakumi final cashout value was invalid');
     send({ bust: round.gameCrash, roundKey: gameId, bustId: '', settlement: own ? {
       gameId, amount: own.amount, grossPayout: own.amount * (stoppedAt ?? 0)
     } : null });
   });
   // A live connection can still stop supplying game updates during maintenance.
   // This is an in-page timer; it makes no network or database requests.
-  const timer = setInterval(() => { if (Date.now() - state.heardAt >= 300000) fail(); }, 15000);
+  const timer = setInterval(() => { if (Date.now() - state.heardAt >= 300000) fail('Pakakumi sent no game updates for five minutes'); }, 15000);
   window.__pakakumiCleanup = () => {
     state.failed = true;
     clearInterval(timer);

@@ -70,10 +70,7 @@ async function deliverAnalysis(result: AnalysisResult, newRound?: { bust: number
       .map((t) => `${t.toFixed(2)}x`)
       .join(", ");
 
-    const winRate =
-      result.stats.totalSignals > 0
-        ? ((result.stats.totalHits / result.stats.totalSignals) * 100).toFixed(1)
-        : "0";
+    const winRate = result.stats.accuracy;
 
     // Today's accuracy line
     const todayLine = result.todayStats.totalPredictions > 0
@@ -86,7 +83,7 @@ async function deliverAnalysis(result: AnalysisResult, newRound?: { bust: number
         `🔥 <b>TARGET HIT!</b> 🔥\n\n` +
         `🎯 <b>Target:</b> &gt;${hitTargetsStr}\n` +
         `✅ <b>Game Result:</b> ${newRound.bust}x\n\n` +
-        `📊 <b>Our Track Record:</b> ${winRate}% correct` +
+        `📊 <b>Our Track Record:</b> ${winRate}% of resolved signals hit` +
         `${todayLine}\n\n` +
         `Premium members got this alert before it happened.`;
 

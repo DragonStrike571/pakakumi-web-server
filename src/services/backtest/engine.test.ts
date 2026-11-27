@@ -36,6 +36,17 @@ const profitWindow = {
   },
 };
 
+test("complete Target Return attempts retain scaled amounts and fresh triggers in historical data", () => {
+  const request = runBacktestSchema.parse({ initialCapital:4750, includeLedger:true, strategy: {type:"adaptive",adaptive:{
+    kind:"roi", returnCalculation:"website", target:10, returnMultiple:2, baseAmount:10, cycleBudget:100,
+    rounding:"up-five", start:"after-target", attempts:{increases:[{type:"multiply",value:2.5,times:1}]},
+  }} });
+  const result = runBacktest({...request,strategy:request.strategy!,rounds:rounds(10,...Array(8).fill(1),1,10,...Array(8).fill(1))});
+  assert.deepEqual(result.ledger?.map(row=>row.amount),[10,10,10,10,10,10,15,15,25,25,25,25,25,25,37.5,37.5]);
+  assert.equal(result.ledger?.[8]?.roundIndex,11);
+  assert.equal(result.summary.endingCapital,4435);
+});
+
 test("the local 5x profit switch survives request validation and historical settlement", () => {
   const request = runBacktestSchema.parse({ strategy: profitWindow, initialCapital: 1000, includeLedger: true });
   const result = runBacktest({ ...request, strategy: request.strategy!, rounds: rounds(1, 1, 1, 1, 5) });

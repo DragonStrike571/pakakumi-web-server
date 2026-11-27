@@ -3,6 +3,7 @@
 export type StrategyType = "sequence" | "algorithm" | "phased" | "adaptive";
 export type ExecutionOutcome = "win" | "loss";
 export type ExecutionAction = "strategy" | "continue" | "reset" | "pause" | "stop";
+export interface BaseProgression { type: "add" | "multiply"; value: number; every: number }
 export type ExecutionRuleMetric =
   | "bust" | "capital" | "profit" | "drawdown"
   | "consecutiveWins" | "consecutiveLosses"
@@ -52,6 +53,7 @@ export interface StrategyConfig {
     targetReturn: number;
     roundingOption?: "none" | "whole" | "five" | "ten";
     maxPlayable?: number;
+    baseAfterMiss?: BaseProgression;
   };
 
   sequence?: {
@@ -91,9 +93,11 @@ export function roundNumber(
   return rounded;
 }
 
-/**
- * Generate a sequence of algorithm-based bets.
- */
+export function nextCalculatedAmount(current: number, spent: number, target: number, factor: number, base = current) {
+  return Math.ceil(Math.max(current, base, factor * spent / target) * 100) / 100;
+}
+
+/** Generate the website's sequence from cumulative spending. */
 export function generateAlgorithmBets(
   capital: number,
   minAmount: number,
@@ -101,8 +105,11 @@ export function generateAlgorithmBets(
   targetReturn: number,
   roundingOption?: "none" | "whole" | "five" | "ten",
   maxPlayable?: number,
+  baseAfterMiss?: BaseProgression,
+  rounding?: (amount: number) => number,
 ): Array<{ amount: number; cashout: number }> {
   let currentAmount = minAmount;
+  let baseAmount = minAmount;
   let totalSum = 0;
   const numbersAdded: number[] = [];
 
@@ -115,7 +122,9 @@ export function generateAlgorithmBets(
     if (loops++ > MAX_ROUNDS) break;
 
     let bet = currentAmount;
-    if (shouldRound) {
+    if (rounding) {
+      bet = rounding(bet);
+    } else if (shouldRound) {
       bet = roundNumber(bet, roundingOption);
     } else {
       bet = Math.round(bet * 100) / 100;
@@ -129,14 +138,11 @@ export function generateAlgorithmBets(
     numbersAdded.push(bet);
 
     // Direct math calculation instead of O(N) loop
-    const nextRequired = (targetReturn * totalSum) / multiplier;
-    
-    if (nextRequired > currentAmount) {
-      currentAmount = nextRequired;
+    if (baseAfterMiss && numbersAdded.length % baseAfterMiss.every === 0) {
+      baseAmount = baseAfterMiss.type === "add" ? baseAmount + baseAfterMiss.value : baseAmount * baseAfterMiss.value;
+      baseAmount = Math.round(baseAmount * 100) / 100;
     }
-    
-    // Round up to nearest cent to ensure target is met
-    currentAmount = Math.ceil(currentAmount * 100) / 100;
+    currentAmount = nextCalculatedAmount(currentAmount, totalSum, multiplier, targetReturn, baseAmount);
     
     // Safety checks for unexpected mathematical instances
     if (!isFinite(currentAmount) || isNaN(currentAmount)) {
@@ -173,6 +179,7 @@ export function executeStrategy(
           config.algorithm.targetReturn,
           config.algorithm.roundingOption,
           config.algorithm.maxPlayable,
+          config.algorithm.baseAfterMiss,
         )
       : config.sequence?.bets || [];
 

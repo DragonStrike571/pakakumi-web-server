@@ -8,14 +8,12 @@
  */
 
 import { Router, Request, Response } from "express";
-import { db } from "../db/index.js";
-import { signalHistory } from "../db/schema.js";
-import { desc, count, eq } from "drizzle-orm";
 import { trycatch } from "../utils/try-catch.js";
 import { requireAuth } from "../middleware/auth.js";
 import {
   getAnalysisSnapshot,
   getSignalHistory,
+  signalTotals,
   getSystemStats,
 } from "../services/analysis/engine.js";
 import { z } from "zod";
@@ -57,9 +55,7 @@ router.get("/current", async (req: Request, res: Response) => {
       activeSignals: [],
       upcomingOpportunities: [],
       stats: {
-        totalSignals: 0,
-        totalHits: 0,
-        accuracy: 0,
+        ...signalTotals(0, 0, 0),
         roundsAnalyzed: 0,
       },
       updatedAt: null,
@@ -69,11 +65,9 @@ router.get("/current", async (req: Request, res: Response) => {
   res.json({
     activeSignals: snapshot.activeSignals || [],
     upcomingOpportunities: snapshot.upcomingOpportunities || [],
-    stats: snapshot.stats || {
-      totalSignals: 0,
-      totalHits: 0,
-      accuracy: 0,
-      roundsAnalyzed: 0,
+    stats: {
+      roundsAnalyzed: snapshot.stats?.roundsAnalyzed ?? 0,
+      ...signalTotals(snapshot.stats?.totalHits ?? 0, snapshot.stats?.totalSignals ?? 0, snapshot.activeSignals?.length ?? 0),
     },
     updatedAt: snapshot.updatedAt,
   });
@@ -86,7 +80,8 @@ router.get("/current", async (req: Request, res: Response) => {
  */
 const historyQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
-  page: z.coerce.number().int().min(1).default(1),
+  page: z.coerce.number().int().min(1).max(100_000).default(1),
+  target: z.coerce.number().finite().gt(1).max(1_000_000).optional(),
   outcome: z.enum(["hit", "missed", "pending"]).optional(),
 });
 
@@ -96,38 +91,8 @@ router.get("/history", async (req: Request, res: Response) => {
     return res.status(400).json({ error: parsed.error.format() });
   }
 
-  const { limit, page, outcome } = parsed.data;
-  const offset = (page - 1) * limit;
-
-  const { data, error } = await trycatch(async () => {
-    const whereCondition = outcome
-      ? eq(signalHistory.outcome, outcome)
-      : undefined;
-
-    const [history, [totalCount]] = await Promise.all([
-      db
-        .select()
-        .from(signalHistory)
-        .where(whereCondition)
-        .orderBy(desc(signalHistory.createdAt))
-        .limit(limit)
-        .offset(offset),
-      db
-        .select({ count: count() })
-        .from(signalHistory)
-        .where(whereCondition),
-    ]);
-
-    return {
-      data: history,
-      pagination: {
-        total: totalCount?.count || 0,
-        page,
-        limit,
-        totalPages: Math.ceil((totalCount?.count || 0) / limit),
-      },
-    };
-  });
+  const { limit, page, outcome, target } = parsed.data;
+  const { data, error } = await trycatch(() => getSignalHistory(limit, page, outcome, target));
 
   if (error) {
     console.error("Error fetching signal history:", error);
@@ -153,22 +118,13 @@ router.get("/stats", async (req: Request, res: Response) => {
 
   if (!stats) {
     return res.json({
-      totalSignals: 0,
-      totalHits: 0,
-      accuracy: 0,
+      ...signalTotals(0, 0, 0),
       lastAlertRound: 0,
     });
   }
 
-  const accuracy =
-    stats.signals > 0
-      ? Math.round((stats.hits / stats.signals) * 100)
-      : 0;
-
   res.json({
-    totalSignals: stats.signals,
-    totalHits: stats.hits,
-    accuracy,
+    ...signalTotals(stats.hits, stats.signals, stats.pending),
     lastAlertRound: stats.lastAlertRound,
   });
 });
